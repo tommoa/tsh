@@ -164,7 +164,8 @@ test "CLI: multiple literals with trailing space" {
 
 test "CLI: output redirection" {
     try expectOutput(">file",
-        \\[1:1] Redirection(>"file") [incomplete]
+        \\[1:1] Redirection(>) [incomplete]
+        \\[1:2] Literal("file") [incomplete]
         \\
         \\
     );
@@ -172,7 +173,8 @@ test "CLI: output redirection" {
 
 test "CLI: output redirection with space" {
     try expectOutput("> file ",
-        \\[1:1] Redirection(>"file")
+        \\[1:1] Redirection(>) [incomplete]
+        \\[1:3] Literal("file")
         \\
         \\
     );
@@ -180,7 +182,8 @@ test "CLI: output redirection with space" {
 
 test "CLI: input redirection" {
     try expectOutput("<input ",
-        \\[1:1] Redirection(<"input")
+        \\[1:1] Redirection(<) [incomplete]
+        \\[1:2] Literal("input")
         \\
         \\
     );
@@ -188,7 +191,8 @@ test "CLI: input redirection" {
 
 test "CLI: append redirection" {
     try expectOutput(">>logfile ",
-        \\[1:1] Redirection(>>"logfile")
+        \\[1:1] Redirection(>>) [incomplete]
+        \\[1:3] Literal("logfile")
         \\
         \\
     );
@@ -196,7 +200,8 @@ test "CLI: append redirection" {
 
 test "CLI: fd-prefixed redirection" {
     try expectOutput("2>errors ",
-        \\[1:1] Redirection(2>"errors")
+        \\[1:1] Redirection(2>) [incomplete]
+        \\[1:3] Literal("errors")
         \\
         \\
     );
@@ -204,7 +209,8 @@ test "CLI: fd-prefixed redirection" {
 
 test "CLI: fd duplication" {
     try expectOutput("2>&1 ",
-        \\[1:1] Redirection(2>&1)
+        \\[1:1] Redirection(2>&) [incomplete]
+        \\[1:4] Literal("1")
         \\
         \\
     );
@@ -215,8 +221,10 @@ test "CLI: complex command" {
         \\[1:1] Literal("FOO=bar")
         \\[1:9] Literal("cmd")
         \\[1:13] Literal("arg1")
-        \\[1:18] Redirection(>"out")
-        \\[1:23] Redirection(2>&1)
+        \\[1:18] Redirection(>) [incomplete]
+        \\[1:19] Literal("out")
+        \\[1:23] Redirection(2>&) [incomplete]
+        \\[1:26] Literal("1")
         \\
         \\
     );
@@ -260,14 +268,20 @@ test "CLI: environment variable assignment" {
     );
 }
 
-test "CLI: invalid redirection reports error" {
-    const output = try runTest(">\n");
-    defer std.testing.allocator.free(output);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Error: InvalidRedirection") != null);
+test "CLI: redirection at newline emits incomplete token" {
+    // Lexer emits the redirection; parser would validate target
+    try expectOutput(">\n",
+        \\[1:1] Redirection(>) [incomplete]
+        \\
+        \\
+    );
 }
 
-test "CLI: invalid fd redirection reports error" {
-    const output = try runTest(">&\n");
-    defer std.testing.allocator.free(output);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Error: InvalidRedirection") != null);
+test "CLI: fd redirection at newline emits incomplete token" {
+    // Lexer emits the redirection; parser would validate target
+    try expectOutput(">&\n",
+        \\[1:1] Redirection(>&) [incomplete]
+        \\
+        \\
+    );
 }
