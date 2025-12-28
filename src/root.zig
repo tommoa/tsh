@@ -188,17 +188,6 @@ pub const Lexer = struct {
         return c;
     }
 
-    /// Skip whitespace (spaces and tabs, not newlines).
-    inline fn skipWhitespace(self: *Lexer) LexerError!void {
-        while (try self.peekByte()) |c| {
-            if (c == ' ' or c == '\t') {
-                _ = try self.consumeOne();
-            } else {
-                break;
-            }
-        }
-    }
-
     /// Check if a character is "plain" - can be included in a word chunk by `readWord`.
     ///
     /// This is different from `isWordComplete`: a character can be "not plain"
@@ -336,12 +325,6 @@ pub const Lexer = struct {
         return self.readWhile(isPlainCharacter);
     }
 
-    /// Read a sequence of digits. Returns a slice from the reader's buffer.
-    /// A sequence is incomplete if it was truncated due to buffer limits.
-    fn readDigits(self: *Lexer) LexerError!?ReadResult {
-        return self.readWhile(isDigit);
-    }
-
     /// Read the content of a single-quoted string (everything until closing ').
     /// The opening quote should already be consumed.
     /// Returns the content (without quotes) and whether it's complete.
@@ -395,13 +378,34 @@ pub const Lexer = struct {
         };
     }
 
+    /// Returns the next token from the input stream.
+    ///
+    /// ## State Machine Design
+    ///
+    /// This function implements a state machine using Zig's labeled switch pattern
+    /// for explicit, self-documenting state transitions. The design separates two
+    /// types of state transitions:
+    ///
+    /// **Intra-call transitions** (`continue :state <new_state>`):
+    /// Used when we can transition to a new state immediately without returning
+    /// a token. Examples include:
+    /// - Line continuations (backslash-newline) - consumed silently, continue parsing
+    /// - Buffer boundary handling - transition to escape state, continue processing
+    ///
+    /// **Inter-call transitions** (set `self.parse_context`, then `break :state <token>`):
+    /// Used when we need to return a token and resume in a different state on the
+    /// next call. Examples include:
+    /// - Entering a quoted string - return DoubleQuoteBegin, resume in .double_quote
+    /// - Returning content from inside quotes - return Literal, stay in quote state
+    ///
+    /// The `parse_context` field persists state across calls, while `continue :state`
+    /// enables efficient intra-call transitions without recursive function calls.
     pub fn nextToken(self: *Lexer) LexerError!?Token {
         self.token_start_position = self.position;
         self.token_start_line = self.line;
         self.token_start_column = self.column;
 
-        // Handle parse context first
-        switch (self.parse_context) {
+        return state: switch (self.parse_context) {
             .single_quote => {
                 // Inside single quotes - we're continuing from a previous incomplete token
                 // All tokens from here should be Continuation
@@ -415,10 +419,10 @@ pub const Lexer = struct {
                     // Check if word continues after closing quote
                     const next = try self.peekByte();
                     const at_boundary = self.isWordComplete(next);
-                    return self.makeToken(.{ .Continuation = result.slice }, at_boundary);
+                    break :state self.makeToken(.{ .Continuation = result.slice }, at_boundary);
                 } else {
                     // Buffer full, need more continuations
-                    return self.makeToken(.{ .Continuation = result.slice }, false);
+                    break :state self.makeToken(.{ .Continuation = result.slice }, false);
                 }
             },
             .double_quote => {
@@ -436,7 +440,7 @@ pub const Lexer = struct {
                         // Check if word continues after closing quote
                         const next = try self.peekByte();
                         const at_boundary = self.isWordComplete(next);
-                        return self.makeToken(.DoubleQuoteEnd, at_boundary);
+                        break :state self.makeToken(.DoubleQuoteEnd, at_boundary);
                     },
                     '\\' => {
                         // Escape sequence - try to peek at both backslash and next char
@@ -449,8 +453,8 @@ pub const Lexer = struct {
                             // Consume backslash and transition to escape state.
                             self.consume(buf[0..1]);
                             self.parse_context = .double_quote_escape;
-                            // Don't emit a token - next call will handle the escape
-                            return self.nextToken();
+                            // Intra-call transition: continue processing in escape state
+                            continue :state .double_quote_escape;
                         }
                         // POSIX: only \$, \`, \", \\, and \newline are special in double quotes
                         // Other backslashes are literal (e.g., \n becomes \ and n)
@@ -462,12 +466,12 @@ pub const Lexer = struct {
                             // Special escape - consume both, return the escaped char
                             const escaped_slice = buf[1..2];
                             self.consume(buf[0..2]);
-                            return self.makeToken(.{ .Literal = escaped_slice }, false);
+                            break :state self.makeToken(.{ .Literal = escaped_slice }, false);
                         } else {
                             // Not a special escape - backslash is literal
                             // Consume just the backslash, next char handled in next iteration
                             self.consume(buf[0..1]);
-                            return self.makeToken(.{ .Literal = buf[0..1] }, false);
+                            break :state self.makeToken(.{ .Literal = buf[0..1] }, false);
                         }
                     },
                     '$', '`' => {
@@ -479,7 +483,7 @@ pub const Lexer = struct {
                         };
                         self.consume(buf);
                         // complete=false: still inside double quotes, more content follows
-                        return self.makeToken(.{ .Literal = buf }, false);
+                        break :state self.makeToken(.{ .Literal = buf }, false);
                     },
                     else => {
                         // Regular literal content - read until special char
@@ -487,7 +491,7 @@ pub const Lexer = struct {
                             return LexerError.UnterminatedQuote;
                         };
                         // complete=false: still inside double quotes
-                        return self.makeToken(.{ .Literal = result.slice }, false);
+                        break :state self.makeToken(.{ .Literal = result.slice }, false);
                     },
                 }
             },
@@ -508,12 +512,12 @@ pub const Lexer = struct {
                     };
                     self.consume(buf);
                     self.parse_context = .double_quote;
-                    return self.makeToken(.{ .Literal = buf }, false);
+                    break :state self.makeToken(.{ .Literal = buf }, false);
                 } else {
                     // Not a special escape - the backslash we consumed was literal.
                     // Emit a backslash literal using a static string slice.
                     self.parse_context = .double_quote;
-                    return self.makeToken(.{ .Literal = "\\" }, false);
+                    break :state self.makeToken(.{ .Literal = "\\" }, false);
                 }
             },
             .none_escape => {
@@ -522,22 +526,22 @@ pub const Lexer = struct {
                 const next = try self.peekByte() orelse {
                     // EOF after backslash outside quotes - backslash is discarded per POSIX
                     self.parse_context = .none;
-                    return null;
+                    break :state null;
                 };
 
                 if (next == '\n') {
                     // Line continuation - backslash-newline is removed entirely
                     _ = try self.consumeOne();
                     self.parse_context = .none;
-                    // Continue processing on the next line
-                    return self.nextToken();
+                    // Intra-call transition: continue processing on the next line
+                    continue :state .none;
                 }
 
                 // Consume the escaped character and return it as a literal
                 const buf = self.reader.peek(1) catch |err| switch (err) {
                     error.EndOfStream => {
                         self.parse_context = .none;
-                        return null;
+                        break :state null;
                     },
                     else => return LexerError.UnexpectedEndOfFile,
                 };
@@ -546,191 +550,199 @@ pub const Lexer = struct {
                 // Check if word continues after this escaped char
                 const after = try self.peekByte();
                 const at_boundary = self.isWordComplete(after);
-                return self.makeToken(.{ .Literal = buf }, at_boundary);
+                break :state self.makeToken(.{ .Literal = buf }, at_boundary);
             },
             .none => {
-                // Normal processing - continue below
-            },
-        }
+                // Normal processing
 
-        // If the previous token was incomplete, handle continuation
-        if (self.in_continuation) {
-            const next = try self.peekByte();
-
-            // Check what follows the incomplete token
-            if (next == null) {
-                // EOF - word is complete
-                self.in_continuation = false;
-                return null;
-            } else if (next == '\'' or next == '"' or next == '\\') {
-                // Quote or escape follows - process it normally (word continues)
-                // Don't emit a continuation, fall through to normal processing
-                self.in_continuation = false;
-            } else if (self.isWordComplete(next)) {
-                // Whitespace or metachar - word is complete, emit empty continuation
-                self.in_continuation = false;
-                return self.makeToken(.{ .Continuation = "" }, true);
-            } else {
-                // Word char - read as continuation
-                const result = try self.readWord() orelse {
-                    self.in_continuation = false;
-                    return null;
-                };
-                // Check if word continues after this
-                const after = try self.peekByte();
-                const at_boundary = self.isWordComplete(after);
-                return self.makeToken(.{ .Continuation = result.slice }, at_boundary);
-            }
-        }
-
-        try self.skipWhitespace();
-
-        self.token_start_position = self.position;
-        self.token_start_line = self.line;
-        self.token_start_column = self.column;
-
-        const first = try self.peekByte() orelse return null;
-
-        // Handle newline - end of command
-        if (first == '\n') {
-            _ = try self.consumeOne();
-            return null;
-        }
-
-        switch (first) {
-            '\'' => {
-                // Single quote - consume it and read content
-                _ = try self.consumeOne();
-                const result = try self.readSingleQuoted() orelse {
-                    return LexerError.UnterminatedQuote;
-                };
-                if (result.complete) {
-                    // Check if word continues after closing quote
+                // If the previous token was incomplete, handle continuation
+                if (self.in_continuation) {
                     const next = try self.peekByte();
-                    const at_boundary = self.isWordComplete(next);
-                    return self.makeToken(.{ .SingleQuoted = result.slice }, at_boundary);
-                } else {
-                    // Need continuation - first chunk is SingleQuoted with complete=false
-                    self.parse_context = .single_quote;
-                    self.in_continuation = true;
-                    return self.makeToken(.{ .SingleQuoted = result.slice }, false);
-                }
-            },
-            '"' => {
-                // Double quote - consume it and enter double quote state
-                _ = try self.consumeOne();
-                self.parse_context = .double_quote;
-                // DoubleQuoteBegin always has complete=false (content follows)
-                return self.makeToken(.DoubleQuoteBegin, false);
-            },
-            '\\' => {
-                // Escape - try to peek both backslash and next char
-                const buf = self.reader.peekGreedy(2) catch |err| switch (err) {
-                    error.EndOfStream => return null,
-                    else => return LexerError.UnexpectedEndOfFile,
-                };
-                if (buf.len < 2) {
-                    // Buffer boundary or EOF - transition to escape state
-                    self.consume(buf[0..1]);
-                    self.parse_context = .none_escape;
-                    return self.nextToken();
+
+                    // Check what follows the incomplete token
+                    if (next == null) {
+                        // EOF - word is complete
+                        self.in_continuation = false;
+                        break :state null;
+                    } else if (next == '\'' or next == '"' or next == '\\') {
+                        // Quote or escape follows - process it normally (word continues)
+                        // Don't emit a continuation, fall through to normal processing
+                        self.in_continuation = false;
+                    } else if (self.isWordComplete(next)) {
+                        // Whitespace or metachar - word is complete, emit empty continuation
+                        self.in_continuation = false;
+                        break :state self.makeToken(.{ .Continuation = "" }, true);
+                    } else {
+                        // Word char - read as continuation
+                        const result = try self.readWord() orelse {
+                            self.in_continuation = false;
+                            break :state null;
+                        };
+                        // Check if word continues after this
+                        const after = try self.peekByte();
+                        const at_boundary = self.isWordComplete(after);
+                        break :state self.makeToken(.{ .Continuation = result.slice }, at_boundary);
+                    }
                 }
 
-                const escaped_char = buf[1];
-                if (escaped_char == '\n') {
-                    // Line continuation - backslash-newline is removed entirely
-                    self.consume(buf[0..2]);
-                    // Continue to next line
-                    return self.nextToken();
-                }
-
-                // Backslash escapes the next character (makes it literal)
-                const escaped_slice = buf[1..2];
-                self.consume(buf[0..2]);
-                // Check if word continues after this escaped char
-                const after = try self.peekByte();
-                const at_boundary = self.isWordComplete(after);
-                return self.makeToken(.{ .Literal = escaped_slice }, at_boundary);
-            },
-            '<' => {
-                _ = try self.consumeOne();
-                return try self.finishRedirection(null, .In);
-            },
-            '>' => {
-                _ = try self.consumeOne();
-                const next = try self.peekByte();
-                if (next == '>') {
-                    _ = try self.consumeOne();
-                    return try self.finishRedirection(null, .Append);
-                }
-                return try self.finishRedirection(null, .Out);
-            },
-            '0'...'9' => {
-                // Could be fd prefix for redirection, or a word starting with digits
-                // Peek ahead to find the full extent of digits and check what follows
-                const buf = self.reader.peekGreedy(1) catch |err| switch (err) {
-                    error.EndOfStream => return null,
-                    else => return LexerError.UnexpectedEndOfFile,
-                };
-                if (buf.len == 0) return null;
-
-                // Find where digits end
-                var digit_len: usize = 0;
-                for (buf) |c| {
-                    if (isDigit(c)) {
-                        digit_len += 1;
+                // Skip whitespace (spaces and tabs, not newlines)
+                while (try self.peekByte()) |c| {
+                    if (c == ' ' or c == '\t') {
+                        _ = try self.consumeOne();
                     } else {
                         break;
                     }
                 }
 
-                // Check what follows the digits
-                const after_digits: u8 = if (digit_len < buf.len) buf[digit_len] else 0;
+                self.token_start_position = self.position;
+                self.token_start_line = self.line;
+                self.token_start_column = self.column;
 
-                if (after_digits == '<' or after_digits == '>') {
-                    // It's an fd-prefixed redirection - keep fd as string slice
-                    const fd_slice = buf[0..digit_len];
-                    self.consume(fd_slice);
-                    _ = try self.consumeOne(); // consume '<' or '>'
+                const first = try self.peekByte() orelse break :state null;
 
-                    if (after_digits == '<') {
-                        return try self.finishRedirection(fd_slice, .In);
-                    } else {
-                        const next2 = try self.peekByte();
-                        if (next2 == '>') {
-                            _ = try self.consumeOne();
-                            return try self.finishRedirection(fd_slice, .Append);
-                        }
-                        return try self.finishRedirection(fd_slice, .Out);
-                    }
-                } else {
-                    // It's a word (may continue with non-digit chars)
-                    const result = try self.readWord() orelse return null;
-                    // Check if word continues (e.g., followed by quote)
-                    // Only peek if word wasn't truncated by buffer - otherwise slice would be invalidated
-                    const at_boundary = if (result.complete)
-                        self.isWordComplete(try self.peekByte())
-                    else
-                        false;
-                    return self.makeToken(.{ .Literal = result.slice }, at_boundary);
-                }
-            },
-            else => {
-                if (!isPlainCharacter(first)) {
-                    // Consume the unhandled character to avoid infinite loop
+                // Handle newline - end of command
+                if (first == '\n') {
                     _ = try self.consumeOne();
-                    return null;
+                    break :state null;
                 }
-                const result = try self.readWord() orelse return null;
-                // Check if word continues (e.g., followed by quote)
-                // Only peek if word wasn't truncated by buffer - otherwise slice would be invalidated
-                const at_boundary = if (result.complete)
-                    self.isWordComplete(try self.peekByte())
-                else
-                    false;
-                return self.makeToken(.{ .Literal = result.slice }, at_boundary);
+
+                switch (first) {
+                    '\'' => {
+                        // Single quote - consume it and read content
+                        _ = try self.consumeOne();
+                        const result = try self.readSingleQuoted() orelse {
+                            return LexerError.UnterminatedQuote;
+                        };
+                        if (result.complete) {
+                            // Check if word continues after closing quote
+                            const next = try self.peekByte();
+                            const at_boundary = self.isWordComplete(next);
+                            break :state self.makeToken(.{ .SingleQuoted = result.slice }, at_boundary);
+                        } else {
+                            // Need continuation - first chunk is SingleQuoted with complete=false
+                            self.parse_context = .single_quote;
+                            self.in_continuation = true;
+                            break :state self.makeToken(.{ .SingleQuoted = result.slice }, false);
+                        }
+                    },
+                    '"' => {
+                        // Double quote - consume it and enter double quote state
+                        _ = try self.consumeOne();
+                        self.parse_context = .double_quote;
+                        // DoubleQuoteBegin always has complete=false (content follows)
+                        break :state self.makeToken(.DoubleQuoteBegin, false);
+                    },
+                    '\\' => {
+                        // Escape - try to peek both backslash and next char
+                        const buf = self.reader.peekGreedy(2) catch |err| switch (err) {
+                            error.EndOfStream => break :state null,
+                            else => return LexerError.UnexpectedEndOfFile,
+                        };
+                        if (buf.len < 2) {
+                            // Buffer boundary or EOF - transition to escape state
+                            self.consume(buf[0..1]);
+                            self.parse_context = .none_escape;
+                            // Intra-call transition: continue processing in escape state
+                            continue :state .none_escape;
+                        }
+
+                        const escaped_char = buf[1];
+                        if (escaped_char == '\n') {
+                            // Line continuation - backslash-newline is removed entirely
+                            self.consume(buf[0..2]);
+                            // Intra-call transition: continue to next line
+                            continue :state .none;
+                        }
+
+                        // Backslash escapes the next character (makes it literal)
+                        const escaped_slice = buf[1..2];
+                        self.consume(buf[0..2]);
+                        // Check if word continues after this escaped char
+                        const after = try self.peekByte();
+                        const at_boundary = self.isWordComplete(after);
+                        break :state self.makeToken(.{ .Literal = escaped_slice }, at_boundary);
+                    },
+                    '<' => {
+                        _ = try self.consumeOne();
+                        break :state try self.finishRedirection(null, .In);
+                    },
+                    '>' => {
+                        _ = try self.consumeOne();
+                        const next = try self.peekByte();
+                        if (next == '>') {
+                            _ = try self.consumeOne();
+                            break :state try self.finishRedirection(null, .Append);
+                        }
+                        break :state try self.finishRedirection(null, .Out);
+                    },
+                    '0'...'9' => {
+                        // Could be fd prefix for redirection, or a word starting with digits
+                        // Peek ahead to find the full extent of digits and check what follows
+                        const buf = self.reader.peekGreedy(1) catch |err| switch (err) {
+                            error.EndOfStream => break :state null,
+                            else => return LexerError.UnexpectedEndOfFile,
+                        };
+                        if (buf.len == 0) break :state null;
+
+                        // Find where digits end
+                        var digit_len: usize = 0;
+                        for (buf) |c| {
+                            if (isDigit(c)) {
+                                digit_len += 1;
+                            } else {
+                                break;
+                            }
+                        }
+
+                        // Check what follows the digits
+                        const after_digits: u8 = if (digit_len < buf.len) buf[digit_len] else 0;
+
+                        if (after_digits == '<' or after_digits == '>') {
+                            // It's an fd-prefixed redirection - keep fd as string slice
+                            const fd_slice = buf[0..digit_len];
+                            self.consume(fd_slice);
+                            _ = try self.consumeOne(); // consume '<' or '>'
+
+                            if (after_digits == '<') {
+                                break :state try self.finishRedirection(fd_slice, .In);
+                            } else {
+                                const next2 = try self.peekByte();
+                                if (next2 == '>') {
+                                    _ = try self.consumeOne();
+                                    break :state try self.finishRedirection(fd_slice, .Append);
+                                }
+                                break :state try self.finishRedirection(fd_slice, .Out);
+                            }
+                        } else {
+                            // It's a word (may continue with non-digit chars)
+                            const result = try self.readWord() orelse break :state null;
+                            // Check if word continues (e.g., followed by quote)
+                            // Only peek if word wasn't truncated by buffer - otherwise slice would be invalidated
+                            const at_boundary = if (result.complete)
+                                self.isWordComplete(try self.peekByte())
+                            else
+                                false;
+                            break :state self.makeToken(.{ .Literal = result.slice }, at_boundary);
+                        }
+                    },
+                    else => {
+                        if (!isPlainCharacter(first)) {
+                            // Consume the unhandled character to avoid infinite loop
+                            _ = try self.consumeOne();
+                            break :state null;
+                        }
+                        const result = try self.readWord() orelse break :state null;
+                        // Check if word continues (e.g., followed by quote)
+                        // Only peek if word wasn't truncated by buffer - otherwise slice would be invalidated
+                        const at_boundary = if (result.complete)
+                            self.isWordComplete(try self.peekByte())
+                        else
+                            false;
+                        break :state self.makeToken(.{ .Literal = result.slice }, at_boundary);
+                    },
+                }
             },
-        }
+        };
     }
 
     /// Finish parsing a redirection operator and emit the token.
