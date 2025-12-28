@@ -35,8 +35,117 @@ fn dumpTokens(reader: *std.io.Reader, writer: *std.io.Writer) !usize {
     return token_count;
 }
 
+/// Dump a Word to the writer.
+fn dumpWord(word: tsh.Word, writer: *std.io.Writer) !void {
+    if (word.parts.len == 0) {
+        try writer.writeAll("\"\"");
+        return;
+    }
+
+    if (word.parts.len == 1) {
+        switch (word.parts[0]) {
+            .literal => |lit| try writer.print("\"{s}\"", .{lit}),
+        }
+        return;
+    }
+
+    // Multiple parts - show as list
+    try writer.writeByte('[');
+    for (word.parts, 0..) |part, i| {
+        if (i > 0) try writer.writeAll(", ");
+        switch (part) {
+            .literal => |lit| try writer.print("\"{s}\"", .{lit}),
+        }
+    }
+    try writer.writeByte(']');
+}
+
+/// Dump a parsed command to the writer in human-readable format.
+fn dumpCommand(cmd: tsh.SimpleCommand, writer: *std.io.Writer) !void {
+    try writer.writeAll("SimpleCommand:\n");
+
+    // Assignments
+    if (cmd.assignments.len > 0) {
+        try writer.writeAll("  assignments:\n");
+        for (cmd.assignments, 0..) |assignment, i| {
+            try writer.print("    [{d}] {s} = ", .{ i, assignment.name });
+            try dumpWord(assignment.value, writer);
+            try writer.writeByte('\n');
+        }
+    }
+
+    // Argv
+    if (cmd.argv.len > 0) {
+        try writer.writeAll("  argv:\n");
+        for (cmd.argv, 0..) |word, i| {
+            try writer.print("    [{d}] ", .{i});
+            try dumpWord(word, writer);
+            try writer.writeByte('\n');
+        }
+    }
+
+    // Redirections
+    if (cmd.redirections.len > 0) {
+        try writer.writeAll("  redirections:\n");
+        for (cmd.redirections, 0..) |redir, i| {
+            try writer.print("    [{d}] ", .{i});
+            if (redir.source_fd) |fd| {
+                try writer.print("{d}", .{fd});
+            }
+            switch (redir.op) {
+                .In => try writer.writeByte('<'),
+                .Out => try writer.writeByte('>'),
+                .Append => try writer.writeAll(">>"),
+                .Fd => try writer.writeAll(">&"),
+            }
+            try writer.writeByte(' ');
+            try dumpWord(redir.target, writer);
+            try writer.writeByte('\n');
+        }
+    }
+}
+
+/// Parse and dump all commands from the reader.
+fn parseAndDump(allocator: std.mem.Allocator, reader: *std.io.Reader, writer: *std.io.Writer) !usize {
+    var lexer = tsh.Lexer.init(reader);
+    var command_count: usize = 0;
+
+    while (true) {
+        var parser = tsh.Parser.init(allocator, &lexer);
+
+        const cmd = parser.parseCommand() catch |err| {
+            if (parser.getErrorInfo()) |info| {
+                try writer.print("[{d}:{d}] Error: {s} ({s})\n", .{
+                    info.line,
+                    info.column,
+                    info.message,
+                    @errorName(err),
+                });
+            } else {
+                try writer.print("Error: {s}\n", .{@errorName(err)});
+            }
+            // Stop processing on parse error - recovery is complex and error-prone
+            break;
+        };
+
+        if (cmd) |c| {
+            try dumpCommand(c, writer);
+            try writer.writeByte('\n');
+            command_count += 1;
+        }
+
+        // Check if we've reached end of input
+        if (reader.bufferedLen() == 0) {
+            break;
+        }
+    }
+
+    return command_count;
+}
+
 const Command = enum {
     dump_tokens,
+    parse,
     help,
 };
 
@@ -46,7 +155,8 @@ fn printUsage() void {
         \\
         \\Options:
         \\  --dump-tokens  Dump lexer tokens (default behavior)
-        \\  --help         Show this help message
+        \\  --parse, -p    Parse and dump AST
+        \\  --help, -h     Show this help message
         \\
         \\If no file is provided, reads from stdin.
         \\
@@ -54,7 +164,10 @@ fn printUsage() void {
 }
 
 pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
 
@@ -67,6 +180,8 @@ pub fn main() !void {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--dump-tokens")) {
             command = .dump_tokens;
+        } else if (std.mem.eql(u8, arg, "--parse") or std.mem.eql(u8, arg, "-p")) {
+            command = .parse;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             command = .help;
         } else if (arg.len > 0 and arg[0] == '-') {
@@ -107,6 +222,13 @@ pub fn main() !void {
             _ = try dumpTokens(&file_reader.interface, &stderr_writer.interface);
             try stderr_writer.interface.flush();
         },
+        .parse => {
+            // Use an arena for parser allocations
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            _ = try parseAndDump(arena.allocator(), &file_reader.interface, &stderr_writer.interface);
+            try stderr_writer.interface.flush();
+        },
         .help => unreachable, // handled above
     }
 }
@@ -124,6 +246,23 @@ fn runTest(input: []const u8) ![]u8 {
 
 fn expectOutput(input: []const u8, expected: []const u8) !void {
     const output = try runTest(input);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings(expected, output);
+}
+
+fn runParseTest(input: []const u8) ![]u8 {
+    var reader = std.io.Reader.fixed(input);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var writer = std.io.Writer.Allocating.init(std.testing.allocator);
+    errdefer writer.deinit();
+    _ = try parseAndDump(arena.allocator(), &reader, &writer.writer);
+
+    return writer.toOwnedSlice();
+}
+
+fn expectParseOutput(input: []const u8, expected: []const u8) !void {
+    const output = try runParseTest(input);
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(expected, output);
 }
@@ -281,6 +420,60 @@ test "CLI: fd redirection at newline emits incomplete token" {
     // Lexer emits the redirection; parser would validate target
     try expectOutput(">&\n",
         \\[1:1] Redirection(>&) [incomplete]
+        \\
+        \\
+    );
+}
+
+// --- Parser CLI tests ---
+
+test "CLI parse: simple command" {
+    try expectParseOutput("cmd arg1 arg2\n",
+        \\SimpleCommand:
+        \\  argv:
+        \\    [0] "cmd"
+        \\    [1] "arg1"
+        \\    [2] "arg2"
+        \\
+        \\
+    );
+}
+
+test "CLI parse: assignment with command" {
+    try expectParseOutput("FOO=bar cmd\n",
+        \\SimpleCommand:
+        \\  assignments:
+        \\    [0] FOO = "bar"
+        \\  argv:
+        \\    [0] "cmd"
+        \\
+        \\
+    );
+}
+
+test "CLI parse: command with redirections" {
+    try expectParseOutput("cmd >out 2>&1\n",
+        \\SimpleCommand:
+        \\  argv:
+        \\    [0] "cmd"
+        \\  redirections:
+        \\    [0] > "out"
+        \\    [1] 2>& "1"
+        \\
+        \\
+    );
+}
+
+test "CLI parse: complex command" {
+    try expectParseOutput("FOO=bar cmd 'arg 1' >out\n",
+        \\SimpleCommand:
+        \\  assignments:
+        \\    [0] FOO = "bar"
+        \\  argv:
+        \\    [0] "cmd"
+        \\    [1] "arg 1"
+        \\  redirections:
+        \\    [0] > "out"
         \\
         \\
     );
