@@ -588,18 +588,25 @@ pub const Parser = struct {
     ///   - the number overflows u32
     fn wordPartsToFdNumber(parts: []const WordPart) ?u32 {
         if (parts.len == 0) return null;
+
         var result: u32 = 0;
+
         for (parts) |part| {
-            switch (part) {
-                .literal => |lit| {
-                    for (lit) |c| {
-                        if (c < '0' or c > '9') return null;
-                        const digit = c - '0';
-                        result = std.math.mul(u32, result, 10) catch return null;
-                        result = std.math.add(u32, result, digit) catch return null;
-                    }
-                },
+            const lit = switch (part) {
+                .literal => |l| l,
+            };
+            if (lit.len == 0) continue;
+
+            // Parse this part as an integer
+            const part_value = std.fmt.parseInt(u32, lit, 10) catch return null;
+
+            // Shift result left by the number of digits in this part
+            for (0..lit.len) |_| {
+                result = std.math.mul(u32, result, 10) catch return null;
             }
+
+            // Add the new part's value
+            result = std.math.add(u32, result, part_value) catch return null;
         }
         return result;
     }
