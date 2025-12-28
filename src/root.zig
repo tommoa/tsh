@@ -11,7 +11,6 @@ pub const Token = lexer.Token;
 pub const TokenType = lexer.TokenType;
 pub const LexerError = lexer.LexerError;
 pub const Redirection = lexer.Redirection;
-pub const RedirectionOp = lexer.RedirectionOp;
 
 pub const Parser = parser.Parser;
 pub const ParseError = parser.ParseError;

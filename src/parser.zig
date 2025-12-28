@@ -52,14 +52,24 @@ pub const Assignment = struct {
     column: usize,
 };
 
+/// The target of a redirection operation.
+pub const RedirectionTarget = union(enum) {
+    /// For file redirections (In, Out, Append): the target filename.
+    file: Word,
+    /// For fd duplication (Fd): the target file descriptor number.
+    fd: u32,
+    /// For fd close (Fd with "-" target): close the source fd.
+    close,
+};
+
 /// A parsed redirection with its target.
 pub const ParsedRedirection = struct {
     /// The type of redirection operation.
-    op: lexer.RedirectionOp,
+    op: lexer.Redirection,
     /// The source file descriptor (e.g., "2" in "2>file"), if specified.
     source_fd: ?u32,
-    /// The target of the redirection (file path or fd number as a word).
-    target: Word,
+    /// The target of the redirection.
+    target: RedirectionTarget,
     /// The absolute position in the input where this redirection starts.
     position: usize,
     /// The line number where this redirection starts (1-indexed).
@@ -84,6 +94,8 @@ pub const ParseError = error{
     UnexpectedEndOfInput,
     /// A redirection operator was not followed by a target.
     MissingRedirectionTarget,
+    /// For >& or <&, the target must be a digit sequence or '-'.
+    InvalidFdRedirectionTarget,
 } || lexer.LexerError || Allocator.Error;
 
 /// Information about a parse error for error reporting.
@@ -122,11 +134,14 @@ const ParseState = enum {
 
 /// Pending redirection info while collecting target.
 const PendingRedir = struct {
-    op: lexer.RedirectionOp,
+    op: lexer.Redirection,
     source_fd: ?u32,
     position: usize,
     line: usize,
     column: usize,
+    /// End position of the redirection operator (for error reporting).
+    end_line: usize,
+    end_column: usize,
 };
 
 /// Parser for POSIX shell simple commands.
@@ -259,11 +274,51 @@ pub const Parser = struct {
                     continue :state .word_complete;
                 };
 
-                try self.addTokenToParts(tok);
-                if (tok.complete) {
-                    continue :state .word_complete;
-                } else {
-                    continue :state .collecting_word;
+                switch (tok.type) {
+                    .Redirection => |redir| {
+                        // Encountered redirection while collecting word.
+                        // Try to interpret word_parts as a source fd number.
+                        // If successful, use it as the source fd for this redirection.
+                        // If not (overflow, non-digits), treat word as a regular argument.
+                        if (wordPartsToFdNumber(self.word_parts.items)) |source_fd| {
+                            // Valid source fd - use it for the redirection
+                            self.word_parts = .{};
+                            self.pending_redir = .{
+                                .op = redir,
+                                .source_fd = source_fd,
+                                .position = self.word_start_position,
+                                .line = self.word_start_line,
+                                .column = self.word_start_column,
+                                .end_line = tok.end_line,
+                                .end_column = tok.end_column,
+                            };
+                            continue :state .need_redir_target;
+                        } else {
+                            // Not a valid fd - finalize word as argument and handle redirection
+                            const word = try self.finishWord();
+                            if (!self.seen_command) {
+                                if (try self.tryBuildAssignment(word)) |assignment| {
+                                    try self.assignments.append(self.allocator, assignment);
+                                } else {
+                                    try self.argv.append(self.allocator, word);
+                                    self.seen_command = true;
+                                }
+                            } else {
+                                try self.argv.append(self.allocator, word);
+                            }
+                            // Now handle the redirection with default source fd
+                            self.setPendingRedir(redir, tok);
+                            continue :state .need_redir_target;
+                        }
+                    },
+                    else => {
+                        try self.addTokenToParts(tok);
+                        if (tok.complete) {
+                            continue :state .word_complete;
+                        } else {
+                            continue :state .collecting_word;
+                        }
+                    },
                 }
             },
 
@@ -272,15 +327,17 @@ pub const Parser = struct {
                     self.setError("lexer error reading redirection target", self.lex.position, self.lex.line, self.lex.column);
                     return err;
                 } orelse {
+                    // EOF - error points to end of redirection operator
                     const redir = self.pending_redir.?;
-                    self.setError("missing redirection target", redir.position, redir.line, redir.column);
+                    self.setError("missing redirection target", redir.position, redir.end_line, redir.end_column);
                     return ParseError.MissingRedirectionTarget;
                 };
 
                 switch (tok.type) {
                     .Redirection => {
+                        // Another redirection where target was expected - error points to end of first redirection
                         const redir = self.pending_redir.?;
-                        self.setError("missing redirection target", redir.position, redir.line, redir.column);
+                        self.setError("missing redirection target", redir.position, redir.end_line, redir.end_column);
                         return ParseError.MissingRedirectionTarget;
                     },
                     else => {
@@ -300,10 +357,15 @@ pub const Parser = struct {
 
                 // If we have a pending redirection, this word is its target
                 if (self.pending_redir) |redir| {
+                    const target: RedirectionTarget = if (redir.op == .Fd)
+                        try self.parseFdTarget(word)
+                    else
+                        .{ .file = word };
+
                     try self.redirections.append(self.allocator, .{
                         .op = redir.op,
                         .source_fd = redir.source_fd,
-                        .target = word,
+                        .target = target,
                         .position = redir.position,
                         .line = redir.line,
                         .column = redir.column,
@@ -378,19 +440,16 @@ pub const Parser = struct {
         };
     }
 
-    /// Set up pending redirection info.
+    /// Set up pending redirection info with default source fd (null).
     fn setPendingRedir(self: *Parser, redir: lexer.Redirection, tok: lexer.Token) void {
-        const source_fd: ?u32 = if (redir.fd) |fd_str|
-            std.fmt.parseInt(u32, fd_str, 10) catch null
-        else
-            null;
-
         self.pending_redir = .{
-            .op = redir.operation.?,
-            .source_fd = source_fd,
+            .op = redir,
+            .source_fd = null,
             .position = tok.position,
             .line = tok.line,
             .column = tok.column,
+            .end_line = tok.end_line,
+            .end_column = tok.end_column,
         };
     }
 
@@ -521,6 +580,56 @@ pub const Parser = struct {
             .column = column,
         };
     }
+
+    /// Try to convert word parts to an fd number.
+    /// Returns null if:
+    ///   - parts is empty
+    ///   - any part contains non-digit characters
+    ///   - the number overflows u32
+    fn wordPartsToFdNumber(parts: []const WordPart) ?u32 {
+        if (parts.len == 0) return null;
+        var result: u32 = 0;
+        for (parts) |part| {
+            switch (part) {
+                .literal => |lit| {
+                    for (lit) |c| {
+                        if (c < '0' or c > '9') return null;
+                        const digit = c - '0';
+                        result = std.math.mul(u32, result, 10) catch return null;
+                        result = std.math.add(u32, result, digit) catch return null;
+                    }
+                },
+            }
+        }
+        return result;
+    }
+
+    /// Parse an fd duplication target from a word.
+    /// Valid targets are:
+    ///   - "-" (close the source fd)
+    ///   - A digit sequence (duplicate to that fd)
+    /// Returns InvalidFdRedirectionTarget if the word is not a valid fd target.
+    fn parseFdTarget(self: *Parser, word: Word) ParseError!RedirectionTarget {
+        // Check for close: exactly one part that is "-"
+        if (word.parts.len == 1) {
+            switch (word.parts[0]) {
+                .literal => |lit| {
+                    if (std.mem.eql(u8, lit, "-")) {
+                        return .close;
+                    }
+                },
+            }
+        }
+
+        // Check for fd number: all parts must be digits and fit in u32
+        if (wordPartsToFdNumber(word.parts)) |fd| {
+            return .{ .fd = fd };
+        }
+
+        // Invalid target (non-digits or overflow)
+        self.setError("invalid fd redirection target (expected digits or '-')", word.position, word.line, word.column);
+        return ParseError.InvalidFdRedirectionTarget;
+    }
 };
 
 // --- Parser tests ---
@@ -554,6 +663,30 @@ fn expectSimpleCommand(
     }
 
     try std.testing.expectEqual(expected_redirections, c.redirections.len);
+}
+
+fn expectFileTarget(target: RedirectionTarget, expected_parts: []const []const u8) !void {
+    switch (target) {
+        .file => |word| try expectWord(word, expected_parts),
+        .fd => return error.ExpectedFileTarget,
+        .close => return error.ExpectedFileTarget,
+    }
+}
+
+fn expectFdTarget(target: RedirectionTarget, expected_fd: u32) !void {
+    switch (target) {
+        .fd => |fd| try std.testing.expectEqual(expected_fd, fd),
+        .file => return error.ExpectedFdTarget,
+        .close => return error.ExpectedFdTarget,
+    }
+}
+
+fn expectCloseTarget(target: RedirectionTarget) !void {
+    switch (target) {
+        .close => {},
+        .file => return error.ExpectedCloseTarget,
+        .fd => return error.ExpectedCloseTarget,
+    }
 }
 
 test "parseCommand: empty input returns null" {
@@ -704,9 +837,9 @@ test "parseCommand: simple redirection" {
     try std.testing.expectEqual(@as(usize, 1), cmd.redirections.len);
 
     const redir = cmd.redirections[0];
-    try std.testing.expectEqual(lexer.RedirectionOp.Out, redir.op);
+    try std.testing.expectEqual(lexer.Redirection.Out, redir.op);
     try std.testing.expectEqual(@as(?u32, null), redir.source_fd);
-    try expectWord(redir.target, &.{"file"});
+    try expectFileTarget(redir.target, &.{"file"});
 }
 
 test "parseCommand: command with redirection" {
@@ -721,7 +854,7 @@ test "parseCommand: command with redirection" {
 
     try std.testing.expectEqual(@as(usize, 1), cmd.argv.len);
     try std.testing.expectEqual(@as(usize, 1), cmd.redirections.len);
-    try expectWord(cmd.redirections[0].target, &.{"out"});
+    try expectFileTarget(cmd.redirections[0].target, &.{"out"});
 }
 
 test "parseCommand: fd redirection 2>&1" {
@@ -738,9 +871,9 @@ test "parseCommand: fd redirection 2>&1" {
     try std.testing.expectEqual(@as(usize, 1), cmd.redirections.len);
 
     const redir = cmd.redirections[0];
-    try std.testing.expectEqual(lexer.RedirectionOp.Fd, redir.op);
+    try std.testing.expectEqual(lexer.Redirection.Fd, redir.op);
     try std.testing.expectEqual(@as(?u32, 2), redir.source_fd);
-    try expectWord(redir.target, &.{"1"});
+    try expectFdTarget(redir.target, 1);
 }
 
 test "parseCommand: multiple redirections" {
@@ -756,9 +889,9 @@ test "parseCommand: multiple redirections" {
     try std.testing.expectEqual(@as(usize, 1), cmd.argv.len);
     try std.testing.expectEqual(@as(usize, 3), cmd.redirections.len);
 
-    try std.testing.expectEqual(lexer.RedirectionOp.Out, cmd.redirections[0].op);
-    try std.testing.expectEqual(lexer.RedirectionOp.Fd, cmd.redirections[1].op);
-    try std.testing.expectEqual(lexer.RedirectionOp.In, cmd.redirections[2].op);
+    try std.testing.expectEqual(lexer.Redirection.Out, cmd.redirections[0].op);
+    try std.testing.expectEqual(lexer.Redirection.Fd, cmd.redirections[1].op);
+    try std.testing.expectEqual(lexer.Redirection.In, cmd.redirections[2].op);
 }
 
 test "parseCommand: missing redirection target" {
@@ -806,6 +939,46 @@ test "parseCommand: double-quoted word" {
         &.{&.{"hello world"}},
         0,
     );
+}
+
+test "parseCommand: quoted redirection-like string is literal" {
+    // "2>&1" in quotes should be a literal argument, not a redirection
+    var reader = std.io.Reader.fixed("cmd \"2>&1\"\n");
+    var lex = lexer.Lexer.init(&reader);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    const cmd = result orelse return error.ExpectedCommand;
+
+    // Should have 2 argv items: "cmd" and "2>&1"
+    try std.testing.expectEqual(@as(usize, 2), cmd.argv.len);
+    try expectWord(cmd.argv[0], &.{"cmd"});
+    try expectWord(cmd.argv[1], &.{ "2", ">", "&", "1" }); // Separate tokens from double-quote parsing
+
+    // No redirections
+    try std.testing.expectEqual(@as(usize, 0), cmd.redirections.len);
+}
+
+test "parseCommand: single-quoted redirection-like string is literal" {
+    // '2>&1' in single quotes should be a literal argument, not a redirection
+    var reader = std.io.Reader.fixed("cmd '2>&1'\n");
+    var lex = lexer.Lexer.init(&reader);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    const cmd = result orelse return error.ExpectedCommand;
+
+    // Should have 2 argv items: "cmd" and "2>&1"
+    try std.testing.expectEqual(@as(usize, 2), cmd.argv.len);
+    try expectWord(cmd.argv[0], &.{"cmd"});
+    try expectWord(cmd.argv[1], &.{"2>&1"}); // Single quotes preserve content as-is
+
+    // No redirections
+    try std.testing.expectEqual(@as(usize, 0), cmd.redirections.len);
 }
 
 test "parseCommand: mixed quotes in word" {
@@ -875,4 +1048,419 @@ test "parseCommand: assignment after command is not assignment" {
         &.{ &.{"cmd"}, &.{"FOO=bar"} }, // FOO=bar is an argument
         0,
     );
+}
+
+// --- Fd duplication validation tests ---
+
+test "parseCommand: fd close >&-" {
+    var reader = std.io.Reader.fixed("cmd >&-\n");
+    var lex = lexer.Lexer.init(&reader);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    const cmd = result orelse return error.ExpectedCommand;
+
+    try std.testing.expectEqual(@as(usize, 1), cmd.argv.len);
+    try std.testing.expectEqual(@as(usize, 1), cmd.redirections.len);
+
+    const redir = cmd.redirections[0];
+    try std.testing.expectEqual(lexer.Redirection.Fd, redir.op);
+    try std.testing.expectEqual(@as(?u32, null), redir.source_fd);
+    try expectCloseTarget(redir.target);
+}
+
+test "parseCommand: fd close 2>&-" {
+    var reader = std.io.Reader.fixed("cmd 2>&-\n");
+    var lex = lexer.Lexer.init(&reader);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    const cmd = result orelse return error.ExpectedCommand;
+
+    try std.testing.expectEqual(@as(usize, 1), cmd.redirections.len);
+
+    const redir = cmd.redirections[0];
+    try std.testing.expectEqual(lexer.Redirection.Fd, redir.op);
+    try std.testing.expectEqual(@as(?u32, 2), redir.source_fd);
+    try expectCloseTarget(redir.target);
+}
+
+test "parseCommand: invalid fd target >&foo errors" {
+    var reader = std.io.Reader.fixed("cmd >&foo\n");
+    var lex = lexer.Lexer.init(&reader);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = parser_inst.parseCommand();
+    try std.testing.expectError(ParseError.InvalidFdRedirectionTarget, result);
+
+    const err_info = parser_inst.getErrorInfo();
+    try std.testing.expect(err_info != null);
+}
+
+test "parseCommand: invalid fd target >&1x errors" {
+    // "1x" is not a valid fd (contains non-digit)
+    var reader = std.io.Reader.fixed("cmd >&1x\n");
+    var lex = lexer.Lexer.init(&reader);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = parser_inst.parseCommand();
+    try std.testing.expectError(ParseError.InvalidFdRedirectionTarget, result);
+}
+
+test "parseCommand: escaped quote after fd target errors" {
+    // \'2>&1\' - the trailing \' makes target "1'" which is invalid
+    var reader = std.io.Reader.fixed("\\'2>&1\\'\n");
+    var lex = lexer.Lexer.init(&reader);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = parser_inst.parseCommand();
+    try std.testing.expectError(ParseError.InvalidFdRedirectionTarget, result);
+}
+
+// --- Buffer boundary tests ---
+
+test "parseCommand: fd redirection 2>&1 with buffer boundary" {
+    // Test that 2>&1 is correctly parsed when buffer boundary falls within the fd prefix.
+    // The parser should correctly combine the split digits into source_fd=2.
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    _ = try std.posix.write(pipe[1], "cmd 2>&1\n");
+    std.posix.close(pipe[1]);
+
+    // Small buffer that forces splits within the input
+    const file = std.fs.File{ .handle = pipe[0] };
+    var small_buf: [1]u8 = undefined;
+    var file_reader = file.reader(&small_buf);
+    var lex = lexer.Lexer.init(&file_reader.interface);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    const cmd = result orelse return error.ExpectedCommand;
+
+    try std.testing.expectEqual(@as(usize, 1), cmd.argv.len);
+    try expectWord(cmd.argv[0], &.{"cmd"});
+
+    try std.testing.expectEqual(@as(usize, 1), cmd.redirections.len);
+    const redir = cmd.redirections[0];
+    try std.testing.expectEqual(lexer.Redirection.Fd, redir.op);
+    try std.testing.expectEqual(@as(?u32, 2), redir.source_fd);
+    try expectFdTarget(redir.target, 1);
+}
+
+test "parseCommand: multi-digit fd 12>&1 with buffer boundary" {
+    // Test that 12>&1 is correctly parsed when buffer boundary splits the fd digits.
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    _ = try std.posix.write(pipe[1], "cmd 12>&1\n");
+    std.posix.close(pipe[1]);
+
+    const file = std.fs.File{ .handle = pipe[0] };
+    var small_buf: [1]u8 = undefined;
+    var file_reader = file.reader(&small_buf);
+    var lex = lexer.Lexer.init(&file_reader.interface);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    const cmd = result orelse return error.ExpectedCommand;
+
+    try std.testing.expectEqual(@as(usize, 1), cmd.argv.len);
+    try std.testing.expectEqual(@as(usize, 1), cmd.redirections.len);
+
+    const redir = cmd.redirections[0];
+    try std.testing.expectEqual(lexer.Redirection.Fd, redir.op);
+    try std.testing.expectEqual(@as(?u32, 12), redir.source_fd);
+    try expectFdTarget(redir.target, 1);
+}
+
+test "parseCommand: non-digit word before redirection with buffer boundary" {
+    // Test that a2>file correctly treats "a2" as a word and ">file" as redirection.
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    _ = try std.posix.write(pipe[1], "a2>file\n");
+    std.posix.close(pipe[1]);
+
+    const file = std.fs.File{ .handle = pipe[0] };
+    var small_buf: [1]u8 = undefined;
+    var file_reader = file.reader(&small_buf);
+    var lex = lexer.Lexer.init(&file_reader.interface);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    const cmd = result orelse return error.ExpectedCommand;
+
+    // "a2" should be argv[0], redirection should be separate
+    try std.testing.expectEqual(@as(usize, 1), cmd.argv.len);
+    try expectWord(cmd.argv[0], &.{ "a", "2" }); // Split across buffer boundaries
+
+    try std.testing.expectEqual(@as(usize, 1), cmd.redirections.len);
+    const redir = cmd.redirections[0];
+    try std.testing.expectEqual(lexer.Redirection.Out, redir.op);
+    try std.testing.expectEqual(@as(?u32, null), redir.source_fd);
+    try expectFileTarget(redir.target, &.{"file"});
+}
+
+test "parseCommand: input fd redirection 0<&3 with buffer boundary" {
+    // Test input fd duplication with buffer boundary.
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    _ = try std.posix.write(pipe[1], "cmd 0<&3\n");
+    std.posix.close(pipe[1]);
+
+    const file = std.fs.File{ .handle = pipe[0] };
+    var small_buf: [1]u8 = undefined;
+    var file_reader = file.reader(&small_buf);
+    var lex = lexer.Lexer.init(&file_reader.interface);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    const cmd = result orelse return error.ExpectedCommand;
+
+    try std.testing.expectEqual(@as(usize, 1), cmd.argv.len);
+    try expectWord(cmd.argv[0], &.{"cmd"});
+
+    try std.testing.expectEqual(@as(usize, 1), cmd.redirections.len);
+    const redir = cmd.redirections[0];
+    try std.testing.expectEqual(lexer.Redirection.Fd, redir.op);
+    try std.testing.expectEqual(@as(?u32, 0), redir.source_fd);
+    try expectFdTarget(redir.target, 3);
+}
+
+test "parseCommand: input redirection 0<file with buffer boundary" {
+    // Test input redirection with fd prefix and buffer boundary.
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    _ = try std.posix.write(pipe[1], "cmd 0<input\n");
+    std.posix.close(pipe[1]);
+
+    const file = std.fs.File{ .handle = pipe[0] };
+    var small_buf: [1]u8 = undefined;
+    var file_reader = file.reader(&small_buf);
+    var lex = lexer.Lexer.init(&file_reader.interface);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    const cmd = result orelse return error.ExpectedCommand;
+
+    try std.testing.expectEqual(@as(usize, 1), cmd.argv.len);
+    try std.testing.expectEqual(@as(usize, 1), cmd.redirections.len);
+
+    const redir = cmd.redirections[0];
+    try std.testing.expectEqual(lexer.Redirection.In, redir.op);
+    try std.testing.expectEqual(@as(?u32, 0), redir.source_fd);
+    try expectFileTarget(redir.target, &.{"input"});
+}
+
+// --- Fuzz test for buffer boundary invariance ---
+
+/// Parse input with a fixed reader (large buffer) and return semantic results.
+fn parseWithFixedReader(allocator: Allocator, input: []const u8) !?SimpleCommand {
+    var reader = std.io.Reader.fixed(input);
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(allocator, &lex);
+    return parser_inst.parseCommand();
+}
+
+/// Parse input with a pipe-based reader (small buffer) and return semantic results.
+fn parseWithSmallBuffer(allocator: Allocator, input: []const u8, buf_size: usize) !?SimpleCommand {
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    _ = try std.posix.write(pipe[1], input);
+    std.posix.close(pipe[1]);
+
+    const file = std.fs.File{ .handle = pipe[0] };
+
+    // Use buffer size 1-5 based on buf_size parameter
+    var small_buf_1: [1]u8 = undefined;
+    var small_buf_2: [2]u8 = undefined;
+    var small_buf_3: [3]u8 = undefined;
+    var small_buf_4: [4]u8 = undefined;
+    var small_buf_5: [5]u8 = undefined;
+
+    switch (buf_size) {
+        1 => {
+            var file_reader = file.reader(&small_buf_1);
+            var lex = lexer.Lexer.init(&file_reader.interface);
+            var parser_inst = Parser.init(allocator, &lex);
+            return parser_inst.parseCommand();
+        },
+        2 => {
+            var file_reader = file.reader(&small_buf_2);
+            var lex = lexer.Lexer.init(&file_reader.interface);
+            var parser_inst = Parser.init(allocator, &lex);
+            return parser_inst.parseCommand();
+        },
+        3 => {
+            var file_reader = file.reader(&small_buf_3);
+            var lex = lexer.Lexer.init(&file_reader.interface);
+            var parser_inst = Parser.init(allocator, &lex);
+            return parser_inst.parseCommand();
+        },
+        4 => {
+            var file_reader = file.reader(&small_buf_4);
+            var lex = lexer.Lexer.init(&file_reader.interface);
+            var parser_inst = Parser.init(allocator, &lex);
+            return parser_inst.parseCommand();
+        },
+        else => {
+            var file_reader = file.reader(&small_buf_5);
+            var lex = lexer.Lexer.init(&file_reader.interface);
+            var parser_inst = Parser.init(allocator, &lex);
+            return parser_inst.parseCommand();
+        },
+    }
+}
+
+/// Concatenate word parts into a single string for comparison.
+fn wordToString(allocator: Allocator, word: Word) ![]const u8 {
+    var result: std.ArrayListUnmanaged(u8) = .{};
+    for (word.parts) |part| {
+        switch (part) {
+            .literal => |lit| try result.appendSlice(allocator, lit),
+        }
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+/// Compare two SimpleCommands for semantic equality.
+fn commandsEqual(allocator: Allocator, a: ?SimpleCommand, b: ?SimpleCommand) !bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+
+    const cmd_a = a.?;
+    const cmd_b = b.?;
+
+    // Compare assignments
+    if (cmd_a.assignments.len != cmd_b.assignments.len) return false;
+    for (cmd_a.assignments, cmd_b.assignments) |ass_a, ass_b| {
+        if (!std.mem.eql(u8, ass_a.name, ass_b.name)) return false;
+        const val_a = try wordToString(allocator, ass_a.value);
+        const val_b = try wordToString(allocator, ass_b.value);
+        if (!std.mem.eql(u8, val_a, val_b)) return false;
+    }
+
+    // Compare argv
+    if (cmd_a.argv.len != cmd_b.argv.len) return false;
+    for (cmd_a.argv, cmd_b.argv) |word_a, word_b| {
+        const str_a = try wordToString(allocator, word_a);
+        const str_b = try wordToString(allocator, word_b);
+        if (!std.mem.eql(u8, str_a, str_b)) return false;
+    }
+
+    // Compare redirections
+    if (cmd_a.redirections.len != cmd_b.redirections.len) return false;
+    for (cmd_a.redirections, cmd_b.redirections) |redir_a, redir_b| {
+        if (redir_a.op != redir_b.op) return false;
+        if (redir_a.source_fd != redir_b.source_fd) return false;
+        // Compare targets based on their type
+        switch (redir_a.target) {
+            .file => |word_a| {
+                switch (redir_b.target) {
+                    .file => |word_b| {
+                        const str_a = try wordToString(allocator, word_a);
+                        const str_b = try wordToString(allocator, word_b);
+                        if (!std.mem.eql(u8, str_a, str_b)) return false;
+                    },
+                    else => return false,
+                }
+            },
+            .fd => |fd_a| {
+                switch (redir_b.target) {
+                    .fd => |fd_b| {
+                        if (fd_a != fd_b) return false;
+                    },
+                    else => return false,
+                }
+            },
+            .close => {
+                switch (redir_b.target) {
+                    .close => {},
+                    else => return false,
+                }
+            },
+        }
+    }
+
+    return true;
+}
+
+test "parseCommand: buffer boundary invariance for fd redirections" {
+    // Test that specific fd-related inputs parse identically across buffer sizes.
+    const test_inputs = [_][]const u8{
+        "2>&1\n",
+        "12>&1\n",
+        "cmd 2>&1\n",
+        "cmd 12>file\n",
+        "a2>file\n",
+        "2>file\n",
+        "cmd >out 2>&1\n",
+        "FOO=bar cmd 2>&1\n",
+        // Input redirections
+        "0<&3\n",
+        "cmd 0<&3\n",
+        "0<input\n",
+        "cmd 0<input\n",
+        "3<&0\n",
+        // Quoted redirection-like strings (should be literals, not redirections)
+        "cmd \"2>&1\"\n",
+        "cmd '2>&1'\n",
+    };
+
+    for (test_inputs) |input| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+
+        // Parse with large buffer (reference result)
+        const ref_result = try parseWithFixedReader(arena.allocator(), input);
+
+        // Parse with various small buffer sizes and compare
+        for (1..6) |buf_size| {
+            var arena2 = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena2.deinit();
+
+            const small_result = parseWithSmallBuffer(arena2.allocator(), input, buf_size) catch |err| {
+                // If small buffer parse fails, reference should also fail or be null
+                if (ref_result != null) {
+                    std.debug.print("Small buffer (size {d}) failed but reference succeeded for: {s}\n", .{ buf_size, input });
+                    return err;
+                }
+                continue;
+            };
+
+            if (!try commandsEqual(arena2.allocator(), ref_result, small_result)) {
+                std.debug.print("Mismatch for input '{s}' with buffer size {d}\n", .{ input, buf_size });
+                return error.BufferBoundaryMismatch;
+            }
+        }
+    }
 }

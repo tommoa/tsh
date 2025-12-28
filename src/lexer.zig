@@ -1,4 +1,3 @@
-//! By convention, root.zig is the root source file when making a library.
 //! This file implements a basic lexer for POSIX shell.
 //!
 //! The subset of POSIX that this file implements:
@@ -19,28 +18,29 @@
 //! These are valid "simple" commands.
 const std = @import("std");
 
-/// The type of redirection occurring.
-pub const RedirectionOp = enum { In, Out, Append, Fd };
-
 /// A redirection operation.
-/// The target is not included - it is emitted as separate tokens following this one.
 ///
-/// Note: Redirection tokens with complete=false do NOT set in_continuation,
-/// because whitespace is allowed between the operator and target (e.g., "> file").
-/// The complete flag tells the parser to collect following tokens as the target,
-/// but doesn't affect lexer word-continuation behavior.
-pub const Redirection = struct {
-    /// The type of redirection occurring.
-    operation: ?RedirectionOp = null,
-    /// The file descriptor being redirected (e.g., "2" in "2>file").
-    fd: ?[]const u8 = null,
-};
+/// The target (filename or fd number) is always emitted as separate token(s) following
+/// the redirection token. The parser collects these tokens to form the complete target.
+///
+/// For file redirections (In, Out, Append): target is a filename.
+/// For fd duplication (Fd): target is a digit string (fd number) or "-" (close).
+///   The parser validates that the target is valid for fd duplication.
+///
+/// Note: Redirection tokens always have complete=false because a target must follow.
+/// Whitespace is allowed between the operator and target (e.g., "> file", ">& 1").
+///
+/// Source fd handling: The source fd (e.g., "2" in "2>file") is NOT stored in
+/// this token. Instead, it is emitted as a separate Literal token with
+/// complete=false immediately before the Redirection token. The parser is
+/// responsible for checking if a preceding incomplete literal is a valid fd.
+pub const Redirection = enum { In, Out, Append, Fd };
 
 /// The type of token returned by the lexer.
 pub const TokenType = union(enum) {
     /// A literal word.
     Literal: []const u8,
-    /// A redirection from a process to something else.
+    /// A redirection operator. The payload indicates the type of redirection.
     Redirection: Redirection,
     /// A continuation of the previous token (if it was not completed).
     Continuation: []const u8,
@@ -62,6 +62,10 @@ pub const Token = struct {
     line: usize,
     /// The column number where this token starts (1-indexed).
     column: usize,
+    /// The line number where this token ends (1-indexed).
+    end_line: usize,
+    /// The column number after the last character of this token (1-indexed).
+    end_column: usize,
     /// Whether the word boundary has been reached.
     /// When false, subsequent tokens are part of the same word.
     complete: bool,
@@ -79,14 +83,11 @@ pub const Token = struct {
             .DoubleQuoteEnd => try writer.writeAll("DoubleQuoteEnd"),
             .Redirection => |r| {
                 try writer.writeAll("Redirection(");
-                if (r.fd) |fd| try writer.print("{s}", .{fd});
-                if (r.operation) |op| {
-                    switch (op) {
-                        .In => try writer.writeByte('<'),
-                        .Out => try writer.writeByte('>'),
-                        .Append => try writer.writeAll(">>"),
-                        .Fd => try writer.writeAll(">&"),
-                    }
+                switch (r) {
+                    .In => try writer.writeByte('<'),
+                    .Out => try writer.writeByte('>'),
+                    .Append => try writer.writeAll(">>"),
+                    .Fd => try writer.writeAll(">&"),
                 }
                 try writer.writeByte(')');
             },
@@ -212,10 +213,6 @@ pub const Lexer = struct {
         };
     }
 
-    fn isDigit(c: u8) bool {
-        return c >= '0' and c <= '9';
-    }
-
     /// Check if a character completes the current word (ends it entirely).
     ///
     /// This is different from `isPlainCharacter`: a character can require special
@@ -227,6 +224,11 @@ pub const Lexer = struct {
     /// Returns true for characters that separate words (whitespace, metacharacters).
     /// Returns false for characters that continue the word with special handling
     /// (quotes, escapes) or regular content.
+    ///
+    /// Note: `<` and `>` return false because words immediately preceding a
+    /// redirection operator may be source fd prefixes (e.g., "2" in "2>file").
+    /// The parser is responsible for determining if the preceding word is a
+    /// valid fd number or should be treated as a regular argument.
     fn isWordComplete(self: *Lexer, c: ?u8) bool {
         const char = c orelse return true; // EOF is always a boundary
 
@@ -234,7 +236,8 @@ pub const Lexer = struct {
             .none, .none_escape => switch (char) {
                 // Whitespace and metacharacters end words
                 // Quotes and backslash do NOT end words - they continue the word
-                ' ', '\t', '\n', '<', '>', '|', ';', '&' => true,
+                // Note: < and > do NOT end words - see comment above
+                ' ', '\t', '\n', '|', ';', '&' => true,
                 else => false,
             },
             .double_quote, .double_quote_escape => switch (char) {
@@ -373,6 +376,8 @@ pub const Lexer = struct {
             .end_position = self.position,
             .line = self.token_start_line,
             .column = self.token_start_column,
+            .end_line = self.line,
+            .end_column = self.column,
             .complete = complete,
             .type = token_type,
         };
@@ -475,7 +480,7 @@ pub const Lexer = struct {
                         }
                     },
                     '$', '`' => {
-                        // Expansion - for now, treat as literal (TODO: Phase 4)
+                        // TODO: Expansion - for now, treat as literal
                         // Peek to get a slice, then consume
                         const buf = self.reader.peek(1) catch |err| switch (err) {
                             error.EndOfStream => return LexerError.UnterminatedQuote,
@@ -568,8 +573,14 @@ pub const Lexer = struct {
                         // Quote or escape follows - process it normally (word continues)
                         // Don't emit a continuation, fall through to normal processing
                         self.in_continuation = false;
+                    } else if (next == '<' or next == '>') {
+                        // Redirection operator - don't emit continuation, let normal processing handle it.
+                        // Parser will join incomplete digits with the redirection if applicable.
+                        // This handles cases like "2>&1" split across buffer boundaries.
+                        self.in_continuation = false;
+                        continue :state .none;
                     } else if (self.isWordComplete(next)) {
-                        // Whitespace or metachar - word is complete, emit empty continuation
+                        // Whitespace or other metachar - word is complete, emit empty continuation
                         self.in_continuation = false;
                         break :state self.makeToken(.{ .Continuation = "" }, true);
                     } else {
@@ -578,9 +589,16 @@ pub const Lexer = struct {
                             self.in_continuation = false;
                             break :state null;
                         };
-                        // Check if word continues after this
-                        const after = try self.peekByte();
-                        const at_boundary = self.isWordComplete(after);
+                        // Check if word continues after this.
+                        // When result.complete=true, the buffer has more data so peeking is safe.
+                        // When result.complete=false, we consumed all buffered data. Peeking might
+                        // trigger buffer refill which can invalidate the slice on streaming readers.
+                        // We conservatively mark as incomplete; the parser handles joining tokens.
+                        const at_boundary = if (result.complete) blk: {
+                            const after = try self.peekByte();
+                            // Don't mark complete if followed by redirection operator - parser may need to join
+                            break :blk if (after == '<' or after == '>') false else self.isWordComplete(after);
+                        } else false;
                         break :state self.makeToken(.{ .Continuation = result.slice }, at_boundary);
                     }
                 }
@@ -664,66 +682,16 @@ pub const Lexer = struct {
                     },
                     '<' => {
                         _ = try self.consumeOne();
-                        break :state try self.finishRedirection(null, .In);
+                        break :state try self.finishRedirection(.In);
                     },
                     '>' => {
                         _ = try self.consumeOne();
                         const next = try self.peekByte();
                         if (next == '>') {
                             _ = try self.consumeOne();
-                            break :state try self.finishRedirection(null, .Append);
+                            break :state try self.finishRedirection(.Append);
                         }
-                        break :state try self.finishRedirection(null, .Out);
-                    },
-                    '0'...'9' => {
-                        // Could be fd prefix for redirection, or a word starting with digits
-                        // Peek ahead to find the full extent of digits and check what follows
-                        const buf = self.reader.peekGreedy(1) catch |err| switch (err) {
-                            error.EndOfStream => break :state null,
-                            else => return LexerError.UnexpectedEndOfFile,
-                        };
-                        if (buf.len == 0) break :state null;
-
-                        // Find where digits end
-                        var digit_len: usize = 0;
-                        for (buf) |c| {
-                            if (isDigit(c)) {
-                                digit_len += 1;
-                            } else {
-                                break;
-                            }
-                        }
-
-                        // Check what follows the digits
-                        const after_digits: u8 = if (digit_len < buf.len) buf[digit_len] else 0;
-
-                        if (after_digits == '<' or after_digits == '>') {
-                            // It's an fd-prefixed redirection - keep fd as string slice
-                            const fd_slice = buf[0..digit_len];
-                            self.consume(fd_slice);
-                            _ = try self.consumeOne(); // consume '<' or '>'
-
-                            if (after_digits == '<') {
-                                break :state try self.finishRedirection(fd_slice, .In);
-                            } else {
-                                const next2 = try self.peekByte();
-                                if (next2 == '>') {
-                                    _ = try self.consumeOne();
-                                    break :state try self.finishRedirection(fd_slice, .Append);
-                                }
-                                break :state try self.finishRedirection(fd_slice, .Out);
-                            }
-                        } else {
-                            // It's a word (may continue with non-digit chars)
-                            const result = try self.readWord() orelse break :state null;
-                            // Check if word continues (e.g., followed by quote)
-                            // Only peek if word wasn't truncated by buffer - otherwise slice would be invalidated
-                            const at_boundary = if (result.complete)
-                                self.isWordComplete(try self.peekByte())
-                            else
-                                false;
-                            break :state self.makeToken(.{ .Literal = result.slice }, at_boundary);
-                        }
+                        break :state try self.finishRedirection(.Out);
                     },
                     else => {
                         if (!isPlainCharacter(first)) {
@@ -753,21 +721,24 @@ pub const Lexer = struct {
     ///
     /// The target is always emitted as separate token(s) following the redirection.
     /// The `complete` flag is always `false` to indicate a target must follow.
-    fn finishRedirection(self: *Lexer, fd_value: ?[]const u8, redir_op: RedirectionOp) LexerError!?Token {
+    fn finishRedirection(self: *Lexer, redir_op: Redirection) LexerError!?Token {
         // Check for >&fd or <&fd (fd duplication)
         const next = try self.peekByte();
         const op = if (next == '&') blk: {
             _ = try self.consumeOne();
-            break :blk RedirectionOp.Fd;
+            break :blk Redirection.Fd;
         } else redir_op;
 
+        // Target follows as separate token(s). Parser will collect and validate.
         return Token{
             .position = self.token_start_position,
             .end_position = self.position,
             .line = self.token_start_line,
             .column = self.token_start_column,
+            .end_line = self.line,
+            .end_column = self.column,
             .complete = false,
-            .type = .{ .Redirection = .{ .operation = op, .fd = fd_value } },
+            .type = .{ .Redirection = op },
         };
     }
 };
@@ -782,16 +753,20 @@ fn expectLiteral(token: ?Token, expected: []const u8) !void {
     }
 }
 
-fn expectRedirection(token: ?Token, expected_op: RedirectionOp, expected_fd: ?[]const u8) !void {
+fn expectIncompleteLiteral(token: ?Token, expected: []const u8) !void {
+    const t = token orelse return error.ExpectedToken;
+    switch (t.type) {
+        .Literal => |lit| try std.testing.expectEqualStrings(expected, lit),
+        else => return error.ExpectedLiteral,
+    }
+    try std.testing.expectEqual(false, t.complete);
+}
+
+fn expectRedirection(token: ?Token, expected_op: Redirection) !void {
     const t = token orelse return error.ExpectedToken;
     switch (t.type) {
         .Redirection => |r| {
-            try std.testing.expectEqual(expected_op, r.operation.?);
-            if (expected_fd) |efd| {
-                try std.testing.expectEqualStrings(efd, r.fd.?);
-            } else {
-                try std.testing.expectEqual(@as(?[]const u8, null), r.fd);
-            }
+            try std.testing.expectEqual(expected_op, r);
         },
         else => return error.ExpectedRedirection,
     }
@@ -819,13 +794,6 @@ test "nextToken: literal with leading/trailing whitespace" {
     var reader = std.io.Reader.fixed("   hello   ");
     var lexer = Lexer.init(&reader);
     try expectLiteral(try lexer.nextToken(), "hello");
-    try std.testing.expectEqual(null, try lexer.nextToken());
-}
-
-test "nextToken: numeric literal" {
-    var reader = std.io.Reader.fixed("123");
-    var lexer = Lexer.init(&reader);
-    try expectLiteral(try lexer.nextToken(), "123");
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -862,7 +830,7 @@ test "nextToken: word with equals sign followed by literal" {
 test "nextToken: output redirection" {
     var reader = std.io.Reader.fixed(">file");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .Out, null);
+    try expectRedirection(try lexer.nextToken(), .Out);
     try expectLiteral(try lexer.nextToken(), "file");
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -870,7 +838,7 @@ test "nextToken: output redirection" {
 test "nextToken: output redirection with space" {
     var reader = std.io.Reader.fixed("> file");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .Out, null);
+    try expectRedirection(try lexer.nextToken(), .Out);
     try expectLiteral(try lexer.nextToken(), "file");
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -878,7 +846,7 @@ test "nextToken: output redirection with space" {
 test "nextToken: input redirection" {
     var reader = std.io.Reader.fixed("<input");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .In, null);
+    try expectRedirection(try lexer.nextToken(), .In);
     try expectLiteral(try lexer.nextToken(), "input");
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -886,7 +854,7 @@ test "nextToken: input redirection" {
 test "nextToken: append redirection" {
     var reader = std.io.Reader.fixed(">>logfile");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .Append, null);
+    try expectRedirection(try lexer.nextToken(), .Append);
     try expectLiteral(try lexer.nextToken(), "logfile");
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -894,7 +862,8 @@ test "nextToken: append redirection" {
 test "nextToken: fd-prefixed output redirection" {
     var reader = std.io.Reader.fixed("2>errors");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .Out, "2");
+    try expectIncompleteLiteral(try lexer.nextToken(), "2");
+    try expectRedirection(try lexer.nextToken(), .Out);
     try expectLiteral(try lexer.nextToken(), "errors");
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -902,7 +871,8 @@ test "nextToken: fd-prefixed output redirection" {
 test "nextToken: fd-prefixed append redirection" {
     var reader = std.io.Reader.fixed("2>>errors");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .Append, "2");
+    try expectIncompleteLiteral(try lexer.nextToken(), "2");
+    try expectRedirection(try lexer.nextToken(), .Append);
     try expectLiteral(try lexer.nextToken(), "errors");
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -910,7 +880,8 @@ test "nextToken: fd-prefixed append redirection" {
 test "nextToken: fd-prefixed input redirection" {
     var reader = std.io.Reader.fixed("0<input");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .In, "0");
+    try expectIncompleteLiteral(try lexer.nextToken(), "0");
+    try expectRedirection(try lexer.nextToken(), .In);
     try expectLiteral(try lexer.nextToken(), "input");
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -918,7 +889,8 @@ test "nextToken: fd-prefixed input redirection" {
 test "nextToken: fd duplication 2>&1" {
     var reader = std.io.Reader.fixed("2>&1");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .Fd, "2");
+    try expectIncompleteLiteral(try lexer.nextToken(), "2");
+    try expectRedirection(try lexer.nextToken(), .Fd);
     try expectLiteral(try lexer.nextToken(), "1");
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -926,7 +898,7 @@ test "nextToken: fd duplication 2>&1" {
 test "nextToken: fd duplication >&2" {
     var reader = std.io.Reader.fixed(">&2");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .Fd, null);
+    try expectRedirection(try lexer.nextToken(), .Fd);
     try expectLiteral(try lexer.nextToken(), "2");
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -938,9 +910,10 @@ test "nextToken: complex command line" {
     try expectLiteral(try lexer.nextToken(), "cmd");
     try expectLiteral(try lexer.nextToken(), "arg1");
     try expectLiteral(try lexer.nextToken(), "arg2");
-    try expectRedirection(try lexer.nextToken(), .Out, null);
+    try expectRedirection(try lexer.nextToken(), .Out);
     try expectLiteral(try lexer.nextToken(), "out");
-    try expectRedirection(try lexer.nextToken(), .Fd, "2");
+    try expectIncompleteLiteral(try lexer.nextToken(), "2");
+    try expectRedirection(try lexer.nextToken(), .Fd);
     try expectLiteral(try lexer.nextToken(), "1");
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -948,7 +921,8 @@ test "nextToken: complex command line" {
 test "nextToken: redirection at start" {
     var reader = std.io.Reader.fixed("2>&1 command");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .Fd, "2");
+    try expectIncompleteLiteral(try lexer.nextToken(), "2");
+    try expectRedirection(try lexer.nextToken(), .Fd);
     try expectLiteral(try lexer.nextToken(), "1");
     try expectLiteral(try lexer.nextToken(), "command");
     try std.testing.expectEqual(null, try lexer.nextToken());
@@ -993,7 +967,7 @@ test "nextToken: redirection at EOF emits incomplete token" {
     // Lexer emits Redirection token; parser validates target presence
     var reader = std.io.Reader.fixed(">");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .Out, null);
+    try expectRedirection(try lexer.nextToken(), .Out);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1001,7 +975,7 @@ test "nextToken: fd redirection at EOF emits incomplete token" {
     // Lexer emits Redirection token; parser validates target presence
     var reader = std.io.Reader.fixed(">&");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .Fd, null);
+    try expectRedirection(try lexer.nextToken(), .Fd);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1083,7 +1057,7 @@ test "nextToken: large fd numbers stored as strings" {
     // >&99999999999999999999 -> Redirection(.Fd), Literal("99999999999999999999")
     var reader = std.io.Reader.fixed(">&99999999999999999999");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .Fd, null);
+    try expectRedirection(try lexer.nextToken(), .Fd);
     try expectLiteral(try lexer.nextToken(), "99999999999999999999");
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -1283,7 +1257,7 @@ test "nextToken: double-quoted string with escaped quote" {
 }
 
 test "nextToken: double-quoted string with dollar sign" {
-    // $ is preserved as literal for now (expansions in Phase 4)
+    // TODO: $ is preserved as literal for now (expansions not yet implemented)
     var reader = std.io.Reader.fixed("\"$var\"");
     var lexer = Lexer.init(&reader);
     try expectDoubleQuoteBegin(try lexer.nextToken());
@@ -1609,7 +1583,7 @@ test "nextToken: mixed literal and quotes" {
 test "nextToken: redirection with double-quoted target" {
     var reader = std.io.Reader.fixed(">\"file\"");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .Out, null);
+    try expectRedirection(try lexer.nextToken(), .Out);
     // Then the quoted target tokens
     try expectDoubleQuoteBegin(try lexer.nextToken());
     try expectLiteral(try lexer.nextToken(), "file");
@@ -1620,7 +1594,7 @@ test "nextToken: redirection with double-quoted target" {
 test "nextToken: redirection with single-quoted target" {
     var reader = std.io.Reader.fixed(">'file'");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .Out, null);
+    try expectRedirection(try lexer.nextToken(), .Out);
     // Then the single-quoted target
     try expectSingleQuoted(try lexer.nextToken(), "file");
     try std.testing.expectEqual(null, try lexer.nextToken());
@@ -1629,7 +1603,8 @@ test "nextToken: redirection with single-quoted target" {
 test "nextToken: redirection with fd and double-quoted target" {
     var reader = std.io.Reader.fixed("2>\"errors\"");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .Out, "2");
+    try expectIncompleteLiteral(try lexer.nextToken(), "2");
+    try expectRedirection(try lexer.nextToken(), .Out);
     try expectDoubleQuoteBegin(try lexer.nextToken());
     try expectLiteral(try lexer.nextToken(), "errors");
     try expectDoubleQuoteEnd(try lexer.nextToken());
@@ -1640,7 +1615,7 @@ test "nextToken: redirection with mixed target (word then quote)" {
     // >name"suffix" - redirection followed by unquoted + quoted parts
     var reader = std.io.Reader.fixed(">name\"suffix\"");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .Out, null);
+    try expectRedirection(try lexer.nextToken(), .Out);
     // "name" as literal (incomplete because quote follows)
     const tok2 = (try lexer.nextToken()).?;
     try std.testing.expectEqualStrings("name", tok2.type.Literal);
@@ -1655,7 +1630,7 @@ test "nextToken: redirection with mixed target (word then quote)" {
 test "nextToken: redirection with space before quoted target" {
     var reader = std.io.Reader.fixed("> \"file\"");
     var lexer = Lexer.init(&reader);
-    try expectRedirection(try lexer.nextToken(), .Out, null);
+    try expectRedirection(try lexer.nextToken(), .Out);
     try expectDoubleQuoteBegin(try lexer.nextToken());
     try expectLiteral(try lexer.nextToken(), "file");
     try expectDoubleQuoteEnd(try lexer.nextToken());
@@ -1834,4 +1809,229 @@ test "fuzz: structured shell-like input" {
     // Structured fuzz: generate semi-valid shell-like input
     // This is more likely to exercise meaningful code paths
     try std.testing.fuzz({}, fuzzStructuredInput, .{});
+}
+
+// --- Buffer boundary tests for fd-prefixed redirections ---
+
+test "nextToken: multi-digit fd at buffer boundary" {
+    // Test 12>&1 with 1-byte buffer.
+    // With such a small buffer, each character is a separate token.
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    _ = try std.posix.write(pipe[1], "12>&1 ");
+    std.posix.close(pipe[1]);
+
+    const file = std.fs.File{ .handle = pipe[0] };
+    var small_buf: [1]u8 = undefined;
+    var file_reader = file.reader(&small_buf);
+    var lexer = Lexer.init(&file_reader.interface);
+
+    // First token: "1" incomplete (1-byte buffer)
+    const tok1 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("1", tok1.type.Literal);
+    try std.testing.expectEqual(false, tok1.complete);
+
+    // Second token: "2" as continuation
+    const tok2 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("2", tok2.type.Continuation);
+    try std.testing.expectEqual(false, tok2.complete);
+
+    // Third token: Redirection(Fd) - the >& operator
+    const tok3 = (try lexer.nextToken()).?;
+    try std.testing.expectEqual(Redirection.Fd, tok3.type.Redirection);
+
+    // Fourth token: "1" (the target fd)
+    const tok4 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("1", tok4.type.Literal);
+    try std.testing.expectEqual(false, tok4.complete);
+
+    // Fifth token: empty continuation (word complete, space follows)
+    const tok5 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("", tok5.type.Continuation);
+    try std.testing.expectEqual(true, tok5.complete);
+
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: non-digit word before redirection at buffer boundary" {
+    // Test a2>file with 1-byte buffer.
+    // With such a small buffer, each character is a separate token.
+    // This tests that continuation handling works correctly across buffer boundaries.
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    _ = try std.posix.write(pipe[1], "a2>file ");
+    std.posix.close(pipe[1]);
+
+    const file = std.fs.File{ .handle = pipe[0] };
+    var small_buf: [1]u8 = undefined;
+    var file_reader = file.reader(&small_buf);
+    var lexer = Lexer.init(&file_reader.interface);
+
+    // First token: "a" incomplete (1-byte buffer)
+    const tok1 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("a", tok1.type.Literal);
+    try std.testing.expectEqual(false, tok1.complete);
+
+    // Second token: "2" as continuation, incomplete (followed by >)
+    const tok2 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("2", tok2.type.Continuation);
+    try std.testing.expectEqual(false, tok2.complete);
+
+    // Third token: Redirection(Out) - the > was seen, word "a2" ends
+    const tok3 = (try lexer.nextToken()).?;
+    try std.testing.expectEqual(Redirection.Out, tok3.type.Redirection);
+
+    // Fourth and following tokens: "file" split across buffer boundaries
+    // With 1-byte buffer, we get: "f", "i", "l", "e" as separate tokens
+    const tok4 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("f", tok4.type.Literal);
+    try std.testing.expectEqual(false, tok4.complete);
+
+    const tok5 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("i", tok5.type.Continuation);
+    try std.testing.expectEqual(false, tok5.complete);
+
+    const tok6 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("l", tok6.type.Continuation);
+    try std.testing.expectEqual(false, tok6.complete);
+
+    const tok7 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("e", tok7.type.Continuation);
+    try std.testing.expectEqual(false, tok7.complete);
+
+    // Final token: empty continuation marking end of word (space follows)
+    const tok8 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("", tok8.type.Continuation);
+    try std.testing.expectEqual(true, tok8.complete);
+
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: fd close >&-" {
+    // Test that >&- is lexed as Redirection(Fd) followed by Literal("-")
+    var reader = std.io.Reader.fixed(">&- ");
+    var lexer = Lexer.init(&reader);
+
+    // First token: Redirection(Fd) - incomplete, target follows
+    const tok1 = (try lexer.nextToken()).?;
+    try std.testing.expectEqual(Redirection.Fd, tok1.type.Redirection);
+    try std.testing.expectEqual(false, tok1.complete);
+
+    // Second token: "-" target
+    const tok2 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("-", tok2.type.Literal);
+    try std.testing.expectEqual(true, tok2.complete);
+
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: fd dup with invalid target >&foo" {
+    // Test that >&foo is lexed as Redirection(Fd) followed by Literal("foo")
+    // Parser will validate that "foo" is not a valid fd target
+    var reader = std.io.Reader.fixed(">&foo ");
+    var lexer = Lexer.init(&reader);
+
+    // First token: Redirection(Fd) - incomplete, target follows
+    const tok1 = (try lexer.nextToken()).?;
+    try std.testing.expectEqual(Redirection.Fd, tok1.type.Redirection);
+    try std.testing.expectEqual(false, tok1.complete);
+
+    // Second token: "foo" target (parser will reject this)
+    const tok2 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("foo", tok2.type.Literal);
+    try std.testing.expectEqual(true, tok2.complete);
+
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: fd dup with space >&  1" {
+    // Test that >& 1 is lexed as Redirection(Fd) followed by Literal("1")
+    var reader = std.io.Reader.fixed(">&  1 ");
+    var lexer = Lexer.init(&reader);
+
+    // First token: Redirection(Fd)
+    const tok1 = (try lexer.nextToken()).?;
+    try std.testing.expectEqual(Redirection.Fd, tok1.type.Redirection);
+    try std.testing.expectEqual(false, tok1.complete);
+
+    // Second token: "1" target
+    const tok2 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("1", tok2.type.Literal);
+    try std.testing.expectEqual(true, tok2.complete);
+
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: source fd overflow treated as word" {
+    // Test that 99999999999999999999>&1 is treated as word + redirection
+    // (number exceeds fd_t max, so not a valid source fd - parser will handle)
+    var reader = std.io.Reader.fixed("99999999999999999999>&1 ");
+    var lexer = Lexer.init(&reader);
+
+    // First token: the overflow number as a literal word (incomplete, followed by redirection)
+    const tok1 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("99999999999999999999", tok1.type.Literal);
+    try std.testing.expectEqual(false, tok1.complete);
+
+    // Second token: Redirection(Fd)
+    const tok2 = (try lexer.nextToken()).?;
+    try std.testing.expectEqual(Redirection.Fd, tok2.type.Redirection);
+
+    // Third token: "1" target
+    const tok3 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("1", tok3.type.Literal);
+
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: max valid source fd" {
+    // Test that max fd_t value is emitted as literal before redirection
+    // (parser will validate and use as source fd)
+    const max_fd = std.math.maxInt(std.posix.fd_t);
+    const max_fd_str = std.fmt.comptimePrint("{d}>&1 ", .{max_fd});
+
+    var reader = std.io.Reader.fixed(max_fd_str);
+    var lexer = Lexer.init(&reader);
+
+    // First token: fd number as literal (incomplete)
+    const tok1 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings(std.fmt.comptimePrint("{d}", .{max_fd}), tok1.type.Literal);
+    try std.testing.expectEqual(false, tok1.complete);
+
+    // Second token: Redirection(Fd)
+    const tok2 = (try lexer.nextToken()).?;
+    try std.testing.expectEqual(Redirection.Fd, tok2.type.Redirection);
+
+    // Third token: "1" target
+    const tok3 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("1", tok3.type.Literal);
+
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: source fd just over max treated as word" {
+    // Test that max fd_t + 1 is treated as word (overflow - parser will handle)
+    const max_fd = std.math.maxInt(std.posix.fd_t);
+    const overflow_fd: u64 = @as(u64, @intCast(max_fd)) + 1;
+    const overflow_fd_str = std.fmt.comptimePrint("{d}>&1 ", .{overflow_fd});
+
+    var reader = std.io.Reader.fixed(overflow_fd_str);
+    var lexer = Lexer.init(&reader);
+
+    // First token: the overflow number as a literal word
+    const tok1 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings(std.fmt.comptimePrint("{d}", .{overflow_fd}), tok1.type.Literal);
+    try std.testing.expectEqual(false, tok1.complete);
+
+    // Second token: Redirection(Fd)
+    const tok2 = (try lexer.nextToken()).?;
+    try std.testing.expectEqual(Redirection.Fd, tok2.type.Redirection);
+
+    // Third token: "1" target
+    const tok3 = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("1", tok3.type.Literal);
+
+    try std.testing.expectEqual(null, try lexer.nextToken());
 }
