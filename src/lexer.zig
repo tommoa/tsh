@@ -40,6 +40,11 @@ pub const Redirection = enum { In, Out, Append, Fd };
 pub const TokenType = union(enum) {
     /// A literal word.
     Literal: []const u8,
+    /// An escaped literal (from backslash escape). Content should not undergo
+    /// tilde expansion or globbing. Currently always a single character, but
+    /// consumers should not assume length to allow for future extensions
+    /// (e.g., multi-byte escape sequences).
+    EscapedLiteral: []const u8,
     /// A redirection operator. The payload indicates the type of redirection.
     Redirection: Redirection,
     /// A continuation of the previous token (if it was not completed).
@@ -85,6 +90,7 @@ pub const Token = struct {
         try writer.print("[{d}:{d}] ", .{ self.line, self.column });
         switch (self.type) {
             .Literal => |lit| try writer.print("Literal(\"{s}\")", .{lit}),
+            .EscapedLiteral => |esc| try writer.print("EscapedLiteral(\"{s}\")", .{esc}),
             .Continuation => |cont| try writer.print("Continuation(\"{s}\")", .{cont}),
             .SingleQuoted => |s| try writer.print("SingleQuoted(\"{s}\")", .{s}),
             .DoubleQuoteBegin => try writer.writeAll("DoubleQuoteBegin"),
@@ -481,10 +487,11 @@ pub const Lexer = struct {
                             // Special escape - consume both, return the escaped char
                             const escaped_slice = buf[1..2];
                             self.consume(buf[0..2]);
-                            break :state self.makeToken(.{ .Literal = escaped_slice }, false);
+                            break :state self.makeToken(.{ .EscapedLiteral = escaped_slice }, false);
                         } else {
                             // Not a special escape - backslash is literal
                             // Consume just the backslash, next char handled in next iteration
+                            // Note: This is a regular Literal because the backslash is literal content.
                             self.consume(buf[0..1]);
                             break :state self.makeToken(.{ .Literal = buf[0..1] }, false);
                         }
@@ -527,10 +534,12 @@ pub const Lexer = struct {
                     };
                     self.consume(buf);
                     self.parse_context = .double_quote;
-                    break :state self.makeToken(.{ .Literal = buf }, false);
+                    break :state self.makeToken(.{ .EscapedLiteral = buf }, false);
                 } else {
                     // Not a special escape - the backslash we consumed was literal.
                     // Emit a backslash literal using a static string slice.
+                    // Note: This is a regular Literal, not EscapedLiteral, because the
+                    // backslash itself is literal content (not an escape sequence result).
                     self.parse_context = .double_quote;
                     break :state self.makeToken(.{ .Literal = "\\" }, false);
                 }
@@ -552,7 +561,7 @@ pub const Lexer = struct {
                     continue :state .none;
                 }
 
-                // Consume the escaped character and return it as a literal
+                // Consume the escaped character and return it as an escaped literal
                 const buf = self.reader.peek(1) catch |err| switch (err) {
                     error.EndOfStream => {
                         self.parse_context = .none;
@@ -565,7 +574,7 @@ pub const Lexer = struct {
                 // Check if word continues after this escaped char
                 const after = try self.peekByte();
                 const at_boundary = self.isWordComplete(after);
-                break :state self.makeToken(.{ .Literal = buf }, at_boundary);
+                break :state self.makeToken(.{ .EscapedLiteral = buf }, at_boundary);
             },
             .none => {
                 // Normal processing
@@ -688,7 +697,7 @@ pub const Lexer = struct {
                         // Check if word continues after this escaped char
                         const after = try self.peekByte();
                         const at_boundary = self.isWordComplete(after);
-                        break :state self.makeToken(.{ .Literal = escaped_slice }, at_boundary);
+                        break :state self.makeToken(.{ .EscapedLiteral = escaped_slice }, at_boundary);
                     },
                     '<' => {
                         _ = try self.consumeOne();
@@ -778,6 +787,14 @@ fn expectIncompleteLiteral(token: ?Token, expected: []const u8) !void {
         else => return error.ExpectedLiteral,
     }
     try std.testing.expectEqual(false, t.complete);
+}
+
+fn expectEscapedLiteral(token: ?Token, expected: []const u8) !void {
+    const t = token orelse return error.ExpectedToken;
+    switch (t.type) {
+        .EscapedLiteral => |esc| try std.testing.expectEqualStrings(expected, esc),
+        else => return error.ExpectedEscapedLiteral,
+    }
 }
 
 fn expectRedirection(token: ?Token, expected_op: Redirection) !void {
@@ -1122,6 +1139,37 @@ test "nextToken: parentheses inside double quotes are literal" {
     try std.testing.expectEqual(null, try lex.nextToken());
 }
 
+// --- EscapedLiteral tests ---
+
+test "nextToken: escaped tilde produces EscapedLiteral" {
+    // \~ should produce EscapedLiteral, not Literal
+    // This is important for tilde expansion - \~ should not expand
+    var reader = std.io.Reader.fixed("\\~");
+    var lex = Lexer.init(&reader);
+    try expectEscapedLiteral(try lex.nextToken(), "~");
+    try std.testing.expectEqual(null, try lex.nextToken());
+}
+
+test "nextToken: escaped tilde in word" {
+    // echo \~foo should tokenize with EscapedLiteral for the ~
+    var reader = std.io.Reader.fixed("echo \\~foo");
+    var lex = Lexer.init(&reader);
+    try expectLiteral(try lex.nextToken(), "echo");
+    try expectEscapedLiteral(try lex.nextToken(), "~");
+    const tok3 = (try lex.nextToken()).?;
+    try std.testing.expectEqualStrings("foo", tok3.type.Continuation);
+    try std.testing.expectEqual(null, try lex.nextToken());
+}
+
+test "nextToken: escaped dollar produces EscapedLiteral" {
+    // \$ outside quotes produces EscapedLiteral
+    var reader = std.io.Reader.fixed("\\$");
+    var lex = Lexer.init(&reader);
+    try expectEscapedLiteral(try lex.nextToken(), "$");
+    try std.testing.expectEqual(null, try lex.nextToken());
+    try std.testing.expectEqual(null, try lex.nextToken());
+}
+
 test "nextToken: token position tracking" {
     var reader = std.io.Reader.fixed("  hello world");
     var lexer = Lexer.init(&reader);
@@ -1231,10 +1279,10 @@ test "nextToken: escape at buffer boundary in double quotes - special escape" {
 
     // DoubleQuoteBegin
     try expectDoubleQuoteBegin(try lexer.nextToken());
-    // The escape \\" should produce Literal("\"")
+    // The escape \\" should produce EscapedLiteral("\"")
     // Even if the backslash is at buffer boundary, the escape state handles it
     const tok2 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings("\"", tok2.type.Literal);
+    try std.testing.expectEqualStrings("\"", tok2.type.EscapedLiteral);
     // DoubleQuoteEnd
     try expectDoubleQuoteEnd(try lexer.nextToken());
     try std.testing.expectEqual(null, try lexer.nextToken());
@@ -1274,9 +1322,9 @@ test "nextToken: escape outside quotes" {
     var reader = std.io.Reader.fixed("\\$x ");
     var lexer = Lexer.init(&reader);
 
-    // \$ produces Literal("$")
+    // \$ produces EscapedLiteral("$")
     const tok1 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings("$", tok1.type.Literal);
+    try std.testing.expectEqualStrings("$", tok1.type.EscapedLiteral);
     try std.testing.expectEqual(false, tok1.complete);
     // "x" continues the word
     const tok2 = (try lexer.nextToken()).?;
@@ -1370,9 +1418,9 @@ test "nextToken: double-quoted string with escaped quote" {
     var lexer = Lexer.init(&reader);
     try expectDoubleQuoteBegin(try lexer.nextToken());
     try expectLiteral(try lexer.nextToken(), "say ");
-    try expectLiteral(try lexer.nextToken(), "\""); // escaped quote
+    try expectEscapedLiteral(try lexer.nextToken(), "\""); // escaped quote
     try expectLiteral(try lexer.nextToken(), "hi");
-    try expectLiteral(try lexer.nextToken(), "\""); // escaped quote
+    try expectEscapedLiteral(try lexer.nextToken(), "\""); // escaped quote
     try expectDoubleQuoteEnd(try lexer.nextToken());
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -1400,31 +1448,31 @@ test "nextToken: POSIX escape - backslash-n is literal" {
 }
 
 test "nextToken: POSIX escape - backslash-backslash" {
-    // \\ is a special escape - produces single backslash
+    // \\ is a special escape - produces single escaped backslash
     var reader = std.io.Reader.fixed("\"\\\\\"");
     var lexer = Lexer.init(&reader);
     try expectDoubleQuoteBegin(try lexer.nextToken());
-    try expectLiteral(try lexer.nextToken(), "\\"); // escaped backslash
+    try expectEscapedLiteral(try lexer.nextToken(), "\\"); // escaped backslash
     try expectDoubleQuoteEnd(try lexer.nextToken());
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
 test "nextToken: POSIX escape - backslash-quote" {
-    // \" is a special escape - produces literal quote
+    // \" is a special escape - produces escaped literal quote
     var reader = std.io.Reader.fixed("\"\\\"\"");
     var lexer = Lexer.init(&reader);
     try expectDoubleQuoteBegin(try lexer.nextToken());
-    try expectLiteral(try lexer.nextToken(), "\""); // escaped quote
+    try expectEscapedLiteral(try lexer.nextToken(), "\""); // escaped quote
     try expectDoubleQuoteEnd(try lexer.nextToken());
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
 test "nextToken: POSIX escape - backslash-dollar" {
-    // \$ is a special escape - produces literal $
+    // \$ is a special escape - produces escaped literal $
     var reader = std.io.Reader.fixed("\"\\$\"");
     var lexer = Lexer.init(&reader);
     try expectDoubleQuoteBegin(try lexer.nextToken());
-    try expectLiteral(try lexer.nextToken(), "$"); // escaped dollar
+    try expectEscapedLiteral(try lexer.nextToken(), "$"); // escaped dollar
     try expectDoubleQuoteEnd(try lexer.nextToken());
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -1432,11 +1480,11 @@ test "nextToken: POSIX escape - backslash-dollar" {
 // --- Unquoted escape tests ---
 
 test "nextToken: unquoted escape - backslash escapes next char" {
-    // \$ outside quotes produces literal $
+    // \$ outside quotes produces escaped literal $
     var reader = std.io.Reader.fixed("\\$HOME ");
     var lexer = Lexer.init(&reader);
     const tok1 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings("$", tok1.type.Literal);
+    try std.testing.expectEqualStrings("$", tok1.type.EscapedLiteral);
     try std.testing.expectEqual(false, tok1.complete); // more word follows
     // "HOME" is a continuation of the word started by the escape
     const tok2 = (try lexer.nextToken()).?;
@@ -1446,7 +1494,7 @@ test "nextToken: unquoted escape - backslash escapes next char" {
 }
 
 test "nextToken: unquoted escape - backslash-quote" {
-    // \" outside quotes produces literal "
+    // \" outside quotes produces escaped literal "
     // say\"hi\" is one word: say + " + hi + "
     var reader = std.io.Reader.fixed("say\\\"hi\\\" ");
     var lexer = Lexer.init(&reader);
@@ -1454,26 +1502,26 @@ test "nextToken: unquoted escape - backslash-quote" {
     const tok1 = (try lexer.nextToken()).?;
     try std.testing.expectEqualStrings("say", tok1.type.Literal);
     try std.testing.expectEqual(false, tok1.complete); // backslash follows
-    // \" produces literal "
+    // \" produces escaped literal "
     const tok2 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings("\"", tok2.type.Literal);
+    try std.testing.expectEqualStrings("\"", tok2.type.EscapedLiteral);
     try std.testing.expectEqual(false, tok2.complete); // more follows
     // "hi" is a continuation
     const tok3 = (try lexer.nextToken()).?;
     try std.testing.expectEqualStrings("hi", tok3.type.Continuation);
     try std.testing.expectEqual(false, tok3.complete); // backslash follows
-    // \" produces literal "
+    // \" produces escaped literal "
     const tok4 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings("\"", tok4.type.Literal);
+    try std.testing.expectEqualStrings("\"", tok4.type.EscapedLiteral);
     try std.testing.expectEqual(true, tok4.complete); // space follows
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
 test "nextToken: unquoted escape - backslash-backslash" {
-    // \\ outside quotes produces literal \
+    // \\ outside quotes produces escaped literal \
     var reader = std.io.Reader.fixed("\\\\");
     var lexer = Lexer.init(&reader);
-    try expectLiteral(try lexer.nextToken(), "\\");
+    try expectEscapedLiteral(try lexer.nextToken(), "\\");
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1499,7 +1547,7 @@ test "nextToken: unquoted escape - trailing backslash at EOF" {
 }
 
 test "nextToken: unquoted escape - backslash-space" {
-    // \<space> produces literal space (escaped space, part of word)
+    // \<space> produces escaped literal space (escaped space, part of word)
     // "hello\ world" is ONE word: hello + <space> + world
     var reader = std.io.Reader.fixed("hello\\ world ");
     var lexer = Lexer.init(&reader);
@@ -1508,7 +1556,7 @@ test "nextToken: unquoted escape - backslash-space" {
     try std.testing.expectEqual(false, tok1.complete); // backslash follows
     // Space is escaped, continues the word
     const tok2 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings(" ", tok2.type.Literal);
+    try std.testing.expectEqualStrings(" ", tok2.type.EscapedLiteral);
     try std.testing.expectEqual(false, tok2.complete); // word continues
     // "world" is a continuation of the same word
     const tok3 = (try lexer.nextToken()).?;
@@ -1525,7 +1573,7 @@ test "nextToken: escape in middle of word" {
     try std.testing.expectEqualStrings("foo", tok1.type.Literal);
     try std.testing.expectEqual(false, tok1.complete); // backslash follows
     const tok2 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings("$", tok2.type.Literal);
+    try std.testing.expectEqualStrings("$", tok2.type.EscapedLiteral);
     try std.testing.expectEqual(false, tok2.complete); // more word follows
     // "bar" is a continuation
     const tok3 = (try lexer.nextToken()).?;

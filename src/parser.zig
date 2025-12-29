@@ -13,10 +13,24 @@ pub const lexer = @import("lexer.zig");
 
 /// A part of a word. Words can be composed of multiple parts when they
 /// contain quotes, escapes, or (in the future) expansions.
+///
+/// The distinction between literal, quoted, and double_quoted is important
+/// for expansion phases:
+/// - `literal`: Subject to tilde expansion, globbing, and field splitting
+/// - `quoted`: Not subject to any expansion (from escapes or single quotes)
+/// - `double_quoted`: Contents may include expansions, but results are not
+///   subject to field splitting or globbing
 pub const WordPart = union(enum) {
-    /// Literal text from unquoted content, single quotes,
-    /// double quote content, or escaped characters.
+    /// Unquoted literal text - subject to tilde expansion, globbing, field splitting.
     literal: []const u8,
+
+    /// Quoted/escaped literal text - not subject to any expansion.
+    /// This includes content from single quotes ('...') and backslash escapes (\x).
+    quoted: []const u8,
+
+    /// Double-quoted region - contents may include expansions (variables, command
+    /// substitution) but results are not subject to field splitting or globbing.
+    double_quoted: []const WordPart,
 
     // Future expansion types:
     // variable: VariableExpansion,
@@ -27,6 +41,15 @@ pub const WordPart = union(enum) {
     pub fn format(self: WordPart, writer: *std.io.Writer) !void {
         switch (self) {
             .literal => |lit| try writer.print("\"{s}\"", .{lit}),
+            .quoted => |q| try writer.print("quoted(\"{s}\")", .{q}),
+            .double_quoted => |parts| {
+                try writer.writeAll("double_quoted([");
+                for (parts, 0..) |part, i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    try part.format(writer);
+                }
+                try writer.writeAll("])");
+            },
         }
     }
 };
@@ -276,6 +299,11 @@ pub const Parser = struct {
     /// Column where current word started.
     word_start_column: usize,
 
+    /// Whether we're currently inside double quotes.
+    in_double_quote: bool,
+    /// Parts being collected for the current double-quoted region.
+    double_quote_parts: std.ArrayListUnmanaged(WordPart),
+
     /// Pending redirection (while collecting target).
     pending_redir: ?PendingRedir,
 
@@ -298,6 +326,8 @@ pub const Parser = struct {
             .word_start_position = 0,
             .word_start_line = 0,
             .word_start_column = 0,
+            .in_double_quote = false,
+            .double_quote_parts = .{},
             .pending_redir = null,
             .assignments = .{},
             .argv = .{},
@@ -551,6 +581,8 @@ pub const Parser = struct {
         self.word_start_position = 0;
         self.word_start_line = 0;
         self.word_start_column = 0;
+        self.in_double_quote = false;
+        self.double_quote_parts = .{};
         self.pending_redir = null;
         self.assignments = .{};
         self.argv = .{};
@@ -590,25 +622,69 @@ pub const Parser = struct {
     }
 
     /// Add a token's content to the word parts list.
+    /// Handles double-quote context by collecting parts into double_quote_parts
+    /// and finalizing them when DoubleQuoteEnd is seen.
     fn addTokenToParts(self: *Parser, token: lexer.Token) ParseError!void {
         switch (token.type) {
             .Literal => |lit| {
                 const copied = try self.allocator.dupe(u8, lit);
-                try self.word_parts.append(self.allocator, .{ .literal = copied });
+                const part = WordPart{ .literal = copied };
+                if (self.in_double_quote) {
+                    try self.double_quote_parts.append(self.allocator, part);
+                } else {
+                    try self.word_parts.append(self.allocator, part);
+                }
+            },
+            .EscapedLiteral => |esc| {
+                const copied = try self.allocator.dupe(u8, esc);
+                const part = WordPart{ .quoted = copied };
+                if (self.in_double_quote) {
+                    try self.double_quote_parts.append(self.allocator, part);
+                } else {
+                    try self.word_parts.append(self.allocator, part);
+                }
             },
             .Continuation => |cont| {
                 // Continuation may be empty (signals word boundary with no content)
                 if (cont.len > 0) {
                     const copied = try self.allocator.dupe(u8, cont);
-                    try self.word_parts.append(self.allocator, .{ .literal = copied });
+                    const part = WordPart{ .literal = copied };
+                    if (self.in_double_quote) {
+                        try self.double_quote_parts.append(self.allocator, part);
+                    } else {
+                        try self.word_parts.append(self.allocator, part);
+                    }
                 }
             },
             .SingleQuoted => |sq| {
+                // SingleQuoted tokens only appear outside double quotes.
+                // Inside double quotes, single quote characters are just Literal tokens.
+                // TODO: When command substitution is implemented, SingleQuoted tokens
+                // may appear inside an outer double-quote context (e.g., "$(cmd 'arg')").
+                // At that point, in_double_quote will need to become a stack.
+                std.debug.assert(!self.in_double_quote);
                 const copied = try self.allocator.dupe(u8, sq);
-                try self.word_parts.append(self.allocator, .{ .literal = copied });
+                try self.word_parts.append(self.allocator, .{ .quoted = copied });
             },
-            .DoubleQuoteBegin, .DoubleQuoteEnd => {
-                // Quote markers don't add content, just affect parsing context
+            .DoubleQuoteBegin => {
+                // Nested double quotes aren't valid shell syntax.
+                // The lexer won't emit DoubleQuoteBegin while already in double quotes.
+                // TODO: When command substitution is implemented, DoubleQuoteBegin may
+                // appear inside an outer double-quote context (e.g., "$(cmd "arg")").
+                // At that point, in_double_quote will need to become a stack.
+                std.debug.assert(!self.in_double_quote);
+                self.in_double_quote = true;
+                self.double_quote_parts = .{};
+            },
+            .DoubleQuoteEnd => {
+                // DoubleQuoteEnd should only appear after a matching DoubleQuoteBegin.
+                // TODO: When command substitution is implemented with a context stack,
+                // this assertion will need to check the stack depth instead.
+                std.debug.assert(self.in_double_quote);
+                // Finalize the double-quoted region
+                const parts_slice = try self.double_quote_parts.toOwnedSlice(self.allocator);
+                try self.word_parts.append(self.allocator, .{ .double_quoted = parts_slice });
+                self.in_double_quote = false;
             },
             .Redirection => {
                 // Shouldn't happen during word collection
@@ -655,12 +731,7 @@ pub const Parser = struct {
 
                 // Add remaining parts from the original word
                 for (word.parts[1..]) |part| {
-                    switch (part) {
-                        .literal => |l| {
-                            const copied = try self.allocator.dupe(u8, l);
-                            try value_parts.append(self.allocator, .{ .literal = copied });
-                        },
-                    }
+                    try value_parts.append(self.allocator, try self.copyWordPart(part));
                 }
 
                 const value = Word{
@@ -680,7 +751,25 @@ pub const Parser = struct {
                     .column = word.column,
                 };
             },
+            // If the first part is quoted or double_quoted, it's not an assignment
+            // (the `=` would need to be in an unquoted literal)
+            .quoted, .double_quoted => return null,
         }
+    }
+
+    /// Deep copy a WordPart, including nested parts for double_quoted.
+    fn copyWordPart(self: *Parser, part: WordPart) ParseError!WordPart {
+        return switch (part) {
+            .literal => |lit| WordPart{ .literal = try self.allocator.dupe(u8, lit) },
+            .quoted => |q| WordPart{ .quoted = try self.allocator.dupe(u8, q) },
+            .double_quoted => |parts| blk: {
+                var copied_parts = try self.allocator.alloc(WordPart, parts.len);
+                for (parts, 0..) |p, i| {
+                    copied_parts[i] = try self.copyWordPart(p);
+                }
+                break :blk WordPart{ .double_quoted = copied_parts };
+            },
+        };
     }
 
     /// Check if a string is a valid shell identifier.
@@ -723,6 +812,7 @@ pub const Parser = struct {
     /// Try to convert word parts to an fd number.
     /// Returns null if:
     ///   - parts is empty
+    ///   - any part is quoted or double_quoted (fd numbers must be unquoted)
     ///   - any part contains non-digit characters
     ///   - the number overflows u32
     fn wordPartsToFdNumber(parts: []const WordPart) ?u32 {
@@ -731,8 +821,11 @@ pub const Parser = struct {
         var result: u32 = 0;
 
         for (parts) |part| {
+            // Only unquoted literals can form fd numbers
             const lit = switch (part) {
                 .literal => |l| l,
+                // Quoted or double_quoted parts can't be fd numbers
+                .quoted, .double_quoted => return null,
             };
             if (lit.len == 0) continue;
 
@@ -757,13 +850,27 @@ pub const Parser = struct {
     /// Returns InvalidFdRedirectionTarget if the word is not a valid fd target.
     fn parseFdTarget(self: *Parser, word: Word) ParseError!RedirectionTarget {
         // Check for close: exactly one part that is "-"
+        // This works with literal, quoted, or double_quoted containing just "-"
         if (word.parts.len == 1) {
-            switch (word.parts[0]) {
-                .literal => |lit| {
-                    if (std.mem.eql(u8, lit, "-")) {
-                        return .close;
+            const text: ?[]const u8 = switch (word.parts[0]) {
+                .literal => |lit| lit,
+                .quoted => |q| q,
+                .double_quoted => |parts| blk: {
+                    // double_quoted with exactly one literal/quoted part containing "-"
+                    if (parts.len == 1) {
+                        break :blk switch (parts[0]) {
+                            .literal => |lit| lit,
+                            .quoted => |q| q,
+                            .double_quoted => null,
+                        };
                     }
+                    break :blk null;
                 },
+            };
+            if (text) |t| {
+                if (std.mem.eql(u8, t, "-")) {
+                    return .close;
+                }
             }
         }
 
@@ -783,9 +890,17 @@ pub const Parser = struct {
 fn expectWord(word: Word, expected_parts: []const []const u8) !void {
     try std.testing.expectEqual(expected_parts.len, word.parts.len);
     for (word.parts, expected_parts) |part, expected| {
-        switch (part) {
-            .literal => |lit| try std.testing.expectEqualStrings(expected, lit),
-        }
+        // For simple tests, just compare the text content regardless of quote type
+        const text = switch (part) {
+            .literal => |lit| lit,
+            .quoted => |q| q,
+            .double_quoted => {
+                // For double_quoted, we need a more complex comparison
+                // For now, skip - tests that need this should use expectWordPart
+                return error.UseExpectWordPartForDoubleQuoted;
+            },
+        };
+        try std.testing.expectEqualStrings(expected, text);
     }
 }
 
@@ -1491,11 +1606,22 @@ fn parseWithSmallBuffer(allocator: Allocator, input: []const u8, buf_size: usize
 fn wordToString(allocator: Allocator, word: Word) ![]const u8 {
     var result: std.ArrayListUnmanaged(u8) = .{};
     for (word.parts) |part| {
-        switch (part) {
-            .literal => |lit| try result.appendSlice(allocator, lit),
-        }
+        try appendWordPartText(allocator, &result, part);
     }
     return result.toOwnedSlice(allocator);
+}
+
+/// Recursively append text content from a WordPart to a list.
+fn appendWordPartText(allocator: Allocator, result: *std.ArrayListUnmanaged(u8), part: WordPart) !void {
+    switch (part) {
+        .literal => |lit| try result.appendSlice(allocator, lit),
+        .quoted => |q| try result.appendSlice(allocator, q),
+        .double_quoted => |parts| {
+            for (parts) |p| {
+                try appendWordPartText(allocator, result, p);
+            }
+        },
+    }
 }
 
 /// Compare two SimpleCommands for semantic equality.

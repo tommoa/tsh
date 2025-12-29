@@ -275,28 +275,58 @@ fn openFlagsForOp(op: Redirection) posix.O {
     };
 }
 
+/// Calculate the expanded length of a WordPart.
+fn wordPartLength(part: WordPart) usize {
+    return switch (part) {
+        .literal => |lit| lit.len,
+        .quoted => |q| q.len,
+        .double_quoted => |parts| blk: {
+            var len: usize = 0;
+            for (parts) |p| {
+                len += wordPartLength(p);
+            }
+            break :blk len;
+        },
+    };
+}
+
+/// Write a WordPart's content into a buffer at the given offset.
+/// Returns the new offset after writing.
+fn writeWordPart(buf: []u8, offset: usize, part: WordPart) usize {
+    switch (part) {
+        .literal => |lit| {
+            @memcpy(buf[offset..][0..lit.len], lit);
+            return offset + lit.len;
+        },
+        .quoted => |q| {
+            @memcpy(buf[offset..][0..q.len], q);
+            return offset + q.len;
+        },
+        .double_quoted => |parts| {
+            var off = offset;
+            for (parts) |p| {
+                off = writeWordPart(buf, off, p);
+            }
+            return off;
+        },
+    }
+}
+
 /// Expand a Word into a null-terminated string.
 ///
-/// Currently just concatenates all literal parts. When command substitution
+/// Currently just concatenates all parts. When command substitution
 /// is added, this will need to recursively execute nested commands.
 fn expandWord(allocator: Allocator, word: Word) Allocator.Error![:0]const u8 {
     var total_len: usize = 0;
     for (word.parts) |part| {
-        switch (part) {
-            .literal => |lit| total_len += lit.len,
-        }
+        total_len += wordPartLength(part);
     }
 
     const buf = try allocator.allocSentinel(u8, total_len, 0);
 
     var offset: usize = 0;
     for (word.parts) |part| {
-        switch (part) {
-            .literal => |lit| {
-                @memcpy(buf[offset..][0..lit.len], lit);
-                offset += lit.len;
-            },
-        }
+        offset = writeWordPart(buf, offset, part);
     }
 
     return buf;

@@ -295,13 +295,15 @@ test "CLI: empty and whitespace input" {
 
 test "CLI parse: complex command output format" {
     // Single comprehensive test covering assignments, argv, and redirections
+    // Note: single-quoted content now formats as quoted("...") to distinguish
+    // from unquoted literals
     try expectParseOutput("FOO=bar cmd 'arg 1' >out 2>&1\n",
         \\SimpleCommand:
         \\  assignments:
         \\    [0] FOO = "bar"
         \\  argv:
         \\    [0] "cmd"
-        \\    [1] "arg 1"
+        \\    [1] quoted("arg 1")
         \\  redirections:
         \\    [0] > "out"
         \\    [1] 2>& 1
