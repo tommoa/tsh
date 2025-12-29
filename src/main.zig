@@ -35,80 +35,6 @@ fn dumpTokens(reader: *std.io.Reader, writer: *std.io.Writer) !usize {
     return token_count;
 }
 
-/// Dump a Word to the writer.
-fn dumpWord(word: tsh.Word, writer: *std.io.Writer) !void {
-    if (word.parts.len == 0) {
-        try writer.writeAll("\"\"");
-        return;
-    }
-
-    if (word.parts.len == 1) {
-        switch (word.parts[0]) {
-            .literal => |lit| try writer.print("\"{s}\"", .{lit}),
-        }
-        return;
-    }
-
-    // Multiple parts - show as list
-    try writer.writeByte('[');
-    for (word.parts, 0..) |part, i| {
-        if (i > 0) try writer.writeAll(", ");
-        switch (part) {
-            .literal => |lit| try writer.print("\"{s}\"", .{lit}),
-        }
-    }
-    try writer.writeByte(']');
-}
-
-/// Dump a parsed command to the writer in human-readable format.
-fn dumpCommand(cmd: tsh.SimpleCommand, writer: *std.io.Writer) !void {
-    try writer.writeAll("SimpleCommand:\n");
-
-    // Assignments
-    if (cmd.assignments.len > 0) {
-        try writer.writeAll("  assignments:\n");
-        for (cmd.assignments, 0..) |assignment, i| {
-            try writer.print("    [{d}] {s} = ", .{ i, assignment.name });
-            try dumpWord(assignment.value, writer);
-            try writer.writeByte('\n');
-        }
-    }
-
-    // Argv
-    if (cmd.argv.len > 0) {
-        try writer.writeAll("  argv:\n");
-        for (cmd.argv, 0..) |word, i| {
-            try writer.print("    [{d}] ", .{i});
-            try dumpWord(word, writer);
-            try writer.writeByte('\n');
-        }
-    }
-
-    // Redirections
-    if (cmd.redirections.len > 0) {
-        try writer.writeAll("  redirections:\n");
-        for (cmd.redirections, 0..) |redir, i| {
-            try writer.print("    [{d}] ", .{i});
-            if (redir.source_fd) |fd| {
-                try writer.print("{d}", .{fd});
-            }
-            switch (redir.op) {
-                .In => try writer.writeByte('<'),
-                .Out => try writer.writeByte('>'),
-                .Append => try writer.writeAll(">>"),
-                .Fd => try writer.writeAll(">&"),
-            }
-            try writer.writeByte(' ');
-            switch (redir.target) {
-                .file => |word| try dumpWord(word, writer),
-                .fd => |fd| try writer.print("{d}", .{fd}),
-                .close => try writer.writeAll("-"),
-            }
-            try writer.writeByte('\n');
-        }
-    }
-}
-
 /// Parse and dump all commands from the reader.
 fn parseAndDump(allocator: std.mem.Allocator, reader: *std.io.Reader, writer: *std.io.Writer) !usize {
     var lexer = tsh.Lexer.init(reader);
@@ -133,7 +59,7 @@ fn parseAndDump(allocator: std.mem.Allocator, reader: *std.io.Reader, writer: *s
         };
 
         if (cmd) |c| {
-            try dumpCommand(c, writer);
+            try c.format(writer);
             try writer.writeByte('\n');
             command_count += 1;
         }
@@ -149,7 +75,7 @@ fn parseAndDump(allocator: std.mem.Allocator, reader: *std.io.Reader, writer: *s
 
 const Command = enum {
     dump_tokens,
-    parse,
+    dump_ast,
     help,
 };
 
@@ -159,7 +85,7 @@ fn printUsage() void {
         \\
         \\Options:
         \\  --dump-tokens  Dump lexer tokens (default behavior)
-        \\  --parse, -p    Parse and dump AST
+        \\  --dump-ast     Parse and dump AST
         \\  --help, -h     Show this help message
         \\
         \\If no file is provided, reads from stdin.
@@ -184,8 +110,8 @@ pub fn main() !void {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--dump-tokens")) {
             command = .dump_tokens;
-        } else if (std.mem.eql(u8, arg, "--parse") or std.mem.eql(u8, arg, "-p")) {
-            command = .parse;
+        } else if (std.mem.eql(u8, arg, "--dump-ast")) {
+            command = .dump_ast;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             command = .help;
         } else if (arg.len > 0 and arg[0] == '-') {
@@ -226,7 +152,7 @@ pub fn main() !void {
             _ = try dumpTokens(&file_reader.interface, &stderr_writer.interface);
             try stderr_writer.interface.flush();
         },
-        .parse => {
+        .dump_ast => {
             // Use an arena for parser allocations
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();

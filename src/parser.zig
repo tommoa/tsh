@@ -22,6 +22,13 @@ pub const WordPart = union(enum) {
     // variable: VariableExpansion,
     // command_sub: CommandSubstitution,
     // arithmetic: ArithmeticExpansion,
+
+    /// Format the word part for human-readable output.
+    pub fn format(self: WordPart, writer: *std.io.Writer) !void {
+        switch (self) {
+            .literal => |lit| try writer.print("\"{s}\"", .{lit}),
+        }
+    }
 };
 
 /// A complete word, which may consist of multiple parts.
@@ -35,6 +42,27 @@ pub const Word = struct {
     line: usize,
     /// The column number where this word starts (1-indexed).
     column: usize,
+
+    /// Format the word for human-readable output.
+    pub fn format(self: Word, writer: *std.io.Writer) !void {
+        if (self.parts.len == 0) {
+            try writer.writeAll("\"\"");
+            return;
+        }
+
+        if (self.parts.len == 1) {
+            try self.parts[0].format(writer);
+            return;
+        }
+
+        // Multiple parts - show as list
+        try writer.writeByte('[');
+        for (self.parts, 0..) |part, i| {
+            if (i > 0) try writer.writeAll(", ");
+            try part.format(writer);
+        }
+        try writer.writeByte(']');
+    }
 };
 
 /// A variable assignment (e.g., `FOO=bar`).
@@ -50,6 +78,12 @@ pub const Assignment = struct {
     line: usize,
     /// The column number where this assignment starts (1-indexed).
     column: usize,
+
+    /// Format the assignment for human-readable output.
+    pub fn format(self: Assignment, writer: *std.io.Writer) !void {
+        try writer.print("{s} = ", .{self.name});
+        try self.value.format(writer);
+    }
 };
 
 /// The target of a redirection operation.
@@ -60,6 +94,15 @@ pub const RedirectionTarget = union(enum) {
     fd: u32,
     /// For fd close (Fd with "-" target): close the source fd.
     close,
+
+    /// Format the redirection target for human-readable output.
+    pub fn format(self: RedirectionTarget, writer: *std.io.Writer) !void {
+        switch (self) {
+            .file => |word| try word.format(writer),
+            .fd => |fd| try writer.print("{d}", .{fd}),
+            .close => try writer.writeAll("-"),
+        }
+    }
 };
 
 /// A parsed redirection with its target.
@@ -76,6 +119,21 @@ pub const ParsedRedirection = struct {
     line: usize,
     /// The column number where this redirection starts (1-indexed).
     column: usize,
+
+    /// Format the redirection for human-readable output.
+    pub fn format(self: ParsedRedirection, writer: *std.io.Writer) !void {
+        if (self.source_fd) |fd| {
+            try writer.print("{d}", .{fd});
+        }
+        switch (self.op) {
+            .In => try writer.writeByte('<'),
+            .Out => try writer.writeByte('>'),
+            .Append => try writer.writeAll(">>"),
+            .Fd => try writer.writeAll(">&"),
+        }
+        try writer.writeByte(' ');
+        try self.target.format(writer);
+    }
 };
 
 /// A simple command consisting of assignments, arguments, and redirections.
@@ -86,6 +144,50 @@ pub const SimpleCommand = struct {
     argv: []const Word,
     /// Redirections in the order they appeared.
     redirections: []const ParsedRedirection,
+
+    /// Format the command for human-readable output.
+    pub fn format(self: SimpleCommand, writer: *std.io.Writer) !void {
+        try self.formatIndented(writer, 0);
+    }
+
+    /// Format the command with indentation (for nested commands).
+    fn formatIndented(self: SimpleCommand, writer: *std.io.Writer, indent: usize) !void {
+        try writer.splatByteAll(' ', indent);
+        try writer.writeAll("SimpleCommand:\n");
+
+        if (self.assignments.len > 0) {
+            try writer.splatByteAll(' ', indent + 2);
+            try writer.writeAll("assignments:\n");
+            for (self.assignments, 0..) |assignment, i| {
+                try writer.splatByteAll(' ', indent + 4);
+                try writer.print("[{d}] ", .{i});
+                try assignment.format(writer);
+                try writer.writeByte('\n');
+            }
+        }
+
+        if (self.argv.len > 0) {
+            try writer.splatByteAll(' ', indent + 2);
+            try writer.writeAll("argv:\n");
+            for (self.argv, 0..) |word, i| {
+                try writer.splatByteAll(' ', indent + 4);
+                try writer.print("[{d}] ", .{i});
+                try word.format(writer);
+                try writer.writeByte('\n');
+            }
+        }
+
+        if (self.redirections.len > 0) {
+            try writer.splatByteAll(' ', indent + 2);
+            try writer.writeAll("redirections:\n");
+            for (self.redirections, 0..) |redir, i| {
+                try writer.splatByteAll(' ', indent + 4);
+                try writer.print("[{d}] ", .{i});
+                try redir.format(writer);
+                try writer.writeByte('\n');
+            }
+        }
+    }
 };
 
 /// Errors that can occur during parsing.
