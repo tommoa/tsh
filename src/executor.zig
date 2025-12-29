@@ -284,7 +284,7 @@ fn openFlagsForOp(op: Redirection) posix.O {
 ///
 /// Returns the expanded string if tilde expansion applies, null otherwise.
 /// When null is returned, the caller should use the original literal unchanged.
-fn expandTilde(allocator: Allocator, literal: []const u8, home: ?[]const u8) Allocator.Error!?[]const u8 {
+inline fn expandTilde(allocator: Allocator, literal: []const u8, home: ?[]const u8) Allocator.Error!?[]const u8 {
     if (literal.len == 0 or literal[0] != '~') {
         return null;
     }
@@ -304,81 +304,127 @@ fn expandTilde(allocator: Allocator, literal: []const u8, home: ?[]const u8) All
     return null;
 }
 
-/// Calculate the expanded length of a WordPart.
-fn wordPartLength(part: WordPart) usize {
-    return switch (part) {
-        .literal => |lit| lit.len,
-        .quoted => |q| q.len,
-        .double_quoted => |parts| blk: {
-            var len: usize = 0;
-            for (parts) |p| {
-                len += wordPartLength(p);
-            }
-            break :blk len;
-        },
-    };
+/// Transform a tilde prefix in the first WordPart into quoted content.
+///
+/// Per POSIX 2.6.1, the result of tilde expansion is "treated as if quoted"
+/// to prevent further expansion processing (field splitting, globbing).
+fn applyTildeExpansion(
+    allocator: Allocator,
+    parts: []const WordPart,
+    home: ?[]const u8,
+) Allocator.Error![]const WordPart {
+    if (parts.len == 0) return parts;
+    if (parts[0] != .literal) return parts;
+
+    const expanded = try expandTilde(allocator, parts[0].literal, home) orelse return parts;
+
+    // Create new parts array with first element as quoted (won't be re-expanded)
+    const new_parts = try allocator.alloc(WordPart, parts.len);
+    new_parts[0] = .{ .quoted = expanded };
+    if (parts.len > 1) {
+        @memcpy(new_parts[1..], parts[1..]);
+    }
+    return new_parts;
 }
 
-/// Write a WordPart's content into a buffer at the given offset.
-/// Returns the new offset after writing.
-fn writeWordPart(buf: []u8, offset: usize, part: WordPart) usize {
-    switch (part) {
-        .literal => |lit| {
-            @memcpy(buf[offset..][0..lit.len], lit);
-            return offset + lit.len;
-        },
-        .quoted => |q| {
-            @memcpy(buf[offset..][0..q.len], q);
-            return offset + q.len;
-        },
-        .double_quoted => |parts| {
-            var off = offset;
-            for (parts) |p| {
-                off = writeWordPart(buf, off, p);
-            }
-            return off;
-        },
+/// Intermediate representation of expanded content within a word.
+///
+/// TODO: When implementing parameter expansion ($VAR) and command substitution
+/// ($(cmd)), field splitting must be considered. Per POSIX 2.6.5:
+///
+/// - Field splitting applies to results of parameter expansion, command
+///   substitution, and arithmetic expansion - but NOT to tilde expansion
+///   or literal content.
+/// - Content inside double quotes is not subject to field splitting.
+/// - Tilde expansion results are explicitly "treated as if quoted" (POSIX 2.6.1).
+///
+/// Field splitting interacts with adjacent content:
+///   text$(cmd)  where cmd outputs "a b c" → ["texta", "b", "c"]
+///   $(cmd)text  where cmd outputs "a b c" → ["a", "b", "ctext"]
+///   $(cmd1)$(cmd2) where outputs are "a b" and "c d" → ["a", "bc", "d"]
+///
+/// The first and last fragments of a split expansion concatenate with adjacent
+/// literals or expansion results. The `complete` flag indicates field boundaries
+/// (similar to lexer token completion), where `complete = true` means "this ends
+/// a word boundary."
+///
+/// When field splitting is implemented, this function may need to:
+/// - Return []ExpandedPart instead of a single ExpandedPart
+/// - Set `complete` flags based on IFS splitting within expansion results
+/// - Ensure literal content and tilde expansion results have `complete = false`
+///   (allowing them to merge with adjacent content)
+const ExpandedPart = struct {
+    content: []const u8,
+    complete: bool,
+};
+
+/// Concatenate expanded parts into a null-terminated string.
+fn concatExpandedParts(
+    allocator: Allocator,
+    parts: []const ExpandedPart,
+) Allocator.Error![:0]const u8 {
+    var total_len: usize = 0;
+    for (parts) |part| {
+        total_len += part.content.len;
     }
+
+    const buf = try allocator.allocSentinel(u8, total_len, 0);
+    var offset: usize = 0;
+    for (parts) |part| {
+        @memcpy(buf[offset..][0..part.content.len], part.content);
+        offset += part.content.len;
+    }
+
+    return buf;
 }
 
 /// Expand a Word into a null-terminated string.
 ///
 /// Performs tilde expansion on unquoted ~ at the start of the word.
-/// When command substitution is added, this will need to recursively
-/// execute nested commands.
+/// Currently returns a single string; when field splitting is implemented,
+/// this will need to return [][:0]const u8 to handle cases where one word
+/// expands into multiple arguments.
 fn expandWord(allocator: Allocator, word: Word, shell: *const ShellState) Allocator.Error![:0]const u8 {
-    // Check for tilde expansion: first part must be an unquoted literal starting with ~
-    var tilde_expanded: ?[]const u8 = null;
-    if (word.parts.len > 0) {
-        if (word.parts[0] == .literal) {
-            tilde_expanded = try expandTilde(allocator, word.parts[0].literal, shell.home);
+    // Pre-process: apply tilde expansion to first part if applicable
+    const parts = try applyTildeExpansion(allocator, word.parts, shell.home);
+
+    var expanded: std.ArrayListUnmanaged(ExpandedPart) = .{};
+    try expanded.ensureTotalCapacity(allocator, parts.len);
+
+    for (parts) |part| {
+        switch (part) {
+            .literal => |lit| try expanded.append(allocator, .{ .content = lit, .complete = false }),
+            .quoted => |q| try expanded.append(allocator, .{ .content = q, .complete = false }),
+            .double_quoted => |inner| {
+                // Inner parts can only be .literal or .quoted (parser never nests double_quoted)
+                // Concatenate them into a single ExpandedPart
+                var inner_len: usize = 0;
+                for (inner) |p| {
+                    inner_len += switch (p) {
+                        .literal => |l| l.len,
+                        .quoted => |q| q.len,
+                        .double_quoted => unreachable,
+                    };
+                }
+
+                const buf = try allocator.alloc(u8, inner_len);
+                var offset: usize = 0;
+                for (inner) |p| {
+                    const content = switch (p) {
+                        .literal => |l| l,
+                        .quoted => |q| q,
+                        .double_quoted => unreachable,
+                    };
+                    @memcpy(buf[offset..][0..content.len], content);
+                    offset += content.len;
+                }
+
+                try expanded.append(allocator, .{ .content = buf, .complete = false });
+            },
         }
     }
 
-    // Calculate total length
-    var total_len: usize = 0;
-    for (word.parts, 0..) |part, i| {
-        if (i == 0 and tilde_expanded != null) {
-            total_len += tilde_expanded.?.len;
-        } else {
-            total_len += wordPartLength(part);
-        }
-    }
-
-    const buf = try allocator.allocSentinel(u8, total_len, 0);
-
-    // Write parts
-    var offset: usize = 0;
-    for (word.parts, 0..) |part, i| {
-        if (i == 0 and tilde_expanded != null) {
-            @memcpy(buf[offset..][0..tilde_expanded.?.len], tilde_expanded.?);
-            offset += tilde_expanded.?.len;
-        } else {
-            offset = writeWordPart(buf, offset, part);
-        }
-    }
-
-    return buf;
+    return concatExpandedParts(allocator, expanded.items);
 }
 
 /// Expand an array of Words into a null-terminated array of null-terminated strings.
@@ -1007,6 +1053,127 @@ test "expandWord: quoted prefix prevents tilde expansion" {
 
     const result = try expandWord(arena.allocator(), word, &shell);
     try std.testing.expectEqualStrings("~", result);
+}
+
+test "applyTildeExpansion: transforms tilde literal to quoted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const parts = [_]WordPart{
+        .{ .literal = "~/docs" },
+        .{ .literal = "/more" },
+    };
+
+    const result = try applyTildeExpansion(arena.allocator(), &parts, "/home/user");
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expect(result[0] == .quoted);
+    try std.testing.expectEqualStrings("/home/user/docs", result[0].quoted);
+    try std.testing.expect(result[1] == .literal);
+    try std.testing.expectEqualStrings("/more", result[1].literal);
+}
+
+test "applyTildeExpansion: no transform when first part is not literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const parts = [_]WordPart{
+        .{ .quoted = "~" },
+        .{ .literal = "/more" },
+    };
+
+    const result = try applyTildeExpansion(arena.allocator(), &parts, "/home/user");
+
+    // Should return original parts unchanged
+    try std.testing.expectEqual(&parts, result.ptr);
+}
+
+test "applyTildeExpansion: no transform when HOME is null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const parts = [_]WordPart{
+        .{ .literal = "~/docs" },
+    };
+
+    const result = try applyTildeExpansion(arena.allocator(), &parts, null);
+
+    // Should return original parts unchanged
+    try std.testing.expectEqual(&parts, result.ptr);
+}
+
+test "applyTildeExpansion: no transform for non-tilde literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const parts = [_]WordPart{
+        .{ .literal = "hello" },
+    };
+
+    const result = try applyTildeExpansion(arena.allocator(), &parts, "/home/user");
+
+    // Should return original parts unchanged
+    try std.testing.expectEqual(&parts, result.ptr);
+}
+
+test "applyTildeExpansion: empty parts returns empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const parts = [_]WordPart{};
+
+    const result = try applyTildeExpansion(arena.allocator(), &parts, "/home/user");
+
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "concatExpandedParts: multiple parts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const parts = [_]ExpandedPart{
+        .{ .content = "hello", .complete = false },
+        .{ .content = " ", .complete = false },
+        .{ .content = "world", .complete = false },
+    };
+
+    const result = try concatExpandedParts(arena.allocator(), &parts);
+    try std.testing.expectEqualStrings("hello world", result);
+}
+
+test "concatExpandedParts: empty parts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const parts = [_]ExpandedPart{};
+
+    const result = try concatExpandedParts(arena.allocator(), &parts);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "expandWord: double-quoted inner parts concatenated" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    try env.put("HOME", "/home/user");
+    var shell = ShellState.initWithEnv(arena.allocator(), env);
+
+    // A word with a double-quoted region containing inner parts
+    // Tilde inside double quotes should NOT expand
+    const inner_parts = [_]WordPart{
+        .{ .literal = "hello" },
+        .{ .literal = "~" },
+    };
+    const word = Word{
+        .parts = &[_]WordPart{.{ .double_quoted = &inner_parts }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWord(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("hello~", result);
 }
 
 test "ExitStatus.toExitCode" {
