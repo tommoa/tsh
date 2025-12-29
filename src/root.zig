@@ -1,9 +1,11 @@
 //! tsh - A POSIX shell implementation in Zig.
 //!
-//! This module re-exports the lexer and parser for library consumers.
+//! This module re-exports the lexer, parser, executor, and state for library consumers.
 
 pub const lexer = @import("lexer.zig");
 pub const parser = @import("parser.zig");
+pub const executor = @import("executor.zig");
+pub const state = @import("state.zig");
 
 // Re-export commonly used types at the top level for convenience
 pub const Lexer = lexer.Lexer;
@@ -19,6 +21,12 @@ pub const Word = parser.Word;
 pub const WordPart = parser.WordPart;
 pub const Assignment = parser.Assignment;
 pub const ParsedRedirection = parser.ParsedRedirection;
+
+pub const Executor = executor.Executor;
+pub const ExecuteError = executor.ExecuteError;
+
+pub const ShellState = state.ShellState;
+pub const ExitStatus = state.ExitStatus;
 
 test {
     @import("std").testing.refAllDecls(@This());

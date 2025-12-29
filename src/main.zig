@@ -35,6 +35,36 @@ fn dumpTokens(reader: *std.io.Reader, writer: *std.io.Writer) !usize {
     return token_count;
 }
 
+/// Run a command string and return the exit code.
+fn runCommand(allocator: std.mem.Allocator, command_string: []const u8, err_writer: *std.io.Writer) !u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed(command_string);
+    var lexer = tsh.Lexer.init(&reader);
+    var parser = tsh.Parser.init(arena.allocator(), &lexer);
+
+    const cmd = parser.parseCommand() catch |err| {
+        if (parser.getErrorInfo()) |info| {
+            try err_writer.print("tsh: [{d}:{d}] {s}\n", .{ info.line, info.column, info.message });
+        } else {
+            try err_writer.print("tsh: parse error: {s}\n", .{@errorName(err)});
+        }
+        try err_writer.flush();
+        return 1;
+    };
+
+    if (cmd) |c| {
+        var shell_state = try tsh.ShellState.init(arena.allocator());
+        var exec = tsh.Executor.init(arena.allocator(), &shell_state);
+        const status = exec.execute(c);
+        return status.toExitCode();
+    }
+
+    // Empty command
+    return 0;
+}
+
 /// Parse and dump all commands from the reader.
 fn parseAndDump(allocator: std.mem.Allocator, reader: *std.io.Reader, writer: *std.io.Writer) !usize {
     var lexer = tsh.Lexer.init(reader);
@@ -76,6 +106,7 @@ fn parseAndDump(allocator: std.mem.Allocator, reader: *std.io.Reader, writer: *s
 const Command = enum {
     dump_tokens,
     dump_ast,
+    run,
     help,
 };
 
@@ -84,6 +115,7 @@ fn printUsage() void {
         \\Usage: tsh [options] [file]
         \\
         \\Options:
+        \\  -c <command>   Execute command string
         \\  --dump-tokens  Dump lexer tokens (default behavior)
         \\  --dump-ast     Parse and dump AST
         \\  --help, -h     Show this help message
@@ -106,12 +138,20 @@ pub fn main() !void {
     // Parse command line arguments
     var command: Command = .dump_tokens;
     var filename: ?[]const u8 = null;
+    var command_string: ?[]const u8 = null;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--dump-tokens")) {
             command = .dump_tokens;
         } else if (std.mem.eql(u8, arg, "--dump-ast")) {
             command = .dump_ast;
+        } else if (std.mem.eql(u8, arg, "-c")) {
+            command = .run;
+            command_string = args.next() orelse {
+                std.debug.print("Error: -c requires a command string\n", .{});
+                printUsage();
+                return error.InvalidArgument;
+            };
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             command = .help;
         } else if (arg.len > 0 and arg[0] == '-') {
@@ -158,6 +198,10 @@ pub fn main() !void {
             defer arena.deinit();
             _ = try parseAndDump(arena.allocator(), &file_reader.interface, &stderr_writer.interface);
             try stderr_writer.interface.flush();
+        },
+        .run => {
+            const exit_code = try runCommand(allocator, command_string.?, &stderr_writer.interface);
+            std.posix.exit(exit_code);
         },
         .help => unreachable, // handled above
     }

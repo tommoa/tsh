@@ -115,23 +115,19 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    // Creates an executable that will run `test` blocks from the provided module.
-    const mod_tests = b.addTest(.{
-        .root_module = mod,
-    });
+    // Creates executables that will run `test` blocks from the modules.
+    const mod_tests = b.addTest(.{ .root_module = mod });
+    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
 
-    // A run step that will run the test executable.
-    const run_mod_tests = b.addRunArtifact(mod_tests);
+    // Run tests directly without the build system's server mode (--listen).
+    // The default addRunArtifact enables server mode which causes hangs when
+    // tests fork child processes - the children inherit the listen pipe/socket,
+    // preventing the build system from detecting test completion.
+    const run_mod_tests = std.Build.Step.Run.create(b, &.{});
+    run_mod_tests.addArtifactArg(mod_tests);
 
-    // Creates an executable that will run `test` blocks from the executable's
-    // root module. Note that test executables only test one module at a time,
-    // hence why we have to create two separate ones.
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
-
-    // A run step that will run the second test executable.
-    const run_exe_tests = b.addRunArtifact(exe_tests);
+    const run_exe_tests = std.Build.Step.Run.create(b, &.{});
+    run_exe_tests.addArtifactArg(exe_tests);
 
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
