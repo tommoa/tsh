@@ -62,6 +62,10 @@ pub const ShellState = struct {
     /// Accessible as $? in the shell.
     last_status: ExitStatus,
 
+    /// Cached HOME environment variable for tilde expansion.
+    /// Updated when HOME is set or unset via setEnv().
+    home: ?[]const u8,
+
     // Future fields:
     // /// Shell variables (not exported, shell-internal only).
     // vars: std.StringHashMap([]const u8),
@@ -86,6 +90,7 @@ pub const ShellState = struct {
             .allocator = allocator,
             .env = env,
             .last_status = .{ .exited = 0 },
+            .home = env.get("HOME"),
         };
     }
 
@@ -99,14 +104,20 @@ pub const ShellState = struct {
         return self.env.get(key);
     }
 
-    /// Set an environment variable.
-    pub fn setEnv(self: *ShellState, key: []const u8, value: []const u8) !void {
-        try self.env.put(key, value);
-    }
-
-    /// Remove an environment variable.
-    pub fn unsetEnv(self: *ShellState, key: []const u8) void {
-        _ = self.env.remove(key);
+    /// Set or unset an environment variable.
+    ///
+    /// If value is non-null, sets the variable. If null, removes it.
+    /// Updates the cached `home` field when key is "HOME".
+    pub fn setEnv(self: *ShellState, key: []const u8, value: ?[]const u8) !void {
+        if (value) |v| {
+            try self.env.put(key, v);
+        } else {
+            _ = self.env.remove(key);
+        }
+        if (std.mem.eql(u8, key, "HOME")) {
+            // Re-fetch from env to get the EnvMap-owned copy, not the caller's slice
+            self.home = self.env.get("HOME");
+        }
     }
 };
 
@@ -143,7 +154,7 @@ test "ShellState: setEnv and getEnv" {
     try std.testing.expectEqualStrings("test_value", state.getEnv("TEST_VAR").?);
 }
 
-test "ShellState: unsetEnv" {
+test "ShellState: setEnv with null removes variable" {
     var env = process.EnvMap.init(std.testing.allocator);
     try env.put("TO_REMOVE", "value");
 
@@ -151,7 +162,7 @@ test "ShellState: unsetEnv" {
     defer state.deinit();
 
     try std.testing.expect(state.getEnv("TO_REMOVE") != null);
-    state.unsetEnv("TO_REMOVE");
+    try state.setEnv("TO_REMOVE", null);
     try std.testing.expect(state.getEnv("TO_REMOVE") == null);
 }
 
@@ -161,4 +172,44 @@ test "ShellState: initial last_status is 0" {
     defer state.deinit();
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, state.last_status);
+}
+
+test "ShellState: home is cached from env" {
+    var env = process.EnvMap.init(std.testing.allocator);
+    try env.put("HOME", "/home/testuser");
+
+    var state = ShellState.initWithEnv(std.testing.allocator, env);
+    defer state.deinit();
+
+    try std.testing.expectEqualStrings("/home/testuser", state.home.?);
+}
+
+test "ShellState: home is null when HOME not set" {
+    const env = process.EnvMap.init(std.testing.allocator);
+    var state = ShellState.initWithEnv(std.testing.allocator, env);
+    defer state.deinit();
+
+    try std.testing.expect(state.home == null);
+}
+
+test "ShellState: setEnv updates cached home" {
+    const env = process.EnvMap.init(std.testing.allocator);
+    var state = ShellState.initWithEnv(std.testing.allocator, env);
+    defer state.deinit();
+
+    try std.testing.expect(state.home == null);
+    try state.setEnv("HOME", "/new/home");
+    try std.testing.expectEqualStrings("/new/home", state.home.?);
+}
+
+test "ShellState: setEnv with null clears cached home" {
+    var env = process.EnvMap.init(std.testing.allocator);
+    try env.put("HOME", "/home/testuser");
+
+    var state = ShellState.initWithEnv(std.testing.allocator, env);
+    defer state.deinit();
+
+    try std.testing.expect(state.home != null);
+    try state.setEnv("HOME", null);
+    try std.testing.expect(state.home == null);
 }

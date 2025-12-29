@@ -120,7 +120,7 @@ pub const Executor = struct {
                 // files_only=true: only create/truncate files, don't redirect shell's fds.
                 // TODO: Add test for this once we support multiple commands - verify that
                 // `> file; echo hello` still outputs to terminal, not to file.
-                switch (applyRedirections(self.allocator, cmd.redirections, true)) {
+                switch (applyRedirections(self.allocator, cmd.redirections, true, self.shell_state)) {
                     .ok => {
                         self.shell_state.last_status = .{ .exited = 0 };
                     },
@@ -138,7 +138,7 @@ pub const Executor = struct {
         }
 
         // Expand argv
-        const argv = expandArgv(self.allocator, cmd.argv) catch |err| {
+        const argv = expandArgv(self.allocator, cmd.argv, self.shell_state) catch |err| {
             self.setError("failed to expand arguments", @errorName(err));
             self.shell_state.last_status = .{ .exited = 1 };
             return self.shell_state.last_status;
@@ -179,7 +179,7 @@ pub const Executor = struct {
         env_map: *const process.EnvMap,
     ) noreturn {
         // Set up redirections (files_only=false: actually redirect fds for the child)
-        switch (applyRedirections(self.allocator, cmd.redirections, false)) {
+        switch (applyRedirections(self.allocator, cmd.redirections, false, self.shell_state)) {
             .ok => {},
             .err => |msg| {
                 printError("{s}\n", .{msg});
@@ -241,7 +241,7 @@ pub const Executor = struct {
 
         // Add/override with command-specific assignments
         for (assignments) |assignment| {
-            const value = try expandWord(self.allocator, assignment.value);
+            const value = try expandWord(self.allocator, assignment.value, self.shell_state);
             try env_map.put(assignment.name, value);
         }
 
@@ -273,6 +273,35 @@ fn openFlagsForOp(op: Redirection) posix.O {
         .Append => .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true },
         .Fd => unreachable, // fd duplication doesn't use open
     };
+}
+
+/// Expand a tilde prefix in a literal string.
+///
+/// POSIX tilde expansion rules (section 2.6.1):
+/// - `~` alone expands to $HOME
+/// - `~/...` expands to $HOME/...
+/// - `~user` would expand to user's home directory (not yet implemented)
+///
+/// Returns the expanded string if tilde expansion applies, null otherwise.
+/// When null is returned, the caller should use the original literal unchanged.
+fn expandTilde(allocator: Allocator, literal: []const u8, home: ?[]const u8) Allocator.Error!?[]const u8 {
+    if (literal.len == 0 or literal[0] != '~') {
+        return null;
+    }
+
+    // ~ alone -> $HOME
+    if (literal.len == 1) {
+        return home;
+    }
+
+    // ~/... -> $HOME/...
+    if (literal[1] == '/') {
+        const home_val = home orelse return null;
+        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ home_val, literal[1..] });
+    }
+
+    // TODO: ~user form - implement passwd lookup for user home directories
+    return null;
 }
 
 /// Calculate the expanded length of a WordPart.
@@ -314,30 +343,50 @@ fn writeWordPart(buf: []u8, offset: usize, part: WordPart) usize {
 
 /// Expand a Word into a null-terminated string.
 ///
-/// Currently just concatenates all parts. When command substitution
-/// is added, this will need to recursively execute nested commands.
-fn expandWord(allocator: Allocator, word: Word) Allocator.Error![:0]const u8 {
+/// Performs tilde expansion on unquoted ~ at the start of the word.
+/// When command substitution is added, this will need to recursively
+/// execute nested commands.
+fn expandWord(allocator: Allocator, word: Word, shell: *const ShellState) Allocator.Error![:0]const u8 {
+    // Check for tilde expansion: first part must be an unquoted literal starting with ~
+    var tilde_expanded: ?[]const u8 = null;
+    if (word.parts.len > 0) {
+        if (word.parts[0] == .literal) {
+            tilde_expanded = try expandTilde(allocator, word.parts[0].literal, shell.home);
+        }
+    }
+
+    // Calculate total length
     var total_len: usize = 0;
-    for (word.parts) |part| {
-        total_len += wordPartLength(part);
+    for (word.parts, 0..) |part, i| {
+        if (i == 0 and tilde_expanded != null) {
+            total_len += tilde_expanded.?.len;
+        } else {
+            total_len += wordPartLength(part);
+        }
     }
 
     const buf = try allocator.allocSentinel(u8, total_len, 0);
 
+    // Write parts
     var offset: usize = 0;
-    for (word.parts) |part| {
-        offset = writeWordPart(buf, offset, part);
+    for (word.parts, 0..) |part, i| {
+        if (i == 0 and tilde_expanded != null) {
+            @memcpy(buf[offset..][0..tilde_expanded.?.len], tilde_expanded.?);
+            offset += tilde_expanded.?.len;
+        } else {
+            offset = writeWordPart(buf, offset, part);
+        }
     }
 
     return buf;
 }
 
 /// Expand an array of Words into a null-terminated array of null-terminated strings.
-fn expandArgv(allocator: Allocator, words: []const Word) Allocator.Error![:null]const ?[*:0]const u8 {
+fn expandArgv(allocator: Allocator, words: []const Word, shell: *const ShellState) Allocator.Error![:null]const ?[*:0]const u8 {
     const argv = try allocator.allocSentinel(?[*:0]const u8, words.len, null);
 
     for (words, 0..) |word, i| {
-        argv[i] = (try expandWord(allocator, word)).ptr;
+        argv[i] = (try expandWord(allocator, word, shell)).ptr;
     }
 
     return argv;
@@ -403,13 +452,13 @@ fn findExecutable(allocator: Allocator, cmd: [*:0]const u8, env_map: *const proc
 /// On success, returns .ok.
 /// On failure, returns .err with an error message. The caller is responsible
 /// for printing the error and determining the appropriate exit status.
-fn applyRedirections(allocator: Allocator, redirections: []const ParsedRedirection, files_only: bool) RedirectionResult {
+fn applyRedirections(allocator: Allocator, redirections: []const ParsedRedirection, files_only: bool, shell: *const ShellState) RedirectionResult {
     for (redirections) |redir| {
         const source_fd: posix.fd_t = @intCast(redir.source_fd orelse defaultSourceFd(redir.op));
 
         switch (redir.target) {
             .file => |word| {
-                const path = expandWord(allocator, word) catch {
+                const path = expandWord(allocator, word, shell) catch {
                     return .{ .err = "failed to expand redirection target" };
                 };
                 const flags = openFlagsForOp(redir.op);
@@ -749,6 +798,9 @@ test "expandWord: single literal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
+    const env = process.EnvMap.init(arena.allocator());
+    var shell = ShellState.initWithEnv(arena.allocator(), env);
+
     const word = Word{
         .parts = &[_]WordPart{.{ .literal = "hello" }},
         .position = 0,
@@ -756,13 +808,16 @@ test "expandWord: single literal" {
         .column = 1,
     };
 
-    const result = try expandWord(arena.allocator(), word);
+    const result = try expandWord(arena.allocator(), word, &shell);
     try std.testing.expectEqualStrings("hello", result);
 }
 
 test "expandWord: multiple literals" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+
+    const env = process.EnvMap.init(arena.allocator());
+    var shell = ShellState.initWithEnv(arena.allocator(), env);
 
     const word = Word{
         .parts = &[_]WordPart{
@@ -774,8 +829,184 @@ test "expandWord: multiple literals" {
         .column = 1,
     };
 
-    const result = try expandWord(arena.allocator(), word);
+    const result = try expandWord(arena.allocator(), word, &shell);
     try std.testing.expectEqualStrings("helloworld", result);
+}
+
+test "expandTilde: tilde alone expands to HOME" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try expandTilde(arena.allocator(), "~", "/home/user");
+    try std.testing.expectEqualStrings("/home/user", result.?);
+}
+
+test "expandTilde: tilde with path expands to HOME/path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try expandTilde(arena.allocator(), "~/Documents/file.txt", "/home/user");
+    try std.testing.expectEqualStrings("/home/user/Documents/file.txt", result.?);
+}
+
+test "expandTilde: tilde alone with no HOME returns null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try expandTilde(arena.allocator(), "~", null);
+    try std.testing.expect(result == null);
+}
+
+test "expandTilde: tilde path with no HOME returns null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try expandTilde(arena.allocator(), "~/foo", null);
+    try std.testing.expect(result == null);
+}
+
+test "expandTilde: tilde-user returns null (not implemented)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try expandTilde(arena.allocator(), "~root", "/home/user");
+    try std.testing.expect(result == null);
+}
+
+test "expandTilde: no tilde returns null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try expandTilde(arena.allocator(), "foo", "/home/user");
+    try std.testing.expect(result == null);
+}
+
+test "expandTilde: tilde not at start returns null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try expandTilde(arena.allocator(), "a~b", "/home/user");
+    try std.testing.expect(result == null);
+}
+
+test "expandWord: tilde expands in unquoted literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    try env.put("HOME", "/home/testuser");
+    var shell = ShellState.initWithEnv(arena.allocator(), env);
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .literal = "~" }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWord(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("/home/testuser", result);
+}
+
+test "expandWord: tilde with path expands" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    try env.put("HOME", "/home/testuser");
+    var shell = ShellState.initWithEnv(arena.allocator(), env);
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .literal = "~/bin" }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWord(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("/home/testuser/bin", result);
+}
+
+test "expandWord: quoted tilde does not expand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    try env.put("HOME", "/home/testuser");
+    var shell = ShellState.initWithEnv(arena.allocator(), env);
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .quoted = "~" }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWord(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("~", result);
+}
+
+test "expandWord: double-quoted tilde does not expand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    try env.put("HOME", "/home/testuser");
+    var shell = ShellState.initWithEnv(arena.allocator(), env);
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .double_quoted = &[_]WordPart{.{ .literal = "~" }} }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWord(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("~", result);
+}
+
+test "expandWord: tilde with no HOME stays literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const env = process.EnvMap.init(arena.allocator());
+    var shell = ShellState.initWithEnv(arena.allocator(), env);
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .literal = "~" }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWord(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("~", result);
+}
+
+test "expandWord: quoted prefix prevents tilde expansion" {
+    // Tests that tilde expansion only occurs when the FIRST part of a word is
+    // an unquoted literal starting with ~. Any quoted content before the tilde
+    // (even empty quotes like ""~) prevents expansion per POSIX 2.6.1.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    try env.put("HOME", "/home/testuser");
+    var shell = ShellState.initWithEnv(arena.allocator(), env);
+
+    // Simulates ""~ - an empty quoted part followed by tilde
+    const word = Word{
+        .parts = &[_]WordPart{
+            .{ .quoted = "" },
+            .{ .literal = "~" },
+        },
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWord(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("~", result);
 }
 
 test "ExitStatus.toExitCode" {
