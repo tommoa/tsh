@@ -50,6 +50,14 @@ pub const TokenType = union(enum) {
     DoubleQuoteBegin,
     /// Marks the end of a double-quoted string.
     DoubleQuoteEnd,
+    /// Left parenthesis - used for subshells, case patterns, function definitions.
+    /// TODO: When implementing arithmetic expansion, `((` needs special handling
+    /// to parse `$((...))` as arithmetic rather than nested command substitution.
+    LeftParen,
+    /// Right parenthesis - closes subshells, case patterns, function definitions.
+    /// TODO: When implementing arithmetic expansion, `))` needs special handling
+    /// to close `$((...))` arithmetic expressions.
+    RightParen,
 };
 
 /// The lexer's Token structure.
@@ -91,6 +99,8 @@ pub const Token = struct {
                 }
                 try writer.writeByte(')');
             },
+            .LeftParen => try writer.writeAll("LeftParen"),
+            .RightParen => try writer.writeAll("RightParen"),
         }
         if (!self.complete) try writer.writeAll(" [incomplete]");
     }
@@ -208,7 +218,7 @@ pub const Lexer = struct {
     /// - `<`, `>`, `&`, `|`, `;` (metacharacters - separate tokens)
     fn isPlainCharacter(c: u8) bool {
         return switch (c) {
-            ' ', '\t', '\n', '<', '>', '&', '|', ';', '\'', '"', '\\' => false,
+            ' ', '\t', '\n', '<', '>', '&', '|', ';', '(', ')', '\'', '"', '\\' => false,
             else => true,
         };
     }
@@ -237,7 +247,7 @@ pub const Lexer = struct {
                 // Whitespace and metacharacters end words
                 // Quotes and backslash do NOT end words - they continue the word
                 // Note: < and > do NOT end words - see comment above
-                ' ', '\t', '\n', '|', ';', '&' => true,
+                ' ', '\t', '\n', '|', ';', '&', '(', ')' => true,
                 else => false,
             },
             .double_quote, .double_quote_escape => switch (char) {
@@ -693,6 +703,14 @@ pub const Lexer = struct {
                         }
                         break :state try self.finishRedirection(.Out);
                     },
+                    '(' => {
+                        _ = try self.consumeOne();
+                        break :state self.makeToken(.LeftParen, true);
+                    },
+                    ')' => {
+                        _ = try self.consumeOne();
+                        break :state self.makeToken(.RightParen, true);
+                    },
                     else => {
                         if (!isPlainCharacter(first)) {
                             // Consume the unhandled character to avoid infinite loop
@@ -999,6 +1017,109 @@ test "nextToken: metacharacter at end of input" {
     var lexer = Lexer.init(&reader);
     try std.testing.expectEqual(null, try lexer.nextToken());
     try std.testing.expectEqual(null, try lexer.nextToken()); // Should hit EOF, not loop
+}
+
+// --- Parenthesis tests ---
+
+fn expectLeftParen(token: ?Token) !void {
+    const t = token orelse return error.ExpectedToken;
+    switch (t.type) {
+        .LeftParen => {},
+        else => return error.ExpectedLeftParen,
+    }
+}
+
+fn expectRightParen(token: ?Token) !void {
+    const t = token orelse return error.ExpectedToken;
+    switch (t.type) {
+        .RightParen => {},
+        else => return error.ExpectedRightParen,
+    }
+}
+
+test "nextToken: left parenthesis" {
+    var reader = std.io.Reader.fixed("(");
+    var lexer = Lexer.init(&reader);
+    try expectLeftParen(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: right parenthesis" {
+    var reader = std.io.Reader.fixed(")");
+    var lexer = Lexer.init(&reader);
+    try expectRightParen(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: parentheses as word boundaries" {
+    // echo(foo) should tokenize as: echo, (, foo, )
+    var reader = std.io.Reader.fixed("echo(foo)");
+    var lexer = Lexer.init(&reader);
+    try expectLiteral(try lexer.nextToken(), "echo");
+    try expectLeftParen(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "foo");
+    try expectRightParen(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: subshell syntax" {
+    // (cmd) should tokenize as: (, cmd, )
+    var reader = std.io.Reader.fixed("(cmd)");
+    var lexer = Lexer.init(&reader);
+    try expectLeftParen(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "cmd");
+    try expectRightParen(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: parentheses with spaces" {
+    var reader = std.io.Reader.fixed("( cmd )");
+    var lexer = Lexer.init(&reader);
+    try expectLeftParen(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "cmd");
+    try expectRightParen(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: nested parentheses" {
+    var reader = std.io.Reader.fixed("(())");
+    var lexer = Lexer.init(&reader);
+    try expectLeftParen(try lexer.nextToken());
+    try expectLeftParen(try lexer.nextToken());
+    try expectRightParen(try lexer.nextToken());
+    try expectRightParen(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: parenthesis complete flag" {
+    // Parentheses should always be complete tokens
+    var reader = std.io.Reader.fixed("(a)");
+    var lexer = Lexer.init(&reader);
+    const tok1 = (try lexer.nextToken()).?;
+    try std.testing.expectEqual(TokenType.LeftParen, tok1.type);
+    try std.testing.expectEqual(true, tok1.complete);
+    _ = try lexer.nextToken(); // skip 'a'
+    const tok3 = (try lexer.nextToken()).?;
+    try std.testing.expectEqual(TokenType.RightParen, tok3.type);
+    try std.testing.expectEqual(true, tok3.complete);
+}
+
+test "nextToken: parentheses inside single quotes are literal" {
+    // Parentheses inside single quotes should be treated as literal content
+    var reader = std.io.Reader.fixed("'(foo)'");
+    var lex = Lexer.init(&reader);
+    try expectSingleQuoted(try lex.nextToken(), "(foo)");
+    try std.testing.expectEqual(null, try lex.nextToken());
+}
+
+test "nextToken: parentheses inside double quotes are literal" {
+    // Parentheses inside double quotes should be treated as literal content
+    var reader = std.io.Reader.fixed("\"(foo)\"");
+    var lex = Lexer.init(&reader);
+    try expectDoubleQuoteBegin(try lex.nextToken());
+    try expectLiteral(try lex.nextToken(), "(foo)");
+    try expectDoubleQuoteEnd(try lex.nextToken());
+    try std.testing.expectEqual(null, try lex.nextToken());
 }
 
 test "nextToken: token position tracking" {
@@ -1676,6 +1797,8 @@ fn fuzzRandomBytes(_: void, input: []const u8) anyerror!void {
             .SingleQuoted => {},
             .DoubleQuoteBegin => {},
             .DoubleQuoteEnd => {},
+            .LeftParen => {},
+            .RightParen => {},
         }
     }
 }

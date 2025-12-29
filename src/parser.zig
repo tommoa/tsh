@@ -198,6 +198,8 @@ pub const ParseError = error{
     MissingRedirectionTarget,
     /// For >& or <&, the target must be a digit sequence or '-'.
     InvalidFdRedirectionTarget,
+    /// Encountered syntax that is not yet implemented (e.g., subshells, functions).
+    UnsupportedSyntax,
 } || lexer.LexerError || Allocator.Error;
 
 /// Information about a parse error for error reporting.
@@ -330,6 +332,14 @@ pub const Parser = struct {
                         self.setPendingRedir(redir, tok);
                         continue :state .need_redir_target;
                     },
+                    .LeftParen => {
+                        self.setError("subshells are not yet implemented", tok.position, tok.line, tok.column);
+                        return ParseError.UnsupportedSyntax;
+                    },
+                    .RightParen => {
+                        self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
+                        return ParseError.UnsupportedSyntax;
+                    },
                     else => {
                         self.startWord(tok);
                         try self.addTokenToParts(tok);
@@ -354,6 +364,14 @@ pub const Parser = struct {
                     .Redirection => |redir| {
                         self.setPendingRedir(redir, tok);
                         continue :state .need_redir_target;
+                    },
+                    .LeftParen => {
+                        self.setError("syntax error near unexpected token `('", tok.position, tok.line, tok.column);
+                        return ParseError.UnsupportedSyntax;
+                    },
+                    .RightParen => {
+                        self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
+                        return ParseError.UnsupportedSyntax;
                     },
                     else => {
                         self.startWord(tok);
@@ -413,6 +431,14 @@ pub const Parser = struct {
                             continue :state .need_redir_target;
                         }
                     },
+                    .LeftParen => {
+                        self.setError("syntax error near unexpected token `('", tok.position, tok.line, tok.column);
+                        return ParseError.UnsupportedSyntax;
+                    },
+                    .RightParen => {
+                        self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
+                        return ParseError.UnsupportedSyntax;
+                    },
                     else => {
                         try self.addTokenToParts(tok);
                         if (tok.complete) {
@@ -441,6 +467,14 @@ pub const Parser = struct {
                         const redir = self.pending_redir.?;
                         self.setError("missing redirection target", redir.position, redir.end_line, redir.end_column);
                         return ParseError.MissingRedirectionTarget;
+                    },
+                    .LeftParen => {
+                        self.setError("syntax error near unexpected token `('", tok.position, tok.line, tok.column);
+                        return ParseError.UnsupportedSyntax;
+                    },
+                    .RightParen => {
+                        self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
+                        return ParseError.UnsupportedSyntax;
                     },
                     else => {
                         self.startWord(tok);
@@ -578,6 +612,9 @@ pub const Parser = struct {
             },
             .Redirection => {
                 // Shouldn't happen during word collection
+            },
+            .LeftParen, .RightParen => {
+                // Shouldn't happen during word collection - handled by state machine
             },
         }
     }
@@ -1572,4 +1609,113 @@ test "parseCommand: buffer boundary invariance for fd redirections" {
             }
         }
     }
+}
+
+// --- Parenthesis error tests ---
+
+test "parseCommand: left parenthesis at start returns UnsupportedSyntax" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("(cmd)");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = parser.parseCommand();
+    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
+    try std.testing.expectEqualStrings("subshells are not yet implemented", parser.error_info.?.message);
+}
+
+test "parseCommand: right parenthesis at start returns UnsupportedSyntax" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed(")");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = parser.parseCommand();
+    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
+    try std.testing.expectEqualStrings("syntax error near unexpected token `)'", parser.error_info.?.message);
+}
+
+test "parseCommand: left parenthesis after command returns UnsupportedSyntax" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("cmd (");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = parser.parseCommand();
+    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
+    try std.testing.expectEqualStrings("syntax error near unexpected token `('", parser.error_info.?.message);
+}
+
+test "parseCommand: right parenthesis after command returns UnsupportedSyntax" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("cmd )");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = parser.parseCommand();
+    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
+    try std.testing.expectEqualStrings("syntax error near unexpected token `)'", parser.error_info.?.message);
+}
+
+test "parseCommand: parenthesis as redirection target returns UnsupportedSyntax" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("cmd >(");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = parser.parseCommand();
+    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
+}
+
+test "parseCommand: parenthesis in word returns UnsupportedSyntax" {
+    // "cmd(" should tokenize as "cmd", "(" - then ( triggers error
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("cmd(");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = parser.parseCommand();
+    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
+}
+
+test "parseCommand: single-quoted parentheses are valid arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo '(foo)'");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.parseCommand();
+    try std.testing.expect(cmd != null);
+    try std.testing.expectEqual(@as(usize, 2), cmd.?.argv.len);
+    try expectWord(cmd.?.argv[0], &[_][]const u8{"echo"});
+    try expectWord(cmd.?.argv[1], &[_][]const u8{"(foo)"});
+}
+
+test "parseCommand: double-quoted parentheses are valid arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo \"(bar)\"");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.parseCommand();
+    try std.testing.expect(cmd != null);
+    try std.testing.expectEqual(@as(usize, 2), cmd.?.argv.len);
+    try expectWord(cmd.?.argv[0], &[_][]const u8{"echo"});
+    try expectWord(cmd.?.argv[1], &[_][]const u8{"(bar)"});
 }
