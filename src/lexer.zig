@@ -3372,3 +3372,30 @@ test "nextToken: source fd just over max treated as word" {
 
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
+
+test "nextToken: ${:-foo} modifier without parameter name" {
+    var reader = std.io.Reader.fixed("${:-foo}");
+    var lexer = Lexer.init(&reader);
+    try expectBraceExpansionBegin(try lexer.nextToken());
+    try expectModifier(try lexer.nextToken(), .UseDefault, true);
+    try expectLiteral(try lexer.nextToken(), "foo");
+    try expectBraceExpansionEnd(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: ${:=value} modifier without parameter name" {
+    var reader = std.io.Reader.fixed("${:=value}");
+    var lexer = Lexer.init(&reader);
+    try expectBraceExpansionBegin(try lexer.nextToken());
+    try expectModifier(try lexer.nextToken(), .AssignDefault, true);
+    try expectLiteral(try lexer.nextToken(), "value");
+    try expectBraceExpansionEnd(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: ${:} is InvalidModifier error" {
+    var reader = std.io.Reader.fixed("${:}");
+    var lexer = Lexer.init(&reader);
+    try expectBraceExpansionBegin(try lexer.nextToken());
+    try std.testing.expectError(LexerError.InvalidModifier, lexer.nextToken());
+}

@@ -588,35 +588,149 @@ fn expandWord(allocator: Allocator, word: Word, shell: *const ShellState) Alloca
             .literal => |lit| try expanded.append(allocator, .{ .content = lit, .complete = false }),
             .quoted => |q| try expanded.append(allocator, .{ .content = q, .complete = false }),
             .double_quoted => |inner| {
-                // Inner parts can only be .literal or .quoted (parser never nests double_quoted)
+                // Inner parts may contain .literal, .quoted, or .parameter
                 // Concatenate them into a single ExpandedPart
-                var inner_len: usize = 0;
-                for (inner) |p| {
-                    inner_len += switch (p) {
-                        .literal => |l| l.len,
-                        .quoted => |q| q.len,
-                        .double_quoted => unreachable,
-                    };
-                }
-
-                const buf = try allocator.alloc(u8, inner_len);
-                var offset: usize = 0;
-                for (inner) |p| {
-                    const content = switch (p) {
-                        .literal => |l| l,
-                        .quoted => |q| q,
-                        .double_quoted => unreachable,
-                    };
-                    @memcpy(buf[offset..][0..content.len], content);
-                    offset += content.len;
-                }
-
-                try expanded.append(allocator, .{ .content = buf, .complete = false });
+                const content = try expandInnerParts(allocator, inner);
+                try expanded.append(allocator, .{ .content = content, .complete = false });
+            },
+            .parameter => |param| {
+                // TODO: Evaluate the expansion using shell state.
+                // For now, output a literal representation of the expansion.
+                const content = try formatParameterExpansion(allocator, param);
+                try expanded.append(allocator, .{ .content = content, .complete = false });
             },
         }
     }
 
     return concatExpandedParts(allocator, expanded.items);
+}
+
+/// Expand inner parts of a double-quoted region into a single string.
+/// Inner parts may contain .literal, .quoted, or .parameter (which are recursively expanded).
+fn expandInnerParts(allocator: Allocator, inner: []const WordPart) Allocator.Error![]const u8 {
+    var result: std.ArrayListUnmanaged(u8) = .{};
+
+    for (inner) |part| {
+        switch (part) {
+            .literal => |l| try result.appendSlice(allocator, l),
+            .quoted => |q| try result.appendSlice(allocator, q),
+            .double_quoted => unreachable, // Parser doesn't nest double_quoted
+            .parameter => |param| {
+                const formatted = try formatParameterExpansion(allocator, param);
+                try result.appendSlice(allocator, formatted);
+            },
+        }
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+/// Format a ParameterExpansion into its shell syntax representation.
+/// TODO: Replace with actual evaluation logic that looks up variable values
+/// from shell state.
+///
+/// NOTE: This duplicates some logic from parser.ParameterExpansion.format().
+/// The duplication is intentional since:
+/// 1. This outputs $VAR for simple expansions vs ${VAR} in the parser
+/// 2. This function will be replaced with evaluation logic
+fn formatParameterExpansion(allocator: Allocator, param: parser.ParameterExpansion) Allocator.Error![]const u8 {
+    // Use an ArrayList to build the formatted string
+    var result: std.ArrayListUnmanaged(u8) = .{};
+
+    // For simple expansions without modifiers, use $VAR format
+    if (param.modifier == null) {
+        try result.appendSlice(allocator, "$");
+        try result.appendSlice(allocator, param.name);
+        return result.toOwnedSlice(allocator);
+    }
+
+    // For expansions with modifiers, use ${...} format
+    try result.appendSlice(allocator, "${");
+
+    const mod = param.modifier.?;
+
+    // Handle length modifier (prefix)
+    if (mod.op == .Length) {
+        try result.append(allocator, '#');
+        try result.appendSlice(allocator, param.name);
+        try result.append(allocator, '}');
+        return result.toOwnedSlice(allocator);
+    }
+
+    try result.appendSlice(allocator, param.name);
+
+    // Write colon if check_null is set (for applicable modifiers)
+    switch (mod.op) {
+        .UseDefault, .AssignDefault, .ErrorIfUnset, .UseAlternative => {
+            if (mod.check_null) try result.append(allocator, ':');
+        },
+        else => {},
+    }
+
+    // Write the operator
+    switch (mod.op) {
+        .Length => unreachable,
+        .UseDefault => try result.append(allocator, '-'),
+        .AssignDefault => try result.append(allocator, '='),
+        .ErrorIfUnset => try result.append(allocator, '?'),
+        .UseAlternative => try result.append(allocator, '+'),
+        .RemoveSmallestPrefix => try result.append(allocator, '#'),
+        .RemoveLargestPrefix => try result.appendSlice(allocator, "##"),
+        .RemoveSmallestSuffix => try result.append(allocator, '%'),
+        .RemoveLargestSuffix => try result.appendSlice(allocator, "%%"),
+    }
+
+    // Write the word if present
+    if (mod.word) |word_parts| {
+        for (word_parts) |part| {
+            switch (part) {
+                .literal => |lit| try result.appendSlice(allocator, lit),
+                .quoted => |q| {
+                    try result.append(allocator, '\'');
+                    try result.appendSlice(allocator, q);
+                    try result.append(allocator, '\'');
+                },
+                .double_quoted => |parts| {
+                    try result.append(allocator, '"');
+                    for (parts) |p| {
+                        const inner = try formatWordPartInner(allocator, p);
+                        try result.appendSlice(allocator, inner);
+                    }
+                    try result.append(allocator, '"');
+                },
+                .parameter => |p| {
+                    const inner = try formatParameterExpansion(allocator, p);
+                    try result.appendSlice(allocator, inner);
+                },
+            }
+        }
+    }
+
+    try result.append(allocator, '}');
+    return result.toOwnedSlice(allocator);
+}
+
+/// Format a WordPart for output inside double quotes.
+///
+/// NOTE: The returned slice has mixed ownership semantics:
+/// - For `.literal`: Returns the input slice directly (borrowed from AST)
+/// - For `.quoted` and `.parameter`: Returns newly allocated memory
+///
+/// Callers should not free the returned slice directly. Memory is managed
+/// by the arena allocator, which outlives the command execution.
+fn formatWordPartInner(allocator: Allocator, part: WordPart) Allocator.Error![]const u8 {
+    return switch (part) {
+        .literal => |lit| lit,
+        .quoted => |q| blk: {
+            var result: std.ArrayListUnmanaged(u8) = .{};
+            try result.append(allocator, '\'');
+            try result.appendSlice(allocator, q);
+            try result.append(allocator, '\'');
+            break :blk result.toOwnedSlice(allocator);
+        },
+        .double_quoted => unreachable,
+        .parameter => |param| formatParameterExpansion(allocator, param),
+    };
 }
 
 /// Expand an array of Words into a null-terminated array of null-terminated strings.

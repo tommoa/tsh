@@ -32,13 +32,16 @@ pub const WordPart = union(enum) {
     /// substitution) but results are not subject to field splitting or globbing.
     double_quoted: []const WordPart,
 
+    /// Parameter expansion - ${param}, ${param:-default}, etc.
+    parameter: ParameterExpansion,
+
     // Future expansion types:
-    // variable: VariableExpansion,
     // command_sub: CommandSubstitution,
     // arithmetic: ArithmeticExpansion,
 
     /// Format the word part for human-readable output.
-    pub fn format(self: WordPart, writer: *std.io.Writer) !void {
+    /// Implements the standard format interface for use with std.fmt.
+    pub fn format(self: WordPart, writer: *std.io.Writer) std.io.Writer.Error!void {
         switch (self) {
             .literal => |lit| try writer.print("\"{s}\"", .{lit}),
             .quoted => |q| try writer.print("quoted(\"{s}\")", .{q}),
@@ -50,7 +53,99 @@ pub const WordPart = union(enum) {
                 }
                 try writer.writeAll("])");
             },
+            .parameter => |param| try param.format(writer),
         }
+    }
+
+    /// Format the word part for shell-like output (used inside double quotes).
+    /// Unlike format(), this outputs content as it would appear in shell syntax.
+    pub fn formatInner(self: WordPart, writer: *std.io.Writer) std.io.Writer.Error!void {
+        switch (self) {
+            .literal => |lit| try writer.writeAll(lit),
+            .quoted => |q| {
+                try writer.writeByte('\'');
+                try writer.writeAll(q);
+                try writer.writeByte('\'');
+            },
+            .double_quoted => |parts| {
+                try writer.writeByte('"');
+                for (parts) |part| {
+                    try part.formatInner(writer);
+                }
+                try writer.writeByte('"');
+            },
+            .parameter => |param| try param.format(writer),
+        }
+    }
+};
+
+/// A parameter expansion (${param}, ${param:-default}, etc.)
+/// Represents POSIX shell parameter expansion from Section 2.6.2.
+pub const ParameterExpansion = struct {
+    /// The parameter name (VAR, 1, ?, @, *, etc.)
+    name: []const u8,
+    /// Optional modifier for the expansion
+    modifier: ?Modifier = null,
+
+    pub const Modifier = struct {
+        /// The modifier operation
+        op: lexer.ModifierOp,
+        /// True if colon present (checks for null/empty, not just unset)
+        /// For example, ${VAR:-default} vs ${VAR-default}
+        check_null: bool,
+        /// The word after the modifier (null for Length modifier)
+        word: ?[]const WordPart,
+    };
+
+    /// Format for debugging output.
+    /// Reconstructs a shell-like representation of the expansion.
+    /// Implements the standard format interface for use with std.fmt.
+    pub fn format(self: ParameterExpansion, writer: *std.io.Writer) std.io.Writer.Error!void {
+        try writer.writeAll("${");
+
+        // Handle length modifier (prefix operator)
+        if (self.modifier) |mod| {
+            if (mod.op == .Length) {
+                try writer.writeByte('#');
+                try writer.writeAll(self.name);
+                try writer.writeByte('}');
+                return;
+            }
+        }
+
+        try writer.writeAll(self.name);
+
+        if (self.modifier) |mod| {
+            // Write colon if check_null is set (for applicable modifiers)
+            switch (mod.op) {
+                .UseDefault, .AssignDefault, .ErrorIfUnset, .UseAlternative => {
+                    if (mod.check_null) try writer.writeByte(':');
+                },
+                else => {},
+            }
+
+            // Write the operator
+            switch (mod.op) {
+                .Length => unreachable, // Handled above
+                .UseDefault => try writer.writeByte('-'),
+                .AssignDefault => try writer.writeByte('='),
+                .ErrorIfUnset => try writer.writeByte('?'),
+                .UseAlternative => try writer.writeByte('+'),
+                .RemoveSmallestPrefix => try writer.writeByte('#'),
+                .RemoveLargestPrefix => try writer.writeAll("##"),
+                .RemoveSmallestSuffix => try writer.writeByte('%'),
+                .RemoveLargestSuffix => try writer.writeAll("%%"),
+            }
+
+            // Write the word if present
+            if (mod.word) |word_parts| {
+                for (word_parts) |part| {
+                    try part.formatInner(writer);
+                }
+            }
+        }
+
+        try writer.writeByte('}');
     }
 };
 
@@ -67,7 +162,7 @@ pub const Word = struct {
     column: usize,
 
     /// Format the word for human-readable output.
-    pub fn format(self: Word, writer: *std.io.Writer) !void {
+    pub fn format(self: Word, writer: *std.io.Writer) std.io.Writer.Error!void {
         if (self.parts.len == 0) {
             try writer.writeAll("\"\"");
             return;
@@ -103,7 +198,7 @@ pub const Assignment = struct {
     column: usize,
 
     /// Format the assignment for human-readable output.
-    pub fn format(self: Assignment, writer: *std.io.Writer) !void {
+    pub fn format(self: Assignment, writer: *std.io.Writer) std.io.Writer.Error!void {
         try writer.print("{s} = ", .{self.name});
         try self.value.format(writer);
     }
@@ -119,7 +214,7 @@ pub const RedirectionTarget = union(enum) {
     close,
 
     /// Format the redirection target for human-readable output.
-    pub fn format(self: RedirectionTarget, writer: *std.io.Writer) !void {
+    pub fn format(self: RedirectionTarget, writer: *std.io.Writer) std.io.Writer.Error!void {
         switch (self) {
             .file => |word| try word.format(writer),
             .fd => |fd| try writer.print("{d}", .{fd}),
@@ -144,7 +239,7 @@ pub const ParsedRedirection = struct {
     column: usize,
 
     /// Format the redirection for human-readable output.
-    pub fn format(self: ParsedRedirection, writer: *std.io.Writer) !void {
+    pub fn format(self: ParsedRedirection, writer: *std.io.Writer) std.io.Writer.Error!void {
         if (self.source_fd) |fd| {
             try writer.print("{d}", .{fd});
         }
@@ -169,12 +264,12 @@ pub const SimpleCommand = struct {
     redirections: []const ParsedRedirection,
 
     /// Format the command for human-readable output.
-    pub fn format(self: SimpleCommand, writer: *std.io.Writer) !void {
+    pub fn format(self: SimpleCommand, writer: *std.io.Writer) std.io.Writer.Error!void {
         try self.formatIndented(writer, 0);
     }
 
     /// Format the command with indentation (for nested commands).
-    fn formatIndented(self: SimpleCommand, writer: *std.io.Writer, indent: usize) !void {
+    fn formatIndented(self: SimpleCommand, writer: *std.io.Writer, indent: usize) std.io.Writer.Error!void {
         try writer.splatByteAll(' ', indent);
         try writer.writeAll("SimpleCommand:\n");
 
@@ -220,7 +315,7 @@ pub const Command = union(enum) {
     simple: SimpleCommand,
 
     /// Format the command for human-readable output.
-    pub fn format(self: Command, writer: *std.io.Writer) !void {
+    pub fn format(self: Command, writer: *std.io.Writer) std.io.Writer.Error!void {
         switch (self) {
             .simple => |cmd| try cmd.format(writer),
         }
@@ -234,7 +329,7 @@ pub const CommandList = struct {
     commands: []const Command,
 
     /// Format the command list for human-readable output.
-    pub fn format(self: CommandList, writer: *std.io.Writer) !void {
+    pub fn format(self: CommandList, writer: *std.io.Writer) std.io.Writer.Error!void {
         for (self.commands, 0..) |cmd, i| {
             if (i > 0) try writer.writeByte('\n');
             try cmd.format(writer);
@@ -252,8 +347,8 @@ pub const ParseError = error{
     InvalidFdRedirectionTarget,
     /// Encountered syntax that is not yet implemented (e.g., subshells, functions).
     UnsupportedSyntax,
-    /// Parameter expansion tokens encountered but not yet supported by parser.
-    ExpansionNotSupported,
+    /// Invalid parameter expansion syntax (e.g., empty ${}).
+    BadSubstitution,
 } || lexer.LexerError || Allocator.Error;
 
 /// Information about a parse error for error reporting.
@@ -302,6 +397,56 @@ const PendingRedir = struct {
     end_column: usize,
 };
 
+/// Maximum depth for nested contexts (double quotes, brace expansions).
+/// Matches the lexer's max_context_depth.
+const max_context_depth = 32;
+
+/// Parser context for nested constructs (double quotes, parameter expansions).
+/// The parser maintains a stack of these to handle nesting like "${var:-${other}}".
+const ParserContext = union(enum) {
+    /// Inside double quotes - collecting parts for a double_quoted WordPart.
+    double_quote: struct {
+        parts: std.ArrayListUnmanaged(WordPart),
+    },
+    /// Inside ${...} - collecting the parameter expansion.
+    brace_expansion: struct {
+        /// The parameter name (null until we see it).
+        name: ?[]const u8,
+        /// The modifier operation (null if no modifier).
+        modifier_op: ?lexer.ModifierOp,
+        /// Whether the modifier has a colon (for :-, :=, etc.).
+        modifier_check_null: bool,
+        /// Parts being collected for the modifier's word.
+        word_parts: std.ArrayListUnmanaged(WordPart),
+        /// True after we've seen a modifier token.
+        seen_modifier: bool,
+    },
+
+    /// Initialize a double_quote context.
+    fn initDoubleQuote() ParserContext {
+        return .{ .double_quote = .{ .parts = .{} } };
+    }
+
+    /// Initialize a brace_expansion context.
+    fn initBraceExpansion() ParserContext {
+        return .{ .brace_expansion = .{
+            .name = null,
+            .modifier_op = null,
+            .modifier_check_null = false,
+            .word_parts = .{},
+            .seen_modifier = false,
+        } };
+    }
+
+    /// Clean up any allocated memory in this context.
+    fn deinit(self: *ParserContext, allocator: Allocator) void {
+        switch (self.*) {
+            .double_quote => |*dq| dq.parts.deinit(allocator),
+            .brace_expansion => |*be| be.word_parts.deinit(allocator),
+        }
+    }
+};
+
 /// Parser for POSIX shell simple commands.
 ///
 /// The parser consumes tokens from a lexer and produces an AST.
@@ -330,10 +475,11 @@ pub const Parser = struct {
     /// Column where current word started.
     word_start_column: usize,
 
-    /// Whether we're currently inside double quotes.
-    in_double_quote: bool,
-    /// Parts being collected for the current double-quoted region.
-    double_quote_parts: std.ArrayListUnmanaged(WordPart),
+    /// Context stack for nested constructs (double quotes, brace expansions).
+    /// Index 0 is the bottom of the stack; context_depth - 1 is the top.
+    context_stack: [max_context_depth]ParserContext,
+    /// Current depth of the context stack (0 = no active context).
+    context_depth: usize,
 
     /// Pending redirection (while collecting target).
     pending_redir: ?PendingRedir,
@@ -357,8 +503,8 @@ pub const Parser = struct {
             .word_start_position = 0,
             .word_start_line = 0,
             .word_start_column = 0,
-            .in_double_quote = false,
-            .double_quote_parts = .{},
+            .context_stack = undefined,
+            .context_depth = 0,
             .pending_redir = null,
             .assignments = .{},
             .argv = .{},
@@ -372,6 +518,51 @@ pub const Parser = struct {
         return self.error_info;
     }
 
+    // --- Context stack operations ---
+
+    /// Push a new context onto the stack.
+    fn pushContext(self: *Parser, ctx: ParserContext) void {
+        std.debug.assert(self.context_depth < max_context_depth);
+        self.context_stack[self.context_depth] = ctx;
+        self.context_depth += 1;
+    }
+
+    /// Pop the top context from the stack.
+    fn popContext(self: *Parser) ParserContext {
+        std.debug.assert(self.context_depth > 0);
+        self.context_depth -= 1;
+        return self.context_stack[self.context_depth];
+    }
+
+    /// Get a mutable pointer to the current (top) context.
+    fn currentContext(self: *Parser) ?*ParserContext {
+        if (self.context_depth == 0) return null;
+        return &self.context_stack[self.context_depth - 1];
+    }
+
+    /// Check if we're currently inside a double-quote context.
+    fn inDoubleQuote(self: *const Parser) bool {
+        if (self.context_depth == 0) return false;
+        return self.context_stack[self.context_depth - 1] == .double_quote;
+    }
+
+    /// Check if we're currently inside a brace expansion context.
+    fn inBraceExpansion(self: *const Parser) bool {
+        if (self.context_depth == 0) return false;
+        return self.context_stack[self.context_depth - 1] == .brace_expansion;
+    }
+
+    /// Get a user-friendly error message for a lexer error.
+    fn lexerErrorMessage(err: lexer.LexerError) []const u8 {
+        return switch (err) {
+            error.InvalidModifier => "invalid modifier",
+            error.UnterminatedQuote => "unterminated quote",
+            error.UnterminatedBraceExpansion => "unterminated brace expansion",
+            error.NestingTooDeep => "nesting too deep",
+            error.UnexpectedEndOfFile => "unexpected end of file",
+        };
+    }
+
     /// Parse a simple command from the input.
     ///
     /// Returns the parsed command, or `null` if the input is empty.
@@ -382,7 +573,7 @@ pub const Parser = struct {
         state: switch (self.state) {
             .start => {
                 const tok = self.lex.nextToken() catch |err| {
-                    self.setError("lexer error", self.lex.position, self.lex.line, self.lex.column);
+                    self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
                     return err;
                 } orelse {
                     continue :state .done;
@@ -420,7 +611,7 @@ pub const Parser = struct {
 
             .after_command => {
                 const tok = self.lex.nextToken() catch |err| {
-                    self.setError("lexer error", self.lex.position, self.lex.line, self.lex.column);
+                    self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
                     return err;
                 } orelse {
                     continue :state .done;
@@ -458,7 +649,7 @@ pub const Parser = struct {
 
             .collecting_word => {
                 const tok = self.lex.nextToken() catch |err| {
-                    self.setError("lexer error while collecting word", self.lex.position, self.lex.line, self.lex.column);
+                    self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
                     return err;
                 } orelse {
                     // End of input mid-word, finish what we have
@@ -530,7 +721,7 @@ pub const Parser = struct {
 
             .need_redir_target => {
                 const tok = self.lex.nextToken() catch |err| {
-                    self.setError("lexer error reading redirection target", self.lex.position, self.lex.line, self.lex.column);
+                    self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
                     return err;
                 } orelse {
                     // EOF - error points to end of redirection operator
@@ -660,8 +851,11 @@ pub const Parser = struct {
         self.word_start_position = 0;
         self.word_start_line = 0;
         self.word_start_column = 0;
-        self.in_double_quote = false;
-        self.double_quote_parts = .{};
+        // Clean up any leftover contexts (shouldn't happen in normal operation)
+        while (self.context_depth > 0) {
+            var ctx = self.popContext();
+            ctx.deinit(self.allocator);
+        }
         self.pending_redir = null;
         self.assignments = .{};
         self.argv = .{};
@@ -701,69 +895,91 @@ pub const Parser = struct {
     }
 
     /// Add a token's content to the word parts list.
-    /// Handles double-quote context by collecting parts into double_quote_parts
-    /// and finalizing them when DoubleQuoteEnd is seen.
+    /// Handles nested contexts (double quotes, brace expansions) by collecting
+    /// parts into the appropriate context and finalizing when the context ends.
     fn addTokenToParts(self: *Parser, token: lexer.Token) ParseError!void {
         switch (token.type) {
             .Literal => |lit| {
                 const copied = try self.allocator.dupe(u8, lit);
-                const part = WordPart{ .literal = copied };
-                if (self.in_double_quote) {
-                    try self.double_quote_parts.append(self.allocator, part);
-                } else {
-                    try self.word_parts.append(self.allocator, part);
-                }
+                try self.addPartToCurrentContext(.{ .literal = copied });
             },
             .EscapedLiteral => |esc| {
                 const copied = try self.allocator.dupe(u8, esc);
-                const part = WordPart{ .quoted = copied };
-                if (self.in_double_quote) {
-                    try self.double_quote_parts.append(self.allocator, part);
-                } else {
-                    try self.word_parts.append(self.allocator, part);
-                }
+                try self.addPartToCurrentContext(.{ .quoted = copied });
             },
             .Continuation => |cont| {
                 // Continuation may be empty (signals word boundary with no content)
                 if (cont.len > 0) {
                     const copied = try self.allocator.dupe(u8, cont);
-                    const part = WordPart{ .literal = copied };
-                    if (self.in_double_quote) {
-                        try self.double_quote_parts.append(self.allocator, part);
-                    } else {
-                        try self.word_parts.append(self.allocator, part);
-                    }
+                    try self.addPartToCurrentContext(.{ .literal = copied });
                 }
             },
             .SingleQuoted => |sq| {
-                // SingleQuoted tokens only appear outside double quotes.
-                // Inside double quotes, single quote characters are just Literal tokens.
-                // TODO: When command substitution is implemented, SingleQuoted tokens
-                // may appear inside an outer double-quote context (e.g., "$(cmd 'arg')").
-                // At that point, in_double_quote will need to become a stack.
-                std.debug.assert(!self.in_double_quote);
+                // SingleQuoted tokens appear outside double quotes (inside double quotes,
+                // single quote characters are emitted as Literal tokens by the lexer).
+                // They're valid in any context: top-level, brace expansion word, etc.
                 const copied = try self.allocator.dupe(u8, sq);
-                try self.word_parts.append(self.allocator, .{ .quoted = copied });
+                try self.addPartToCurrentContext(.{ .quoted = copied });
             },
             .DoubleQuoteBegin => {
-                // Nested double quotes aren't valid shell syntax.
-                // The lexer won't emit DoubleQuoteBegin while already in double quotes.
-                // TODO: When command substitution is implemented, DoubleQuoteBegin may
-                // appear inside an outer double-quote context (e.g., "$(cmd "arg")").
-                // At that point, in_double_quote will need to become a stack.
-                std.debug.assert(!self.in_double_quote);
-                self.in_double_quote = true;
-                self.double_quote_parts = .{};
+                // Push a double-quote context onto the stack.
+                self.pushContext(ParserContext.initDoubleQuote());
             },
             .DoubleQuoteEnd => {
-                // DoubleQuoteEnd should only appear after a matching DoubleQuoteBegin.
-                // TODO: When command substitution is implemented with a context stack,
-                // this assertion will need to check the stack depth instead.
-                std.debug.assert(self.in_double_quote);
-                // Finalize the double-quoted region
-                const parts_slice = try self.double_quote_parts.toOwnedSlice(self.allocator);
-                try self.word_parts.append(self.allocator, .{ .double_quoted = parts_slice });
-                self.in_double_quote = false;
+                // Pop the double-quote context and finalize it.
+                std.debug.assert(self.inDoubleQuote());
+                var ctx = self.popContext();
+                errdefer ctx.deinit(self.allocator);
+                const parts_slice = try ctx.double_quote.parts.toOwnedSlice(self.allocator);
+                try self.addPartToCurrentContext(.{ .double_quoted = parts_slice });
+            },
+            .SimpleExpansion => |name| {
+                // Simple expansion: $VAR, $1, $?, etc.
+                const copied_name = try self.allocator.dupe(u8, name);
+                const expansion = ParameterExpansion{ .name = copied_name };
+                try self.addPartToCurrentContext(.{ .parameter = expansion });
+            },
+            .BraceExpansionBegin => {
+                // Push a brace expansion context onto the stack.
+                self.pushContext(ParserContext.initBraceExpansion());
+            },
+            .Modifier => |mod| {
+                // Modifier inside ${...}
+                std.debug.assert(self.inBraceExpansion());
+                const ctx = self.currentContext().?;
+                ctx.brace_expansion.modifier_op = mod.op;
+                ctx.brace_expansion.modifier_check_null = mod.check_null;
+                ctx.brace_expansion.seen_modifier = true;
+            },
+            .BraceExpansionEnd => {
+                // Pop the brace expansion context and build the ParameterExpansion.
+                std.debug.assert(self.inBraceExpansion());
+                var ctx = self.popContext();
+                errdefer ctx.deinit(self.allocator);
+                const be = &ctx.brace_expansion;
+
+                // Check for missing parameter name (e.g., ${} or ${:-foo})
+                if (be.name == null) {
+                    self.setError("bad substitution", token.position, token.line, token.column);
+                    return error.BadSubstitution;
+                }
+
+                // Build the ParameterExpansion
+                const expansion = ParameterExpansion{
+                    .name = be.name.?, // Confirmed not null above
+                    .modifier = if (be.modifier_op) |op| blk: {
+                        break :blk ParameterExpansion.Modifier{
+                            .op = op,
+                            .check_null = be.modifier_check_null,
+                            .word = if (be.word_parts.items.len > 0)
+                                try be.word_parts.toOwnedSlice(self.allocator)
+                            else
+                                null,
+                        };
+                    } else null,
+                };
+
+                try self.addPartToCurrentContext(.{ .parameter = expansion });
             },
             .Redirection => {
                 // Shouldn't happen during word collection
@@ -774,11 +990,48 @@ pub const Parser = struct {
             .Separator, .DoubleSemicolon => {
                 // Shouldn't happen during word collection - handled by state machine
             },
-            .SimpleExpansion, .BraceExpansionBegin, .BraceExpansionEnd, .Modifier => {
-                // TODO: Phase 2 - parse parameter expansion into AST
-                // For now, treat expansion tokens as errors (parser not yet ready)
-                return error.ExpansionNotSupported;
-            },
+        }
+    }
+
+    /// Add a WordPart to the current context.
+    /// If inside a brace expansion, handles the special case where the first
+    /// literal becomes the parameter name.
+    fn addPartToCurrentContext(self: *Parser, part: WordPart) !void {
+        if (self.currentContext()) |ctx| {
+            switch (ctx.*) {
+                .double_quote => |*dq| {
+                    try dq.parts.append(self.allocator, part);
+                },
+                .brace_expansion => |*be| {
+                    // In brace expansion context:
+                    // - If we haven't seen a modifier yet and name is null,
+                    //   a literal becomes the parameter name
+                    // - After a modifier (or for non-literal parts), add to word_parts
+                    if (!be.seen_modifier and be.name == null) {
+                        switch (part) {
+                            .literal => |lit| {
+                                be.name = lit;
+                                return;
+                            },
+                            else => {},
+                        }
+                    }
+                    // For Length modifier, the name comes AFTER the modifier token
+                    if (be.modifier_op == .Length and be.name == null) {
+                        switch (part) {
+                            .literal => |lit| {
+                                be.name = lit;
+                                return;
+                            },
+                            else => {},
+                        }
+                    }
+                    try be.word_parts.append(self.allocator, part);
+                },
+            }
+        } else {
+            // No context - add directly to word_parts
+            try self.word_parts.append(self.allocator, part);
         }
     }
 
@@ -838,13 +1091,13 @@ pub const Parser = struct {
                     .column = word.column,
                 };
             },
-            // If the first part is quoted or double_quoted, it's not an assignment
+            // If the first part is quoted, double_quoted, or parameter, it's not an assignment
             // (the `=` would need to be in an unquoted literal)
-            .quoted, .double_quoted => return null,
+            .quoted, .double_quoted, .parameter => return null,
         }
     }
 
-    /// Deep copy a WordPart, including nested parts for double_quoted.
+    /// Deep copy a WordPart, including nested parts for double_quoted and parameter.
     fn copyWordPart(self: *Parser, part: WordPart) ParseError!WordPart {
         return switch (part) {
             .literal => |lit| WordPart{ .literal = try self.allocator.dupe(u8, lit) },
@@ -855,6 +1108,27 @@ pub const Parser = struct {
                     copied_parts[i] = try self.copyWordPart(p);
                 }
                 break :blk WordPart{ .double_quoted = copied_parts };
+            },
+            .parameter => |param| blk: {
+                const copied_name = try self.allocator.dupe(u8, param.name);
+                const copied_modifier: ?ParameterExpansion.Modifier = if (param.modifier) |mod| m: {
+                    const copied_word: ?[]const WordPart = if (mod.word) |word_parts| w: {
+                        var copied_parts = try self.allocator.alloc(WordPart, word_parts.len);
+                        for (word_parts, 0..) |p, i| {
+                            copied_parts[i] = try self.copyWordPart(p);
+                        }
+                        break :w copied_parts;
+                    } else null;
+                    break :m ParameterExpansion.Modifier{
+                        .op = mod.op,
+                        .check_null = mod.check_null,
+                        .word = copied_word,
+                    };
+                } else null;
+                break :blk WordPart{ .parameter = ParameterExpansion{
+                    .name = copied_name,
+                    .modifier = copied_modifier,
+                } };
             },
         };
     }
@@ -911,8 +1185,8 @@ pub const Parser = struct {
             // Only unquoted literals can form fd numbers
             const lit = switch (part) {
                 .literal => |l| l,
-                // Quoted or double_quoted parts can't be fd numbers
-                .quoted, .double_quoted => return null,
+                // Quoted, double_quoted, or parameter parts can't be fd numbers
+                .quoted, .double_quoted, .parameter => return null,
             };
             if (lit.len == 0) continue;
 
@@ -948,11 +1222,13 @@ pub const Parser = struct {
                         break :blk switch (parts[0]) {
                             .literal => |lit| lit,
                             .quoted => |q| q,
-                            .double_quoted => null,
+                            .double_quoted, .parameter => null,
                         };
                     }
                     break :blk null;
                 },
+                // Parameter expansions can't be evaluated at parse time
+                .parameter => null,
             };
             if (text) |t| {
                 if (std.mem.eql(u8, t, "-")) {
@@ -985,6 +1261,11 @@ fn expectWord(word: Word, expected_parts: []const []const u8) !void {
                 // For double_quoted, we need a more complex comparison
                 // For now, skip - tests that need this should use expectWordPart
                 return error.UseExpectWordPartForDoubleQuoted;
+            },
+            .parameter => {
+                // For parameter expansions, we need a more complex comparison
+                // Tests that need this should check the parameter fields directly
+                return error.UseExpectWordPartForParameter;
             },
         };
         try std.testing.expectEqualStrings(expected, text);
@@ -1708,6 +1989,12 @@ fn appendWordPartText(allocator: Allocator, result: *std.ArrayListUnmanaged(u8),
                 try appendWordPartText(allocator, result, p);
             }
         },
+        .parameter => |param| {
+            // Append the parameter name as a placeholder for comparison purposes.
+            // This allows buffer boundary tests to compare commands with expansions.
+            try result.appendSlice(allocator, "$");
+            try result.appendSlice(allocator, param.name);
+        },
     }
 }
 
@@ -2109,4 +2396,274 @@ test "parseCommandList: double semicolon treated as separator" {
     const list = try parser.parseCommandList();
     try std.testing.expect(list != null);
     try std.testing.expectEqual(@as(usize, 2), list.?.commands.len);
+}
+
+// --- Parameter expansion tests ---
+
+test "parseCommand: simple expansion $VAR" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo $VAR");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.parseCommand();
+    try std.testing.expect(cmd != null);
+    try std.testing.expectEqual(@as(usize, 2), cmd.?.argv.len);
+
+    // Second argument should be a parameter expansion
+    const arg = cmd.?.argv[1];
+    try std.testing.expectEqual(@as(usize, 1), arg.parts.len);
+    try std.testing.expect(arg.parts[0] == .parameter);
+    try std.testing.expectEqualStrings("VAR", arg.parts[0].parameter.name);
+    try std.testing.expect(arg.parts[0].parameter.modifier == null);
+}
+
+test "parseCommand: simple expansion $1" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo $1");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.parseCommand();
+    try std.testing.expect(cmd != null);
+    const arg = cmd.?.argv[1];
+    try std.testing.expect(arg.parts[0] == .parameter);
+    try std.testing.expectEqualStrings("1", arg.parts[0].parameter.name);
+}
+
+test "parseCommand: simple expansion $?" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo $?");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.parseCommand();
+    try std.testing.expect(cmd != null);
+    const arg = cmd.?.argv[1];
+    try std.testing.expect(arg.parts[0] == .parameter);
+    try std.testing.expectEqualStrings("?", arg.parts[0].parameter.name);
+}
+
+test "parseCommand: braced expansion ${VAR}" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo ${VAR}");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.parseCommand();
+    try std.testing.expect(cmd != null);
+    const arg = cmd.?.argv[1];
+    try std.testing.expect(arg.parts[0] == .parameter);
+    try std.testing.expectEqualStrings("VAR", arg.parts[0].parameter.name);
+    try std.testing.expect(arg.parts[0].parameter.modifier == null);
+}
+
+test "parseCommand: expansion with default ${VAR:-default}" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo ${VAR:-default}");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.parseCommand();
+    try std.testing.expect(cmd != null);
+    const arg = cmd.?.argv[1];
+    try std.testing.expect(arg.parts[0] == .parameter);
+
+    const param = arg.parts[0].parameter;
+    try std.testing.expectEqualStrings("VAR", param.name);
+    try std.testing.expect(param.modifier != null);
+    try std.testing.expectEqual(lexer.ModifierOp.UseDefault, param.modifier.?.op);
+    try std.testing.expect(param.modifier.?.check_null);
+    try std.testing.expect(param.modifier.?.word != null);
+    try std.testing.expectEqual(@as(usize, 1), param.modifier.?.word.?.len);
+    try std.testing.expectEqualStrings("default", param.modifier.?.word.?[0].literal);
+}
+
+test "parseCommand: expansion without colon ${VAR-default}" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo ${VAR-default}");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.parseCommand();
+    try std.testing.expect(cmd != null);
+    const param = cmd.?.argv[1].parts[0].parameter;
+    try std.testing.expectEqual(lexer.ModifierOp.UseDefault, param.modifier.?.op);
+    try std.testing.expect(!param.modifier.?.check_null);
+}
+
+test "parseCommand: length expansion ${#VAR}" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo ${#VAR}");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.parseCommand();
+    try std.testing.expect(cmd != null);
+    const param = cmd.?.argv[1].parts[0].parameter;
+    try std.testing.expectEqualStrings("VAR", param.name);
+    try std.testing.expect(param.modifier != null);
+    try std.testing.expectEqual(lexer.ModifierOp.Length, param.modifier.?.op);
+    try std.testing.expect(param.modifier.?.word == null);
+}
+
+test "parseCommand: prefix removal ${VAR#pattern}" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo ${VAR#*.}");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.parseCommand();
+    try std.testing.expect(cmd != null);
+    const param = cmd.?.argv[1].parts[0].parameter;
+    try std.testing.expectEqualStrings("VAR", param.name);
+    try std.testing.expectEqual(lexer.ModifierOp.RemoveSmallestPrefix, param.modifier.?.op);
+    try std.testing.expectEqualStrings("*.", param.modifier.?.word.?[0].literal);
+}
+
+test "parseCommand: suffix removal ${VAR%pattern}" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo ${VAR%.*}");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.parseCommand();
+    try std.testing.expect(cmd != null);
+    const param = cmd.?.argv[1].parts[0].parameter;
+    try std.testing.expectEqualStrings("VAR", param.name);
+    try std.testing.expectEqual(lexer.ModifierOp.RemoveSmallestSuffix, param.modifier.?.op);
+    try std.testing.expectEqualStrings(".*", param.modifier.?.word.?[0].literal);
+}
+
+test "parseCommand: expansion in double quotes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo \"hello $VAR\"");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.parseCommand();
+    try std.testing.expect(cmd != null);
+    const arg = cmd.?.argv[1];
+    try std.testing.expectEqual(@as(usize, 1), arg.parts.len);
+    try std.testing.expect(arg.parts[0] == .double_quoted);
+
+    const inner = arg.parts[0].double_quoted;
+    try std.testing.expectEqual(@as(usize, 2), inner.len);
+    try std.testing.expect(inner[0] == .literal);
+    try std.testing.expectEqualStrings("hello ", inner[0].literal);
+    try std.testing.expect(inner[1] == .parameter);
+    try std.testing.expectEqualStrings("VAR", inner[1].parameter.name);
+}
+
+test "parseCommand: mixed literal and expansion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo prefix${VAR}suffix");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.parseCommand();
+    try std.testing.expect(cmd != null);
+    const arg = cmd.?.argv[1];
+    try std.testing.expectEqual(@as(usize, 3), arg.parts.len);
+    try std.testing.expect(arg.parts[0] == .literal);
+    try std.testing.expectEqualStrings("prefix", arg.parts[0].literal);
+    try std.testing.expect(arg.parts[1] == .parameter);
+    try std.testing.expectEqualStrings("VAR", arg.parts[1].parameter.name);
+    try std.testing.expect(arg.parts[2] == .literal);
+    try std.testing.expectEqualStrings("suffix", arg.parts[2].literal);
+}
+
+test "parseCommand: nested expansion ${VAR:-${OTHER}}" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo ${VAR:-${OTHER}}");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.parseCommand();
+    try std.testing.expect(cmd != null);
+    const param = cmd.?.argv[1].parts[0].parameter;
+    try std.testing.expectEqualStrings("VAR", param.name);
+    try std.testing.expectEqual(lexer.ModifierOp.UseDefault, param.modifier.?.op);
+
+    // The word should contain a nested parameter expansion
+    const word = param.modifier.?.word.?;
+    try std.testing.expectEqual(@as(usize, 1), word.len);
+    try std.testing.expect(word[0] == .parameter);
+    try std.testing.expectEqualStrings("OTHER", word[0].parameter.name);
+}
+
+test "parseCommand: expansion in assignment value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("FOO=$BAR");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.parseCommand();
+    try std.testing.expect(cmd != null);
+    try std.testing.expectEqual(@as(usize, 1), cmd.?.assignments.len);
+    try std.testing.expectEqualStrings("FOO", cmd.?.assignments[0].name);
+
+    const value = cmd.?.assignments[0].value;
+    try std.testing.expectEqual(@as(usize, 1), value.parts.len);
+    try std.testing.expect(value.parts[0] == .parameter);
+    try std.testing.expectEqualStrings("BAR", value.parts[0].parameter.name);
+}
+
+test "parseCommand: empty ${} is BadSubstitution error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo ${}");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = parser.parseCommand();
+    try std.testing.expectError(error.BadSubstitution, result);
+
+    // Verify error message
+    const err_info = parser.getErrorInfo();
+    try std.testing.expect(err_info != null);
+    try std.testing.expectEqualStrings("bad substitution", err_info.?.message);
+}
+
+test "parseCommand: ${:-foo} missing parameter name is BadSubstitution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo ${:-foo}");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = parser.parseCommand();
+    try std.testing.expectError(error.BadSubstitution, result);
+
+    const err_info = parser.getErrorInfo();
+    try std.testing.expect(err_info != null);
+    try std.testing.expectEqualStrings("bad substitution", err_info.?.message);
 }
