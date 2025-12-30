@@ -7,6 +7,7 @@ pub const parser = @import("parser.zig");
 pub const executor = @import("executor.zig");
 pub const state = @import("state.zig");
 pub const builtins = @import("builtins.zig");
+pub const options = @import("options.zig");
 pub const repl = @import("repl.zig");
 
 // Re-export commonly used types at the top level for convenience
@@ -29,6 +30,8 @@ pub const ExecuteError = executor.ExecuteError;
 
 pub const Builtin = builtins.Builtin;
 pub const BuiltinResult = builtins.BuiltinResult;
+
+pub const OptionParser = options.OptionParser;
 
 pub const ShellState = state.ShellState;
 pub const ShellOptions = state.ShellOptions;

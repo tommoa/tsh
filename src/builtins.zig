@@ -19,6 +19,7 @@
 const std = @import("std");
 const posix = std.posix;
 const state = @import("state.zig");
+const options = @import("options.zig");
 const ShellState = state.ShellState;
 const printError = state.printError;
 
@@ -115,43 +116,25 @@ fn runExit(args: []const []const u8, shell: *ShellState) BuiltinResult {
 ///
 /// POSIX Reference: Section 2.14.1 - cd
 fn runCd(args: []const []const u8, shell: *ShellState) BuiltinResult {
-    var physical = false;
-    var dir_arg: ?[]const u8 = null;
+    const CdOptions = struct {
+        physical: bool = false,
 
-    // Parse arguments
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (arg.len > 0 and arg[0] == '-' and arg.len > 1) {
-            // Option processing (note: "-" alone has len==1, so it falls through to else)
-            if (std.mem.eql(u8, arg, "-L")) {
-                physical = false;
-            } else if (std.mem.eql(u8, arg, "-P")) {
-                physical = true;
-            } else if (std.mem.eql(u8, arg, "--")) {
-                // End of options
-                i += 1;
-                if (i < args.len) {
-                    dir_arg = args[i];
-                    i += 1;
-                }
-                break;
-            } else {
-                printError("cd: {s}: invalid option\n", .{arg});
-                return .{ .exit_code = 1 };
-            }
-        } else {
-            dir_arg = arg;
-            i += 1;
-            break;
-        }
-    }
+        pub const meta = .{
+            .name = "cd",
+            .options = &.{
+                .{ .short = 'L', .field = "physical", .value = false },
+                .{ .short = 'P', .field = "physical", .value = true },
+            },
+            .operands = .{ .min = 0, .max = @as(?usize, 1) },
+        };
+    };
 
-    // Check for extra arguments - cd takes at most one operand
-    if (i < args.len) {
-        printError("cd: too many arguments\n", .{});
+    const parsed = options.OptionParser(CdOptions).parse(args) catch {
         return .{ .exit_code = 1 };
-    }
+    };
+
+    const physical = parsed.options.physical;
+    const dir_arg: ?[]const u8 = if (parsed.operands.len > 0) parsed.operands[0] else null;
 
     // Determine target directory
     // For "cd -", we swap cwd and oldcwd, so track this case specially
@@ -252,33 +235,31 @@ fn runCd(args: []const []const u8, shell: *ShellState) BuiltinResult {
 /// pwd [-L|-P]
 ///
 /// Print the current working directory.
-///
-/// Options:
-///   -L  Print the logical path (from $PWD, default)
-///   -P  Print the physical path (resolve symlinks)
+/// -L: Logical path (default) - from shell tracking, may include symlinks
+/// -P: Physical path - resolved from filesystem
 ///
 /// POSIX Reference: Section 2.14.1 - pwd
 fn runPwd(args: []const []const u8, shell: *ShellState) BuiltinResult {
-    var physical = false;
+    const PwdOptions = struct {
+        physical: bool = false,
 
-    // Parse options - pwd takes no operands per POSIX
-    for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "-L")) {
-            physical = false;
-        } else if (std.mem.eql(u8, arg, "-P")) {
-            physical = true;
-        } else if (arg.len > 0 and arg[0] == '-') {
-            printError("pwd: {s}: invalid option\n", .{arg});
-            return .{ .exit_code = 1 };
-        } else {
-            printError("pwd: too many arguments\n", .{});
-            return .{ .exit_code = 1 };
-        }
-    }
+        pub const meta = .{
+            .name = "pwd",
+            .options = &.{
+                .{ .short = 'L', .field = "physical", .value = false },
+                .{ .short = 'P', .field = "physical", .value = true },
+            },
+            .operands = .{ .min = 0, .max = @as(?usize, 0) },
+        };
+    };
+
+    const parsed = options.OptionParser(PwdOptions).parse(args) catch {
+        return .{ .exit_code = 1 };
+    };
 
     // Buffer declared outside conditional so it remains valid for the write
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const output = if (physical)
+    const output = if (parsed.options.physical)
         posix.getcwd(&cwd_buf) catch {
             printError("pwd: error getting current directory\n", .{});
             return .{ .exit_code = 1 };
@@ -442,28 +423,30 @@ fn runExport(args: []const []const u8, shell: *ShellState) BuiltinResult {
 ///
 /// POSIX Reference: Section 2.14.1 - unset
 fn runUnset(args: []const []const u8, shell: *ShellState) BuiltinResult {
-    var i: usize = 1;
+    const UnsetMode = enum { variables, functions };
+    const UnsetOptions = struct {
+        // -v (default) unsets variables, -f unsets functions
+        // These are mutually exclusive; last one wins per POSIX
+        mode: UnsetMode = .variables,
 
-    // Parse options
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (arg.len > 0 and arg[0] == '-') {
-            if (std.mem.eql(u8, arg, "-v")) {
-                // -v is the default, just continue
-                continue;
-            } else if (std.mem.eql(u8, arg, "-f")) {
-                printError("unset: functions not yet supported\n", .{});
-                return .{ .exit_code = 1 };
-            } else if (std.mem.eql(u8, arg, "--")) {
-                i += 1;
-                break;
-            } else {
-                printError("unset: {s}: invalid option\n", .{arg});
-                return .{ .exit_code = 1 };
-            }
-        } else {
-            break;
-        }
+        pub const meta = .{
+            .name = "unset",
+            .options = &.{
+                .{ .short = 'v', .field = "mode", .value = UnsetMode.variables },
+                .{ .short = 'f', .field = "mode", .value = UnsetMode.functions },
+            },
+            .operands = .{ .min = 0, .max = @as(?usize, null) },
+        };
+    };
+
+    const parsed = options.OptionParser(UnsetOptions).parse(args) catch {
+        return .{ .exit_code = 1 };
+    };
+
+    // -f for functions is recognized but not yet supported
+    if (parsed.options.mode == .functions) {
+        printError("unset: functions not yet supported\n", .{});
+        return .{ .exit_code = 1 };
     }
 
     // Unset each variable, tracking if any errors occurred.
@@ -474,8 +457,7 @@ fn runUnset(args: []const []const u8, shell: *ShellState) BuiltinResult {
     // matching bash and dash behavior. The shell.cwd and shell.oldcwd allocations
     // are independent from the environment variables, so no memory issues arise.
     var had_error = false;
-    while (i < args.len) : (i += 1) {
-        const name = args[i];
+    for (parsed.operands) |name| {
 
         // Validate identifier
         if (!isValidIdentifier(name)) {
