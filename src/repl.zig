@@ -15,7 +15,6 @@
 //! TODO: Read startup files before entering loop:
 //!       - Login shell: /etc/profile, ~/.profile
 //!       - Interactive non-login: $ENV
-//! TODO: exit builtin (currently EOF exits the loop)
 //! TODO: History and line editing
 
 const std = @import("std");
@@ -89,7 +88,7 @@ pub fn run(
         }
 
         // Process the line according to the mode
-        try processLine(
+        const result = try processLine(
             allocator,
             state,
             command_line,
@@ -98,10 +97,16 @@ pub fn run(
             &stderr_writer.interface,
         );
         try stdout_writer.interface.flush();
+
+        // Check if exit was requested
+        if (result == .exit_requested) {
+            return state.exit_code;
+        }
     }
 }
 
 /// Process a single line of input according to the specified mode.
+/// Returns .exit_requested if the exit builtin was called.
 fn processLine(
     allocator: Allocator,
     state: *ShellState,
@@ -109,17 +114,31 @@ fn processLine(
     mode: ProcessingMode,
     stdout: *std.io.Writer,
     stderr: *std.io.Writer,
-) !void {
+) !ExecuteResult {
     // Use an arena allocator per line so we can free everything after processing
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
     switch (mode) {
-        .execute => try executeCommands(arena.allocator(), state, command_line, stderr),
-        .dump_tokens => try dumpTokens(command_line, stdout, stderr),
-        .dump_ast => try dumpAst(arena.allocator(), command_line, stdout, stderr),
+        .execute => return try executeCommands(arena.allocator(), state, command_line, stderr),
+        .dump_tokens => {
+            try dumpTokens(command_line, stdout, stderr);
+            return .ok;
+        },
+        .dump_ast => {
+            try dumpAst(arena.allocator(), command_line, stdout, stderr);
+            return .ok;
+        },
     }
 }
+
+/// Result of executing commands.
+const ExecuteResult = enum {
+    /// Commands executed, continue REPL.
+    ok,
+    /// Exit was requested via the exit builtin.
+    exit_requested,
+};
 
 /// Parse and execute commands from the line.
 fn executeCommands(
@@ -127,7 +146,7 @@ fn executeCommands(
     state: *ShellState,
     command_line: []const u8,
     stderr: *std.io.Writer,
-) !void {
+) !ExecuteResult {
     var line_reader = std.io.Reader.fixed(command_line);
     var lexer = Lexer.init(&line_reader);
     var parser = Parser.init(allocator, &lexer);
@@ -144,13 +163,23 @@ fn executeCommands(
         }
         try stderr.flush();
         state.last_status = .{ .exited = 1 };
-        return;
+        return .ok;
     };
 
     if (cmd_list) |list| {
         var exec = Executor.init(allocator, state);
-        state.last_status = exec.executeList(list);
+        state.last_status = exec.executeList(list) catch |err| switch (err) {
+            error.ExitRequested => return .exit_requested,
+            else => {
+                try stderr.print("tsh: execution error: {s}\n", .{@errorName(err)});
+                try stderr.flush();
+                state.last_status = .{ .exited = 1 };
+                return .ok;
+            },
+        };
     }
+
+    return .ok;
 }
 
 /// Tokenize the line and dump tokens to stdout.

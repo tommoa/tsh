@@ -14,6 +14,7 @@ const process = std.process;
 const parser = @import("parser.zig");
 const lexer = @import("lexer.zig");
 const state = @import("state.zig");
+const builtins = @import("builtins.zig");
 const SimpleCommand = parser.SimpleCommand;
 const Command = parser.Command;
 const CommandList = parser.CommandList;
@@ -23,6 +24,7 @@ const Assignment = parser.Assignment;
 const ParsedRedirection = parser.ParsedRedirection;
 const Redirection = lexer.Redirection;
 const ShellState = state.ShellState;
+const printError = state.printError;
 pub const ExitStatus = state.ExitStatus;
 
 /// Errors that can occur during command execution.
@@ -35,6 +37,8 @@ pub const ExecuteError = error{
     ExecFailed,
     /// Failed to set up redirections.
     RedirectionFailed,
+    /// The `exit` builtin was invoked. The exit code is in shell_state.exit_code.
+    ExitRequested,
 } || Allocator.Error || process.GetEnvMapError;
 
 /// Information about an execution error for error reporting.
@@ -54,6 +58,104 @@ pub const RedirectionResult = union(enum) {
     ok,
     /// A redirection failed. Contains the error message to display.
     err: []const u8,
+};
+
+/// Saved file descriptors for restoration after builtin execution with redirections.
+/// This allows builtins to have redirections applied, then restored afterward
+/// so the shell's own stdin/stdout/stderr remain intact.
+const SavedFds = struct {
+    const Entry = struct {
+        fd: posix.fd_t,
+        saved: ?posix.fd_t,
+    };
+
+    /// Maximum number of redirections we can save/restore.
+    /// Bounded to 16 entries - if a command has more than 16 redirections,
+    /// the excess ones won't be saved/restored. This is a reasonable limit;
+    /// typical commands have 1-3 redirections.
+    const MAX_ENTRIES = 16;
+
+    entries: [MAX_ENTRIES]Entry = undefined,
+    len: usize = 0,
+
+    const SaveError = error{TooManyRedirections};
+
+    /// Save file descriptors that will be modified by the given redirections.
+    /// For each fd: if it currently exists, dup it for later restoration.
+    /// If it doesn't exist, record null so we know to close it later.
+    /// If there are no redirections, this returns an empty entries list
+    /// and restore() will be a no-op.
+    ///
+    /// The saved fds are created with FD_CLOEXEC set to prevent them from
+    /// leaking to child processes if a builtin ever forks.
+    ///
+    /// Returns error.TooManyRedirections if there are more unique fds to save
+    /// than MAX_ENTRIES (16). This is a safeguard to prevent silent fd corruption.
+    fn save(redirections: []const ParsedRedirection) SaveError!SavedFds {
+        var self = SavedFds{};
+
+        for (redirections) |redir| {
+            const fd: posix.fd_t = @intCast(redir.source_fd orelse defaultSourceFd(redir.op));
+
+            // Check if we've already saved this fd
+            var already_saved = false;
+            for (self.entries[0..self.len]) |entry| {
+                if (entry.fd == fd) {
+                    already_saved = true;
+                    break;
+                }
+            }
+            if (already_saved) continue;
+
+            // Check capacity before adding
+            if (self.len >= MAX_ENTRIES) {
+                // Clean up already-saved fds before returning error
+                for (self.entries[0..self.len]) |entry| {
+                    if (entry.saved) |saved_fd| {
+                        posix.close(saved_fd);
+                    }
+                }
+                return error.TooManyRedirections;
+            }
+
+            // Try to dup with CLOEXEC - succeeds if fd exists, fails if not
+            // Using fcntl F_DUPFD_CLOEXEC to atomically dup and set CLOEXEC
+            const saved: ?posix.fd_t = if (posix.fcntl(fd, posix.F.DUPFD_CLOEXEC, 0)) |fd_usize|
+                @intCast(fd_usize)
+            else |_|
+                null;
+            self.entries[self.len] = .{ .fd = fd, .saved = saved };
+            self.len += 1;
+        }
+        return self;
+    }
+
+    /// Restore file descriptors to their original state.
+    /// If we saved a copy, restore it with dup2 (which implicitly closes
+    /// the redirection's fd). If we didn't save a copy (fd didn't exist
+    /// before), just close the fd that the redirection created.
+    /// If there are no entries, this is a no-op.
+    ///
+    /// Returns true if all restorations succeeded, false if any dup2 failed.
+    /// On failure, continues restoring remaining fds but logs an error.
+    fn restore(self: SavedFds) bool {
+        var success = true;
+        for (self.entries[0..self.len]) |entry| {
+            if (entry.saved) |saved_fd| {
+                // Existed before - restore original (dup2 closes entry.fd implicitly)
+                posix.dup2(saved_fd, entry.fd) catch {
+                    // Log error but continue restoring other fds
+                    printError("failed to restore fd {d}\n", .{entry.fd});
+                    success = false;
+                };
+                posix.close(saved_fd);
+            } else {
+                // Didn't exist before - close the fd created by redirection
+                posix.close(entry.fd);
+            }
+        }
+        return success;
+    }
 };
 
 /// Result of searching for an executable command.
@@ -111,12 +213,22 @@ pub const Executor = struct {
 
     /// Execute a simple command.
     ///
-    /// Returns the exit status of the command.
-    pub fn execute(self: *Executor, cmd: SimpleCommand) ExitStatus {
+    /// Returns the exit status of the command, or error.ExitRequested if
+    /// the exit builtin was invoked.
+    ///
+    /// POSIX Reference: Section 2.9.1 - Simple Commands
+    pub fn execute(self: *Executor, cmd: SimpleCommand) ExecuteError!ExitStatus {
         self.error_info = null;
 
         // Handle commands with no argv
         if (cmd.argv.len == 0) {
+            // Apply assignments to shell variables
+            // POSIX Reference: Section 2.9.1 - variable assignments without command
+            for (cmd.assignments) |assignment| {
+                const value = try expandWord(self.allocator, assignment.value, self.shell_state);
+                try self.shell_state.setVariable(assignment.name, value);
+            }
+
             // If there are redirections, apply them to the shell (e.g., "> file" creates/truncates file)
             if (cmd.redirections.len > 0) {
                 // files_only=true: only create/truncate files, don't redirect shell's fds.
@@ -132,7 +244,7 @@ pub const Executor = struct {
                 }
                 return self.shell_state.last_status;
             }
-            // Assignments-only: no-ops for now. When we add shell state, they'll set shell variables.
+
             self.shell_state.last_status = .{ .exited = 0 };
             return self.shell_state.last_status;
         }
@@ -143,6 +255,68 @@ pub const Executor = struct {
             self.shell_state.last_status = .{ .exited = 1 };
             return self.shell_state.last_status;
         };
+
+        // Get the command name
+        const cmd_name = std.mem.span(argv[0] orelse {
+            self.setError("empty command", null);
+            self.shell_state.last_status = .{ .exited = 1 };
+            return self.shell_state.last_status;
+        });
+
+        // Check if this is a builtin command
+        if (builtins.Builtin.fromName(cmd_name)) |builtin| {
+            // For special builtins, variable assignments are persistent
+            // POSIX Reference: Section 2.14 - Special Built-In Utilities
+            for (cmd.assignments) |assignment| {
+                const value = try expandWord(self.allocator, assignment.value, self.shell_state);
+                try self.shell_state.setVariable(assignment.name, value);
+            }
+
+            // Build args slice for builtin
+            // Count args first, then create a fixed slice
+            var argc: usize = 0;
+            while (argv[argc] != null) : (argc += 1) {}
+            const args = try self.allocator.alloc([]const u8, argc);
+            defer self.allocator.free(args);
+            for (0..argc) |i| {
+                args[i] = std.mem.span(argv[i].?);
+            }
+
+            // Save fds and apply redirections for builtins
+            // If no redirections, save/restore are no-ops (empty entries list)
+            const saved_fds = SavedFds.save(cmd.redirections) catch {
+                printError("too many redirections\n", .{});
+                self.setError("too many redirections", null);
+                self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
+                return self.shell_state.last_status;
+            };
+            defer _ = saved_fds.restore();
+
+            if (cmd.redirections.len > 0) {
+                switch (applyRedirections(self.allocator, cmd.redirections, false, self.shell_state)) {
+                    .ok => {},
+                    .err => |msg| {
+                        printError("{s}\n", .{msg});
+                        self.setError(msg, null);
+                        self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
+                        return self.shell_state.last_status;
+                    },
+                }
+            }
+
+            // Run the builtin
+            const result = builtin.run(args, self.shell_state);
+            self.shell_state.last_status = .{ .exited = result.exit_code };
+
+            if (result.should_exit) {
+                self.shell_state.exit_code = result.exit_code;
+                return error.ExitRequested;
+            }
+
+            return self.shell_state.last_status;
+        }
+
+        // Not a builtin - fork and exec external command
 
         // Build child environment map (copy shell env, add command assignments)
         var env_map = self.buildChildEnvMap(cmd.assignments) catch |err| {
@@ -172,14 +346,15 @@ pub const Executor = struct {
 
     /// Execute a command list (multiple commands sequentially).
     ///
-    /// Returns the exit status of the last command executed.
-    pub fn executeList(self: *Executor, list: CommandList) ExitStatus {
+    /// Returns the exit status of the last command executed, or
+    /// error.ExitRequested if the exit builtin was invoked.
+    pub fn executeList(self: *Executor, list: CommandList) ExecuteError!ExitStatus {
         var last_status: ExitStatus = .{ .exited = 0 };
 
         for (list.commands) |cmd| {
             switch (cmd) {
                 .simple => |simple| {
-                    last_status = self.execute(simple);
+                    last_status = try self.execute(simple);
                 },
             }
         }
@@ -583,17 +758,6 @@ fn statusFromWaitResult(status: u32) ExitStatus {
     }
 }
 
-/// Print an error message to stderr (for use in child process).
-/// Note: Uses a 512-byte buffer which may truncate very long paths.
-fn printError(comptime fmt: []const u8, args: anytype) void {
-    // TODO: Consider increasing buffer size or using unbuffered writes for long paths
-    var buf: [512]u8 = undefined;
-    const stderr = std.fs.File.stderr();
-    var writer = stderr.writer(&buf);
-    writer.interface.print("tsh: " ++ fmt, args) catch {};
-    writer.interface.flush() catch {};
-}
-
 // --- Tests ---
 
 fn parseCommand(allocator: Allocator, input: []const u8) !?SimpleCommand {
@@ -610,7 +774,7 @@ test "execute: simple echo" {
     const cmd = try parseCommand(arena.allocator(), "/bin/echo hello\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = exec.execute(cmd);
+    const status = try exec.execute(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 }
@@ -622,7 +786,7 @@ test "execute: exit status success" {
     const cmd = try parseCommand(arena.allocator(), "true\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = exec.execute(cmd);
+    const status = try exec.execute(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 }
@@ -634,7 +798,7 @@ test "execute: exit status failure" {
     const cmd = try parseCommand(arena.allocator(), "false\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = exec.execute(cmd);
+    const status = try exec.execute(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 1 }, status);
 }
@@ -646,7 +810,7 @@ test "execute: PATH lookup" {
     const cmd = try parseCommand(arena.allocator(), "echo hello\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = exec.execute(cmd);
+    const status = try exec.execute(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 }
@@ -658,7 +822,7 @@ test "execute: command not found" {
     const cmd = try parseCommand(arena.allocator(), "nonexistent_cmd_12345\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = exec.execute(cmd);
+    const status = try exec.execute(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 127 }, status);
 }
@@ -675,7 +839,7 @@ test "execute: output redirection" {
     const cmd = try parseCommand(arena.allocator(), "echo hello > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = exec.execute(cmd);
+    const status = try exec.execute(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 
@@ -705,7 +869,7 @@ test "execute: input redirection" {
     const cmd = try parseCommand(arena.allocator(), "cat < " ++ tmp_path ++ "\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = exec.execute(cmd);
+    const status = try exec.execute(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 
@@ -726,11 +890,11 @@ test "execute: append redirection" {
     const cmd1 = try parseCommand(arena.allocator(), "echo first > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    _ = exec.execute(cmd1);
+    _ = try exec.execute(cmd1);
 
     // Append
     const cmd2 = try parseCommand(arena.allocator(), "echo second >> " ++ tmp_path ++ "\n") orelse return error.NoCommand;
-    const status = exec.execute(cmd2);
+    const status = try exec.execute(cmd2);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 
@@ -754,7 +918,7 @@ test "execute: env assignment" {
     const cmd = try parseCommand(arena.allocator(), "FOO=testvalue sh -c 'echo $FOO' > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = exec.execute(cmd);
+    const status = try exec.execute(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 
@@ -773,10 +937,13 @@ test "execute: assignments only" {
     const cmd = try parseCommand(arena.allocator(), "FOO=bar\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = exec.execute(cmd);
+    const status = try exec.execute(cmd);
 
     // Assignments-only commands return success
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
+
+    // Verify variable was set
+    try std.testing.expectEqualStrings("bar", shell_state.getVariable("FOO").?);
 }
 
 test "execute: redirection only (like touch)" {
@@ -792,7 +959,7 @@ test "execute: redirection only (like touch)" {
     const cmd = try parseCommand(arena.allocator(), "> " ++ tmp_path ++ "\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = exec.execute(cmd);
+    const status = try exec.execute(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 
@@ -818,7 +985,7 @@ test "execute: assignment with redirection only" {
     const cmd = try parseCommand(arena.allocator(), "FOO=bar > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = exec.execute(cmd);
+    const status = try exec.execute(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 
@@ -845,7 +1012,7 @@ test "execute: fd duplication 2>&1" {
     const cmd = try parseCommand(arena.allocator(), "sh -c 'echo error >&2' > " ++ tmp_path ++ " 2>&1\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = exec.execute(cmd);
+    const status = try exec.execute(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 
@@ -861,8 +1028,8 @@ test "expandWord: single literal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const env = process.EnvMap.init(arena.allocator());
-    var shell = ShellState.initWithEnv(arena.allocator(), env);
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
 
     const word = Word{
         .parts = &[_]WordPart{.{ .literal = "hello" }},
@@ -879,8 +1046,8 @@ test "expandWord: multiple literals" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const env = process.EnvMap.init(arena.allocator());
-    var shell = ShellState.initWithEnv(arena.allocator(), env);
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
 
     const word = Word{
         .parts = &[_]WordPart{
@@ -958,7 +1125,7 @@ test "expandWord: tilde expands in unquoted literal" {
 
     var env = process.EnvMap.init(arena.allocator());
     try env.put("HOME", "/home/testuser");
-    var shell = ShellState.initWithEnv(arena.allocator(), env);
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
 
     const word = Word{
         .parts = &[_]WordPart{.{ .literal = "~" }},
@@ -977,7 +1144,7 @@ test "expandWord: tilde with path expands" {
 
     var env = process.EnvMap.init(arena.allocator());
     try env.put("HOME", "/home/testuser");
-    var shell = ShellState.initWithEnv(arena.allocator(), env);
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
 
     const word = Word{
         .parts = &[_]WordPart{.{ .literal = "~/bin" }},
@@ -996,7 +1163,7 @@ test "expandWord: quoted tilde does not expand" {
 
     var env = process.EnvMap.init(arena.allocator());
     try env.put("HOME", "/home/testuser");
-    var shell = ShellState.initWithEnv(arena.allocator(), env);
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
 
     const word = Word{
         .parts = &[_]WordPart{.{ .quoted = "~" }},
@@ -1015,7 +1182,7 @@ test "expandWord: double-quoted tilde does not expand" {
 
     var env = process.EnvMap.init(arena.allocator());
     try env.put("HOME", "/home/testuser");
-    var shell = ShellState.initWithEnv(arena.allocator(), env);
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
 
     const word = Word{
         .parts = &[_]WordPart{.{ .double_quoted = &[_]WordPart{.{ .literal = "~" }} }},
@@ -1032,8 +1199,8 @@ test "expandWord: tilde with no HOME stays literal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const env = process.EnvMap.init(arena.allocator());
-    var shell = ShellState.initWithEnv(arena.allocator(), env);
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
 
     const word = Word{
         .parts = &[_]WordPart{.{ .literal = "~" }},
@@ -1055,7 +1222,7 @@ test "expandWord: quoted prefix prevents tilde expansion" {
 
     var env = process.EnvMap.init(arena.allocator());
     try env.put("HOME", "/home/testuser");
-    var shell = ShellState.initWithEnv(arena.allocator(), env);
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
 
     // Simulates ""~ - an empty quoted part followed by tilde
     const word = Word{
@@ -1174,7 +1341,7 @@ test "expandWord: double-quoted inner parts concatenated" {
 
     var env = process.EnvMap.init(arena.allocator());
     try env.put("HOME", "/home/user");
-    var shell = ShellState.initWithEnv(arena.allocator(), env);
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
 
     // A word with a double-quoted region containing inner parts
     // Tilde inside double quotes should NOT expand
@@ -1223,7 +1390,7 @@ test "executeList: redirection-only command does not affect subsequent command" 
 
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = exec.executeList(cmd_list);
+    const status = try exec.executeList(cmd_list);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 
@@ -1234,4 +1401,157 @@ test "executeList: redirection-only command does not affect subsequent command" 
 
     // Clean up
     std.fs.deleteFileAbsolute(tmp_path) catch {};
+}
+
+// --- Builtin tests ---
+
+test "execute: exit builtin returns ExitRequested" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const cmd = try parseCommand(arena.allocator(), "exit 42\n") orelse return error.NoCommand;
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+
+    const result = exec.execute(cmd);
+    try std.testing.expectError(ExecuteError.ExitRequested, result);
+    try std.testing.expectEqual(@as(u8, 42), shell_state.exit_code);
+}
+
+test "execute: pwd builtin" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const cmd = try parseCommand(arena.allocator(), "pwd\n") orelse return error.NoCommand;
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+    const status = try exec.execute(cmd);
+
+    try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
+}
+
+test "execute: export and variable visibility" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+
+    // Set a shell variable
+    const cmd1 = try parseCommand(arena.allocator(), "FOO=bar\n") orelse return error.NoCommand;
+    var exec = Executor.init(arena.allocator(), &shell_state);
+    _ = try exec.execute(cmd1);
+
+    // Should be in variables, not env
+    try std.testing.expectEqualStrings("bar", shell_state.getVariable("FOO").?);
+    try std.testing.expect(shell_state.env.get("FOO") == null);
+
+    // Export it
+    const cmd2 = try parseCommand(arena.allocator(), "export FOO\n") orelse return error.NoCommand;
+    _ = try exec.execute(cmd2);
+
+    // Should now be in env
+    try std.testing.expectEqualStrings("bar", shell_state.env.get("FOO").?);
+}
+
+test "execute: builtin with output redirection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_builtin_redir";
+    std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    // pwd > file should write cwd to file
+    const cmd = try parseCommand(arena.allocator(), "pwd > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+    const status = try exec.execute(cmd);
+
+    try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
+
+    // Verify file contains the cwd
+    const contents = try std.fs.cwd().readFileAlloc(std.testing.allocator, tmp_path, 4096);
+    defer std.testing.allocator.free(contents);
+
+    // Contents should match shell_state.cwd with a newline
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}\n", .{shell_state.cwd});
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, contents);
+
+    // Clean up
+    std.fs.deleteFileAbsolute(tmp_path) catch {};
+}
+
+test "execute: builtin redirection does not affect subsequent commands" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_builtin_redir_restore";
+    std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+
+    // First: pwd > file
+    const cmd1 = try parseCommand(arena.allocator(), "pwd > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
+    _ = try exec.execute(cmd1);
+
+    // Second: pwd (no redirection) - should NOT go to file
+    // We can't easily capture stdout in a test, but we can verify the file wasn't appended
+    const contents_after_first = try std.fs.cwd().readFileAlloc(std.testing.allocator, tmp_path, 4096);
+    defer std.testing.allocator.free(contents_after_first);
+
+    const cmd2 = try parseCommand(arena.allocator(), "pwd\n") orelse return error.NoCommand;
+    _ = try exec.execute(cmd2);
+
+    // File should still have the same contents (not doubled)
+    const contents_after_second = try std.fs.cwd().readFileAlloc(std.testing.allocator, tmp_path, 4096);
+    defer std.testing.allocator.free(contents_after_second);
+    try std.testing.expectEqualStrings(contents_after_first, contents_after_second);
+
+    // Clean up
+    std.fs.deleteFileAbsolute(tmp_path) catch {};
+}
+
+test "execute: builtin with append redirection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_builtin_append";
+    std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+
+    // pwd > file (create)
+    const cmd1 = try parseCommand(arena.allocator(), "pwd > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
+    _ = try exec.execute(cmd1);
+
+    // pwd >> file (append)
+    const cmd2 = try parseCommand(arena.allocator(), "pwd >> " ++ tmp_path ++ "\n") orelse return error.NoCommand;
+    _ = try exec.execute(cmd2);
+
+    // File should contain cwd twice
+    const contents = try std.fs.cwd().readFileAlloc(std.testing.allocator, tmp_path, 4096);
+    defer std.testing.allocator.free(contents);
+
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}\n{s}\n", .{ shell_state.cwd, shell_state.cwd });
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, contents);
+
+    // Clean up
+    std.fs.deleteFileAbsolute(tmp_path) catch {};
+}
+
+test "execute: builtin redirection error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // pwd > /nonexistent/path should fail
+    const cmd = try parseCommand(arena.allocator(), "pwd > /nonexistent_dir_12345/file\n") orelse return error.NoCommand;
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+    const status = try exec.execute(cmd);
+
+    // Should return error status
+    try std.testing.expectEqual(ExitStatus{ .exited = ExitStatus.GENERAL_ERROR }, status);
 }
