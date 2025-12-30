@@ -1,124 +1,29 @@
 const std = @import("std");
 const tsh = @import("tsh");
 
-/// Dump all tokens from the reader to the writer in human-readable format.
-/// Returns the number of tokens processed.
-fn dumpTokens(reader: *std.io.Reader, writer: *std.io.Writer) !usize {
-    var lexer = tsh.Lexer.init(reader);
-    var token_count: usize = 0;
-    var had_token_on_line = false;
-
-    while (true) {
-        const token = lexer.nextToken() catch |err| {
-            try writer.print("[{d}:{d}] Error: {s}\n", .{ lexer.line, lexer.column, @errorName(err) });
-            break;
-        };
-
-        if (token) |tok| {
-            switch (tok.type) {
-                .Separator => {
-                    // End of command - print blank line between commands
-                    if (had_token_on_line) {
-                        try writer.writeByte('\n');
-                        had_token_on_line = false;
-                    }
-                },
-                else => {
-                    try tok.format(writer);
-                    try writer.writeByte('\n');
-                    token_count += 1;
-                    had_token_on_line = true;
-                },
-            }
-        } else {
-            // null means EOF
-            break;
-        }
-    }
-    return token_count;
-}
-
-/// Run a command string and return the exit code.
-fn runCommand(allocator: std.mem.Allocator, command_string: []const u8, err_writer: *std.io.Writer) !u8 {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    var reader = std.io.Reader.fixed(command_string);
-    var lexer = tsh.Lexer.init(&reader);
-    var parser = tsh.Parser.init(arena.allocator(), &lexer);
-
-    const cmd_list = parser.parseCommandList() catch |err| {
-        if (parser.getErrorInfo()) |info| {
-            try err_writer.print("tsh: [{d}:{d}] {s}\n", .{ info.line, info.column, info.message });
-        } else {
-            try err_writer.print("tsh: parse error: {s}\n", .{@errorName(err)});
-        }
-        try err_writer.flush();
-        return 1;
-    };
-
-    if (cmd_list) |list| {
-        var shell_state = try tsh.ShellState.init(arena.allocator());
-        var exec = tsh.Executor.init(arena.allocator(), &shell_state);
-        const status = exec.executeList(list);
-        return status.toExitCode();
-    }
-
-    // Empty command
-    return 0;
-}
-
-/// Parse and dump all commands from the reader.
-fn parseAndDump(allocator: std.mem.Allocator, reader: *std.io.Reader, writer: *std.io.Writer) !usize {
-    var lexer = tsh.Lexer.init(reader);
-    var parser = tsh.Parser.init(allocator, &lexer);
-
-    const cmd_list = parser.parseCommandList() catch |err| {
-        if (parser.getErrorInfo()) |info| {
-            try writer.print("[{d}:{d}] Error: {s} ({s})\n", .{
-                info.line,
-                info.column,
-                info.message,
-                @errorName(err),
-            });
-        } else {
-            try writer.print("Error: {s}\n", .{@errorName(err)});
-        }
-        return 0;
-    };
-
-    if (cmd_list) |list| {
-        try list.format(writer);
-        try writer.writeByte('\n');
-        return list.commands.len;
-    }
-
-    return 0;
-}
-
-const Command = enum {
-    dump_tokens,
-    dump_ast,
-    run,
-    help,
-};
-
 fn printUsage() void {
     std.debug.print(
         \\Usage: tsh [options] [file]
         \\
         \\Options:
         \\  -c <command>   Execute command string
-        \\  --dump-tokens  Dump lexer tokens (default behavior)
-        \\  --dump-ast     Parse and dump AST
+        \\  -i             Force interactive mode (show prompts)
+        \\  -l, --login    Run as login shell
+        \\
+        \\Output (default: execute commands):
+        \\  --dump-tokens  Dump lexer tokens instead of executing
+        \\  --dump-ast     Parse and dump AST instead of executing
+        \\
+        \\Other:
         \\  --help, -h     Show this help message
         \\
-        \\If no file is provided, reads from stdin.
+        \\If no file is provided and stdin is a terminal, runs in interactive mode.
+        \\If file is "-", reads from stdin.
         \\
     , .{});
 }
 
-pub fn main() !void {
+pub fn main() !u8 {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -126,110 +31,179 @@ pub fn main() !void {
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
 
-    _ = args.skip(); // skip program name
+    // Check if we're invoked as a login shell (argv[0] starts with '-')
+    const program_name = args.next() orelse "tsh";
+    var is_login_shell = program_name.len > 0 and program_name[0] == '-';
 
     // Parse command line arguments
-    var command: Command = .dump_tokens;
+    var processing_mode: tsh.ProcessingMode = .execute;
     var filename: ?[]const u8 = null;
     var command_string: ?[]const u8 = null;
+    var force_interactive = false;
+    var show_help = false;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--dump-tokens")) {
-            command = .dump_tokens;
+            processing_mode = .dump_tokens;
         } else if (std.mem.eql(u8, arg, "--dump-ast")) {
-            command = .dump_ast;
+            processing_mode = .dump_ast;
         } else if (std.mem.eql(u8, arg, "-c")) {
-            command = .run;
             command_string = args.next() orelse {
-                std.debug.print("Error: -c requires a command string\n", .{});
+                std.debug.print("tsh: -c requires a command string\n", .{});
                 printUsage();
-                return error.InvalidArgument;
+                return 1;
             };
+        } else if (std.mem.eql(u8, arg, "--login") or std.mem.eql(u8, arg, "-l")) {
+            is_login_shell = true;
+        } else if (std.mem.eql(u8, arg, "-i")) {
+            force_interactive = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            command = .help;
+            show_help = true;
+        } else if (std.mem.eql(u8, arg, "-")) {
+            // "-" means read from stdin (POSIX convention)
+            filename = arg;
         } else if (arg.len > 0 and arg[0] == '-') {
-            std.debug.print("Unknown option: {s}\n", .{arg});
+            std.debug.print("tsh: unknown option: {s}\n", .{arg});
             printUsage();
-            return error.InvalidArgument;
+            return 1;
         } else {
             filename = arg;
         }
     }
 
-    // Handle help command
-    if (command == .help) {
+    // Handle help
+    if (show_help) {
         printUsage();
-        return;
+        return 0;
     }
 
-    // Open file if provided, otherwise use stdin
+    // Determine if interactive mode
+    // Interactive if: forced with -i, OR (no -c, no file, and stdin is a tty)
+    const is_interactive = force_interactive or
+        (command_string == null and filename == null and std.posix.isatty(std.posix.STDIN_FILENO));
+
+    // TODO: Use is_login_shell for startup file loading:
+    //       - Login shell: /etc/profile, ~/.profile
+    //       - Interactive non-login: $ENV
+    if (is_login_shell) {
+        // Placeholder - startup file loading will be implemented later
+    }
+
+    // Initialize shell state
+    var shell_state = try tsh.ShellState.init(allocator);
+    defer shell_state.deinit();
+    shell_state.options.interactive = is_interactive;
+
+    // Determine input source and create reader
     var file: ?std.fs.File = null;
     defer if (file) |f| f.close();
 
     var read_buf: [4096]u8 = undefined;
 
-    // Create File.Reader, then get the std.io.Reader interface
-    var file_reader = if (filename) |fname| blk: {
-        file = std.fs.cwd().openFile(fname, .{}) catch |err| {
-            std.debug.print("Error opening file '{s}': {}\n", .{ fname, err });
-            return err;
+    const exit_code = if (command_string) |cmd| blk: {
+        // -c mode: fixed string reader
+        var fixed_reader = std.io.Reader.fixed(cmd);
+        break :blk try tsh.repl.run(allocator, &shell_state, &fixed_reader, processing_mode);
+    } else if (filename) |fname| blk: {
+        // File or "-" for stdin
+        const input_file = if (std.mem.eql(u8, fname, "-"))
+            std.fs.File.stdin()
+        else inner: {
+            file = std.fs.cwd().openFile(fname, .{}) catch |err| {
+                std.debug.print("tsh: cannot open '{s}': {s}\n", .{ fname, @errorName(err) });
+                return 1;
+            };
+            break :inner file.?;
         };
-        break :blk file.?.reader(&read_buf);
-    } else std.fs.File.stdin().reader(&read_buf);
+        var file_reader = input_file.reader(&read_buf);
+        break :blk try tsh.repl.run(allocator, &shell_state, &file_reader.interface, processing_mode);
+    } else blk: {
+        // stdin (default)
+        var stdin_reader = std.fs.File.stdin().reader(&read_buf);
+        break :blk try tsh.repl.run(allocator, &shell_state, &stdin_reader.interface, processing_mode);
+    };
 
-    var stderr_buf: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
-
-    switch (command) {
-        .dump_tokens => {
-            _ = try dumpTokens(&file_reader.interface, &stderr_writer.interface);
-            try stderr_writer.interface.flush();
-        },
-        .dump_ast => {
-            // Use an arena for parser allocations
-            var arena = std.heap.ArenaAllocator.init(allocator);
-            defer arena.deinit();
-            _ = try parseAndDump(arena.allocator(), &file_reader.interface, &stderr_writer.interface);
-            try stderr_writer.interface.flush();
-        },
-        .run => {
-            const exit_code = try runCommand(allocator, command_string.?, &stderr_writer.interface);
-            std.posix.exit(exit_code);
-        },
-        .help => unreachable, // handled above
-    }
+    return exit_code;
 }
 
 // --- Integration tests for the CLI ---
 
-fn runTest(input: []const u8) ![]u8 {
-    var reader = std.io.Reader.fixed(input);
+/// Helper to run token dumping on a string and capture output
+fn runTokenDumpTest(input: []const u8) ![]u8 {
     var writer = std.io.Writer.Allocating.init(std.testing.allocator);
     errdefer writer.deinit();
-    _ = try dumpTokens(&reader, &writer.writer);
+
+    var reader = std.io.Reader.fixed(input);
+
+    // We test the token format directly using the lexer
+    var lexer = tsh.Lexer.init(&reader);
+
+    while (true) {
+        const token = lexer.nextToken() catch |err| {
+            try writer.writer.print("[{d}:{d}] Error: {s}\n", .{ lexer.line, lexer.column, @errorName(err) });
+            break;
+        };
+
+        if (token) |tok| {
+            switch (tok.type) {
+                .Separator => {
+                    try writer.writer.writeByte('\n');
+                },
+                else => {
+                    try tok.format(&writer.writer);
+                    try writer.writer.writeByte('\n');
+                },
+            }
+        } else {
+            break;
+        }
+    }
 
     return writer.toOwnedSlice();
 }
 
-fn expectOutput(input: []const u8, expected: []const u8) !void {
-    const output = try runTest(input);
+fn expectTokenOutput(input: []const u8, expected: []const u8) !void {
+    const output = try runTokenDumpTest(input);
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(expected, output);
 }
 
-fn runParseTest(input: []const u8) ![]u8 {
-    var reader = std.io.Reader.fixed(input);
+/// Helper to run AST dumping on a string and capture output
+fn runAstDumpTest(input: []const u8) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+
     var writer = std.io.Writer.Allocating.init(std.testing.allocator);
     errdefer writer.deinit();
-    _ = try parseAndDump(arena.allocator(), &reader, &writer.writer);
+
+    var reader = std.io.Reader.fixed(input);
+    var lexer = tsh.Lexer.init(&reader);
+    var parser = tsh.Parser.init(arena.allocator(), &lexer);
+
+    const cmd_list = parser.parseCommandList() catch |err| {
+        if (parser.getErrorInfo()) |info| {
+            try writer.writer.print("[{d}:{d}] Error: {s} ({s})\n", .{
+                info.line,
+                info.column,
+                info.message,
+                @errorName(err),
+            });
+        } else {
+            try writer.writer.print("Error: {s}\n", .{@errorName(err)});
+        }
+        return writer.toOwnedSlice();
+    };
+
+    if (cmd_list) |list| {
+        try list.format(&writer.writer);
+        try writer.writer.writeByte('\n');
+    }
 
     return writer.toOwnedSlice();
 }
 
-fn expectParseOutput(input: []const u8, expected: []const u8) !void {
-    const output = try runParseTest(input);
+fn expectAstOutput(input: []const u8, expected: []const u8) !void {
+    const output = try runAstDumpTest(input);
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(expected, output);
 }
@@ -238,8 +212,7 @@ fn expectParseOutput(input: []const u8, expected: []const u8) !void {
 // Comprehensive token/parsing tests are in lexer.zig and parser.zig.
 
 test "CLI: basic token output format" {
-    // Tests basic literal output with position and incomplete flag
-    try expectOutput("hello world\n",
+    try expectTokenOutput("hello world\n",
         \\[1:1] Literal("hello")
         \\[1:7] Literal("world")
         \\
@@ -248,8 +221,7 @@ test "CLI: basic token output format" {
 }
 
 test "CLI: redirection output format" {
-    // Tests all redirection types in one command
-    try expectOutput("cmd <in >out >>log 2>&1\n",
+    try expectTokenOutput("cmd <in >out >>log 2>&1\n",
         \\[1:1] Literal("cmd")
         \\[1:5] Redirection(<) [incomplete]
         \\[1:6] Literal("in")
@@ -266,8 +238,7 @@ test "CLI: redirection output format" {
 }
 
 test "CLI: multi-line output format" {
-    // Tests line number tracking across multiple commands
-    try expectOutput("echo hello\necho world\n",
+    try expectTokenOutput("echo hello\necho world\n",
         \\[1:1] Literal("echo")
         \\[1:6] Literal("hello")
         \\
@@ -279,18 +250,16 @@ test "CLI: multi-line output format" {
 }
 
 test "CLI: empty and whitespace input" {
-    try expectOutput("", "");
-    try expectOutput("   \t  ", "");
-    try expectOutput("\n\n\n", "");
+    // Note: These test the lexer directly, not the full CLI which skips blank lines
+    try expectTokenOutput("", "");
+    try expectTokenOutput("   \t  ", "");
+    try expectTokenOutput("\n\n\n", "\n\n\n"); // Lexer produces Separator tokens for newlines
 }
 
 // --- Parser CLI tests ---
 
 test "CLI parse: complex command output format" {
-    // Single comprehensive test covering assignments, argv, and redirections
-    // Note: single-quoted content now formats as quoted("...") to distinguish
-    // from unquoted literals
-    try expectParseOutput("FOO=bar cmd 'arg 1' >out 2>&1\n",
+    try expectAstOutput("FOO=bar cmd 'arg 1' >out 2>&1\n",
         \\SimpleCommand:
         \\  assignments:
         \\    [0] FOO = "bar"

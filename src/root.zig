@@ -6,6 +6,7 @@ pub const lexer = @import("lexer.zig");
 pub const parser = @import("parser.zig");
 pub const executor = @import("executor.zig");
 pub const state = @import("state.zig");
+pub const repl = @import("repl.zig");
 
 // Re-export commonly used types at the top level for convenience
 pub const Lexer = lexer.Lexer;
@@ -26,6 +27,8 @@ pub const Executor = executor.Executor;
 pub const ExecuteError = executor.ExecuteError;
 
 pub const ShellState = state.ShellState;
+pub const ShellOptions = state.ShellOptions;
+pub const ProcessingMode = state.ProcessingMode;
 pub const ExitStatus = state.ExitStatus;
 
 test {

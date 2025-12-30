@@ -3,11 +3,52 @@
 //! ShellState maintains the persistent state of the shell between commands:
 //! - Environment variables (exported, inherited by child processes)
 //! - Last exit status (for $?)
-//! - Future: shell variables, options, functions, aliases, traps, etc.
+//! - Shell options (interactive mode, etc.)
+//! - PS1 prompt string
+//! - Future: shell variables, functions, aliases, traps, etc.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const process = std.process;
+
+/// Shell options that can be set via command-line flags or the `set` builtin.
+///
+/// These correspond to POSIX shell options (see section 2.14.2):
+/// - `-i`: Interactive mode
+/// - `-e`: errexit - exit on error (future)
+/// - `-x`: xtrace - print commands before execution (future)
+/// - `-u`: nounset - error on unset variables (future)
+pub const ShellOptions = struct {
+    /// Whether the shell is running in interactive mode.
+    /// Set at startup based on isatty(stdin) or `-i` flag.
+    /// Note: POSIX says `-i` can only be set at invocation, not changed later.
+    interactive: bool = false,
+
+    // TODO: Add more options for `set` builtin:
+    // errexit: bool = false,    // -e
+    // xtrace: bool = false,     // -x
+    // nounset: bool = false,    // -u
+    // noclobber: bool = false,  // -C
+    // allexport: bool = false,  // -a
+};
+
+/// Default PS1 prompt per POSIX: "$ " for regular users.
+/// POSIX specifies this in section 2.5.3.
+pub const DEFAULT_PS1 = "$ ";
+
+/// Processing mode for shell input.
+///
+/// This determines what the shell does with each command/line of input.
+/// The mode is set at startup via command-line flags and applies to all
+/// input sources (interactive, file, or -c command string).
+pub const ProcessingMode = enum {
+    /// Parse and execute commands (default behavior).
+    execute,
+    /// Tokenize input and dump tokens to stdout (--dump-tokens).
+    dump_tokens,
+    /// Parse input and dump AST to stdout (--dump-ast).
+    dump_ast,
+};
 
 /// The result of executing a command.
 ///
@@ -66,11 +107,16 @@ pub const ShellState = struct {
     /// Updated when HOME is set or unset via setEnv().
     home: ?[]const u8,
 
+    /// PS1 prompt string for interactive mode.
+    /// TODO: Expand variables in PS1 before displaying.
+    ps1: []const u8,
+
+    /// Shell options (interactive mode, etc.).
+    options: ShellOptions,
+
     // Future fields:
     // /// Shell variables (not exported, shell-internal only).
     // vars: std.StringHashMap([]const u8),
-    // /// Shell options (set -e, set -x, etc.).
-    // options: ShellOptions,
     // /// Positional parameters ($1, $2, etc.).
     // positional_params: []const []const u8,
 
@@ -91,6 +137,8 @@ pub const ShellState = struct {
             .env = env,
             .last_status = .{ .exited = 0 },
             .home = env.get("HOME"),
+            .ps1 = env.get("PS1") orelse DEFAULT_PS1,
+            .options = .{},
         };
     }
 
@@ -107,16 +155,20 @@ pub const ShellState = struct {
     /// Set or unset an environment variable.
     ///
     /// If value is non-null, sets the variable. If null, removes it.
-    /// Updates the cached `home` field when key is "HOME".
+    /// Updates cached fields (`home`, `ps1`) when their corresponding
+    /// environment variables are modified.
     pub fn setEnv(self: *ShellState, key: []const u8, value: ?[]const u8) !void {
         if (value) |v| {
             try self.env.put(key, v);
         } else {
             _ = self.env.remove(key);
         }
+        // Update cached values when their environment variables change
         if (std.mem.eql(u8, key, "HOME")) {
             // Re-fetch from env to get the EnvMap-owned copy, not the caller's slice
             self.home = self.env.get("HOME");
+        } else if (std.mem.eql(u8, key, "PS1")) {
+            self.ps1 = self.env.get("PS1") orelse DEFAULT_PS1;
         }
     }
 };
@@ -212,4 +264,52 @@ test "ShellState: setEnv with null clears cached home" {
     try std.testing.expect(state.home != null);
     try state.setEnv("HOME", null);
     try std.testing.expect(state.home == null);
+}
+
+test "ShellState: ps1 defaults to DEFAULT_PS1" {
+    const env = process.EnvMap.init(std.testing.allocator);
+    var state = ShellState.initWithEnv(std.testing.allocator, env);
+    defer state.deinit();
+
+    try std.testing.expectEqualStrings(DEFAULT_PS1, state.ps1);
+}
+
+test "ShellState: ps1 is read from environment" {
+    var env = process.EnvMap.init(std.testing.allocator);
+    try env.put("PS1", "custom> ");
+
+    var state = ShellState.initWithEnv(std.testing.allocator, env);
+    defer state.deinit();
+
+    try std.testing.expectEqualStrings("custom> ", state.ps1);
+}
+
+test "ShellState: options default to non-interactive" {
+    const env = process.EnvMap.init(std.testing.allocator);
+    var state = ShellState.initWithEnv(std.testing.allocator, env);
+    defer state.deinit();
+
+    try std.testing.expect(!state.options.interactive);
+}
+
+test "ShellState: setEnv updates cached ps1" {
+    const env = process.EnvMap.init(std.testing.allocator);
+    var state = ShellState.initWithEnv(std.testing.allocator, env);
+    defer state.deinit();
+
+    try std.testing.expectEqualStrings(DEFAULT_PS1, state.ps1);
+    try state.setEnv("PS1", "new> ");
+    try std.testing.expectEqualStrings("new> ", state.ps1);
+}
+
+test "ShellState: setEnv with null resets ps1 to default" {
+    var env = process.EnvMap.init(std.testing.allocator);
+    try env.put("PS1", "custom> ");
+
+    var state = ShellState.initWithEnv(std.testing.allocator, env);
+    defer state.deinit();
+
+    try std.testing.expectEqualStrings("custom> ", state.ps1);
+    try state.setEnv("PS1", null);
+    try std.testing.expectEqualStrings(DEFAULT_PS1, state.ps1);
 }
