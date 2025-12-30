@@ -252,6 +252,8 @@ pub const ParseError = error{
     InvalidFdRedirectionTarget,
     /// Encountered syntax that is not yet implemented (e.g., subshells, functions).
     UnsupportedSyntax,
+    /// Parameter expansion tokens encountered but not yet supported by parser.
+    ExpansionNotSupported,
 } || lexer.LexerError || Allocator.Error;
 
 /// Information about a parse error for error reporting.
@@ -771,6 +773,11 @@ pub const Parser = struct {
             },
             .Separator, .DoubleSemicolon => {
                 // Shouldn't happen during word collection - handled by state machine
+            },
+            .SimpleExpansion, .BraceExpansionBegin, .BraceExpansionEnd, .Modifier => {
+                // TODO: Phase 2 - parse parameter expansion into AST
+                // For now, treat expansion tokens as errors (parser not yet ready)
+                return error.ExpansionNotSupported;
             },
         }
     }
