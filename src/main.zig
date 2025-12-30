@@ -15,21 +15,24 @@ fn dumpTokens(reader: *std.io.Reader, writer: *std.io.Writer) !usize {
         };
 
         if (token) |tok| {
-            try tok.format(writer);
-            try writer.writeByte('\n');
-            token_count += 1;
-            had_token_on_line = true;
+            switch (tok.type) {
+                .Separator => {
+                    // End of command - print blank line between commands
+                    if (had_token_on_line) {
+                        try writer.writeByte('\n');
+                        had_token_on_line = false;
+                    }
+                },
+                else => {
+                    try tok.format(writer);
+                    try writer.writeByte('\n');
+                    token_count += 1;
+                    had_token_on_line = true;
+                },
+            }
         } else {
-            // null means end of command (newline) or end of input
-            if (had_token_on_line) {
-                try writer.writeByte('\n');
-                had_token_on_line = false;
-            }
-            // Check if we've reached actual end of input
-            if (reader.bufferedLen() == 0) {
-                break;
-            }
-            // Otherwise it was just a newline, continue to next command
+            // null means EOF
+            break;
         }
     }
     return token_count;
@@ -44,7 +47,7 @@ fn runCommand(allocator: std.mem.Allocator, command_string: []const u8, err_writ
     var lexer = tsh.Lexer.init(&reader);
     var parser = tsh.Parser.init(arena.allocator(), &lexer);
 
-    const cmd = parser.parseCommand() catch |err| {
+    const cmd_list = parser.parseCommandList() catch |err| {
         if (parser.getErrorInfo()) |info| {
             try err_writer.print("tsh: [{d}:{d}] {s}\n", .{ info.line, info.column, info.message });
         } else {
@@ -54,10 +57,10 @@ fn runCommand(allocator: std.mem.Allocator, command_string: []const u8, err_writ
         return 1;
     };
 
-    if (cmd) |c| {
+    if (cmd_list) |list| {
         var shell_state = try tsh.ShellState.init(arena.allocator());
         var exec = tsh.Executor.init(arena.allocator(), &shell_state);
-        const status = exec.execute(c);
+        const status = exec.executeList(list);
         return status.toExitCode();
     }
 
@@ -68,39 +71,29 @@ fn runCommand(allocator: std.mem.Allocator, command_string: []const u8, err_writ
 /// Parse and dump all commands from the reader.
 fn parseAndDump(allocator: std.mem.Allocator, reader: *std.io.Reader, writer: *std.io.Writer) !usize {
     var lexer = tsh.Lexer.init(reader);
-    var command_count: usize = 0;
+    var parser = tsh.Parser.init(allocator, &lexer);
 
-    while (true) {
-        var parser = tsh.Parser.init(allocator, &lexer);
-
-        const cmd = parser.parseCommand() catch |err| {
-            if (parser.getErrorInfo()) |info| {
-                try writer.print("[{d}:{d}] Error: {s} ({s})\n", .{
-                    info.line,
-                    info.column,
-                    info.message,
-                    @errorName(err),
-                });
-            } else {
-                try writer.print("Error: {s}\n", .{@errorName(err)});
-            }
-            // Stop processing on parse error - recovery is complex and error-prone
-            break;
-        };
-
-        if (cmd) |c| {
-            try c.format(writer);
-            try writer.writeByte('\n');
-            command_count += 1;
+    const cmd_list = parser.parseCommandList() catch |err| {
+        if (parser.getErrorInfo()) |info| {
+            try writer.print("[{d}:{d}] Error: {s} ({s})\n", .{
+                info.line,
+                info.column,
+                info.message,
+                @errorName(err),
+            });
+        } else {
+            try writer.print("Error: {s}\n", .{@errorName(err)});
         }
+        return 0;
+    };
 
-        // Check if we've reached end of input
-        if (reader.bufferedLen() == 0) {
-            break;
-        }
+    if (cmd_list) |list| {
+        try list.format(writer);
+        try writer.writeByte('\n');
+        return list.commands.len;
     }
 
-    return command_count;
+    return 0;
 }
 
 const Command = enum {

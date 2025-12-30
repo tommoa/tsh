@@ -15,6 +15,8 @@ const parser = @import("parser.zig");
 const lexer = @import("lexer.zig");
 const state = @import("state.zig");
 const SimpleCommand = parser.SimpleCommand;
+const Command = parser.Command;
+const CommandList = parser.CommandList;
 const Word = parser.Word;
 const WordPart = parser.WordPart;
 const Assignment = parser.Assignment;
@@ -118,8 +120,6 @@ pub const Executor = struct {
             // If there are redirections, apply them to the shell (e.g., "> file" creates/truncates file)
             if (cmd.redirections.len > 0) {
                 // files_only=true: only create/truncate files, don't redirect shell's fds.
-                // TODO: Add test for this once we support multiple commands - verify that
-                // `> file; echo hello` still outputs to terminal, not to file.
                 switch (applyRedirections(self.allocator, cmd.redirections, true, self.shell_state)) {
                     .ok => {
                         self.shell_state.last_status = .{ .exited = 0 };
@@ -168,6 +168,23 @@ pub const Executor = struct {
         const result = posix.waitpid(pid, 0);
         self.shell_state.last_status = statusFromWaitResult(result.status);
         return self.shell_state.last_status;
+    }
+
+    /// Execute a command list (multiple commands sequentially).
+    ///
+    /// Returns the exit status of the last command executed.
+    pub fn executeList(self: *Executor, list: CommandList) ExitStatus {
+        var last_status: ExitStatus = .{ .exited = 0 };
+
+        for (list.commands) |cmd| {
+            switch (cmd) {
+                .simple => |simple| {
+                    last_status = self.execute(simple);
+                },
+            }
+        }
+
+        return last_status;
     }
 
     /// Execute in the child process (after fork).
@@ -1182,4 +1199,39 @@ test "ExitStatus.toExitCode" {
     try std.testing.expectEqual(@as(u8, 127), (ExitStatus{ .exited = 127 }).toExitCode());
     try std.testing.expectEqual(@as(u8, 137), (ExitStatus{ .signaled = 9 }).toExitCode()); // SIGKILL
     try std.testing.expectEqual(@as(u8, 143), (ExitStatus{ .signaled = 15 }).toExitCode()); // SIGTERM
+}
+
+fn parseCommandList(allocator: Allocator, input: []const u8) !?parser.CommandList {
+    var reader = std.io.Reader.fixed(input);
+    var lex = lexer.Lexer.init(&reader);
+    var p = parser.Parser.init(allocator, &lex);
+    return p.parseCommandList();
+}
+
+test "executeList: redirection-only command does not affect subsequent command" {
+    // Verify that `> file; echo hello` works correctly:
+    // - First command creates/truncates the file
+    // - Second command outputs to stdout, not to the file
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_redir_then_echo";
+    std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    const input = "> " ++ tmp_path ++ "; /bin/echo hello\n";
+    const cmd_list = try parseCommandList(arena.allocator(), input) orelse return error.NoCommand;
+
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+    const status = exec.executeList(cmd_list);
+
+    try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
+
+    // Verify file was created and is empty (not containing "hello")
+    const contents = try std.fs.cwd().readFileAlloc(std.testing.allocator, tmp_path, 1024);
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings("", contents);
+
+    // Clean up
+    std.fs.deleteFileAbsolute(tmp_path) catch {};
 }

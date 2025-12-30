@@ -213,6 +213,35 @@ pub const SimpleCommand = struct {
     }
 };
 
+/// A command that can be executed.
+/// Currently only supports simple commands, but will expand to include
+/// compound commands (if, while, for, case), pipelines, and subshells.
+pub const Command = union(enum) {
+    simple: SimpleCommand,
+
+    /// Format the command for human-readable output.
+    pub fn format(self: Command, writer: *std.io.Writer) !void {
+        switch (self) {
+            .simple => |cmd| try cmd.format(writer),
+        }
+    }
+};
+
+/// A list of commands to execute sequentially.
+/// Commands are separated by `;` or newlines.
+pub const CommandList = struct {
+    /// The commands to execute in order.
+    commands: []const Command,
+
+    /// Format the command list for human-readable output.
+    pub fn format(self: CommandList, writer: *std.io.Writer) !void {
+        for (self.commands, 0..) |cmd, i| {
+            if (i > 0) try writer.writeByte('\n');
+            try cmd.format(writer);
+        }
+    }
+};
+
 /// Errors that can occur during parsing.
 pub const ParseError = error{
     /// Reached end of input when more tokens were expected.
@@ -358,6 +387,11 @@ pub const Parser = struct {
                 };
 
                 switch (tok.type) {
+                    .Separator, .DoubleSemicolon => {
+                        // Empty command (e.g., leading semicolon or blank line) - skip
+                        // TODO: DoubleSemicolon (`;;`) will need special handling for case/esac
+                        continue :state .start;
+                    },
                     .Redirection => |redir| {
                         self.setPendingRedir(redir, tok);
                         continue :state .need_redir_target;
@@ -391,6 +425,11 @@ pub const Parser = struct {
                 };
 
                 switch (tok.type) {
+                    .Separator, .DoubleSemicolon => {
+                        // Command is complete, separator consumed
+                        // TODO: DoubleSemicolon (`;;`) will need special handling for case/esac
+                        continue :state .done;
+                    },
                     .Redirection => |redir| {
                         self.setPendingRedir(redir, tok);
                         continue :state .need_redir_target;
@@ -469,6 +508,13 @@ pub const Parser = struct {
                         self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
                         return ParseError.UnsupportedSyntax;
                     },
+                    .Separator, .DoubleSemicolon => {
+                        // Unreachable: The lexer marks words complete when followed by separators.
+                        // Even on a buffer boundary, the lexer emits a complete empty Continuation
+                        // token before the separator, which transitions us to .word_complete first.
+                        // This invariant is verified by the buffer boundary tests in this file.
+                        unreachable;
+                    },
                     else => {
                         try self.addTokenToParts(tok);
                         if (tok.complete) {
@@ -492,6 +538,12 @@ pub const Parser = struct {
                 };
 
                 switch (tok.type) {
+                    .Separator, .DoubleSemicolon => {
+                        // Separator where redirection target was expected
+                        const redir = self.pending_redir.?;
+                        self.setError("missing redirection target", redir.position, redir.end_line, redir.end_column);
+                        return ParseError.MissingRedirectionTarget;
+                    },
                     .Redirection => {
                         // Another redirection where target was expected - error points to end of first redirection
                         const redir = self.pending_redir.?;
@@ -569,6 +621,31 @@ pub const Parser = struct {
                 };
             },
         }
+    }
+
+    /// Parse a command list (multiple commands separated by `;` or newlines).
+    ///
+    /// Returns the parsed command list, or `null` if the input is empty.
+    /// Empty commands (e.g., `;;;` or blank lines) are silently skipped.
+    pub fn parseCommandList(self: *Parser) ParseError!?CommandList {
+        var commands = std.ArrayListUnmanaged(Command){};
+
+        while (true) {
+            const cmd = try self.parseCommand();
+            if (cmd) |c| {
+                try commands.append(self.allocator, .{ .simple = c });
+            } else {
+                // parseCommand returns null only when it hits EOF (after skipping any
+                // leading separators). So if we get null, we've reached the end.
+                break;
+            }
+        }
+
+        if (commands.items.len == 0) return null;
+
+        return CommandList{
+            .commands = try commands.toOwnedSlice(self.allocator),
+        };
     }
 
     // --- Helper methods ---
@@ -690,6 +767,9 @@ pub const Parser = struct {
                 // Shouldn't happen during word collection
             },
             .LeftParen, .RightParen => {
+                // Shouldn't happen during word collection - handled by state machine
+            },
+            .Separator, .DoubleSemicolon => {
                 // Shouldn't happen during word collection - handled by state machine
             },
         }
@@ -1844,4 +1924,182 @@ test "parseCommand: double-quoted parentheses are valid arguments" {
     try std.testing.expectEqual(@as(usize, 2), cmd.?.argv.len);
     try expectWord(cmd.?.argv[0], &[_][]const u8{"echo"});
     try expectWord(cmd.?.argv[1], &[_][]const u8{"(bar)"});
+}
+
+// --- Command list tests ---
+
+test "parseCommandList: single command" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo hello");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const list = try parser.parseCommandList();
+    try std.testing.expect(list != null);
+    try std.testing.expectEqual(@as(usize, 1), list.?.commands.len);
+}
+
+test "parseCommandList: two commands with semicolon" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo a; echo b");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const list = try parser.parseCommandList();
+    try std.testing.expect(list != null);
+    try std.testing.expectEqual(@as(usize, 2), list.?.commands.len);
+}
+
+test "parseCommandList: buffer boundary with separator (1 byte buffer)" {
+    // Test parsing "foo;bar" with a tiny buffer to check if separator
+    // can arrive while parser is in .collecting_word state
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    _ = try std.posix.write(pipe[1], "foo;bar");
+    std.posix.close(pipe[1]);
+
+    const file = std.fs.File{ .handle = pipe[0] };
+    var buf: [1]u8 = undefined;
+    var file_reader = file.reader(&buf);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var lex = lexer.Lexer.init(&file_reader.interface);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const list = try parser.parseCommandList();
+    try std.testing.expect(list != null);
+    try std.testing.expectEqual(@as(usize, 2), list.?.commands.len);
+
+    // Verify first command is "foo"
+    const cmd1 = list.?.commands[0].simple;
+    try std.testing.expectEqual(@as(usize, 1), cmd1.argv.len);
+    const word1 = try wordToString(arena.allocator(), cmd1.argv[0]);
+    try std.testing.expectEqualStrings("foo", word1);
+
+    // Verify second command is "bar"
+    const cmd2 = list.?.commands[1].simple;
+    try std.testing.expectEqual(@as(usize, 1), cmd2.argv.len);
+    const word2 = try wordToString(arena.allocator(), cmd2.argv[0]);
+    try std.testing.expectEqualStrings("bar", word2);
+}
+
+test "parseCommandList: buffer boundary with separator (3 byte buffer)" {
+    // Test parsing "foo;bar" with 3-byte buffer
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    _ = try std.posix.write(pipe[1], "foo;bar");
+    std.posix.close(pipe[1]);
+
+    const file = std.fs.File{ .handle = pipe[0] };
+    var buf: [3]u8 = undefined;
+    var file_reader = file.reader(&buf);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var lex = lexer.Lexer.init(&file_reader.interface);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const list = try parser.parseCommandList();
+    try std.testing.expect(list != null);
+    try std.testing.expectEqual(@as(usize, 2), list.?.commands.len);
+}
+
+test "parseCommandList: buffer boundary with separator (4 byte buffer)" {
+    // Test parsing "foo;bar" with 4-byte buffer (semicolon at boundary)
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    _ = try std.posix.write(pipe[1], "foo;bar");
+    std.posix.close(pipe[1]);
+
+    const file = std.fs.File{ .handle = pipe[0] };
+    var buf: [4]u8 = undefined;
+    var file_reader = file.reader(&buf);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var lex = lexer.Lexer.init(&file_reader.interface);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const list = try parser.parseCommandList();
+    try std.testing.expect(list != null);
+    try std.testing.expectEqual(@as(usize, 2), list.?.commands.len);
+}
+
+test "parseCommandList: two commands with newline" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo a\necho b");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const list = try parser.parseCommandList();
+    try std.testing.expect(list != null);
+    try std.testing.expectEqual(@as(usize, 2), list.?.commands.len);
+}
+
+test "parseCommandList: empty commands are skipped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Use spaces between semicolons to avoid `;;` which is DoubleSemicolon
+    var reader = std.io.Reader.fixed("; ; ; echo a ; ; ;");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const list = try parser.parseCommandList();
+    try std.testing.expect(list != null);
+    try std.testing.expectEqual(@as(usize, 1), list.?.commands.len);
+}
+
+test "parseCommandList: only separators returns null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Use spaces between semicolons to avoid `;;` which is DoubleSemicolon
+    var reader = std.io.Reader.fixed("; ; ;");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const list = try parser.parseCommandList();
+    try std.testing.expectEqual(null, list);
+}
+
+test "parseCommandList: mixed separators" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo a\n; echo b; \n echo c");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const list = try parser.parseCommandList();
+    try std.testing.expect(list != null);
+    try std.testing.expectEqual(@as(usize, 3), list.?.commands.len);
+}
+
+test "parseCommandList: double semicolon treated as separator" {
+    // TODO: `;;` will need special handling for case/esac
+    // For now, it's treated as a separator (empty command between)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo a;; echo b");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const list = try parser.parseCommandList();
+    try std.testing.expect(list != null);
+    try std.testing.expectEqual(@as(usize, 2), list.?.commands.len);
 }

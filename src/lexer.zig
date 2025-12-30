@@ -63,6 +63,10 @@ pub const TokenType = union(enum) {
     /// TODO: When implementing arithmetic expansion, `))` needs special handling
     /// to close `$((...))` arithmetic expressions.
     RightParen,
+    /// Command separator - `;` or newline. Separates commands in a command list.
+    Separator,
+    /// Double semicolon `;;` - terminates a case clause in case/esac statements.
+    DoubleSemicolon,
 };
 
 /// The lexer's Token structure.
@@ -107,6 +111,8 @@ pub const Token = struct {
             },
             .LeftParen => try writer.writeAll("LeftParen"),
             .RightParen => try writer.writeAll("RightParen"),
+            .Separator => try writer.writeAll("Separator"),
+            .DoubleSemicolon => try writer.writeAll("DoubleSemicolon"),
         }
         if (!self.complete) try writer.writeAll(" [incomplete]");
     }
@@ -637,10 +643,10 @@ pub const Lexer = struct {
 
                 const first = try self.peekByte() orelse break :state null;
 
-                // Handle newline - end of command
+                // Handle newline - command separator
                 if (first == '\n') {
                     _ = try self.consumeOne();
-                    break :state null;
+                    break :state self.makeToken(.Separator, true);
                 }
 
                 switch (first) {
@@ -719,6 +725,15 @@ pub const Lexer = struct {
                     ')' => {
                         _ = try self.consumeOne();
                         break :state self.makeToken(.RightParen, true);
+                    },
+                    ';' => {
+                        _ = try self.consumeOne();
+                        const next = try self.peekByte();
+                        if (next == ';') {
+                            _ = try self.consumeOne();
+                            break :state self.makeToken(.DoubleSemicolon, true);
+                        }
+                        break :state self.makeToken(.Separator, true);
                     },
                     else => {
                         if (!isPlainCharacter(first)) {
@@ -807,6 +822,22 @@ fn expectRedirection(token: ?Token, expected_op: Redirection) !void {
     }
     // Redirection tokens should always have complete=false (target follows)
     try std.testing.expectEqual(false, t.complete);
+}
+
+fn expectSeparator(token: ?Token) !void {
+    const t = token orelse return error.ExpectedToken;
+    switch (t.type) {
+        .Separator => {},
+        else => return error.ExpectedSeparator,
+    }
+}
+
+fn expectDoubleSemicolon(token: ?Token) !void {
+    const t = token orelse return error.ExpectedToken;
+    switch (t.type) {
+        .DoubleSemicolon => {},
+        else => return error.ExpectedDoubleSemicolon,
+    }
 }
 
 test "nextToken: simple literal" {
@@ -975,11 +1006,11 @@ test "nextToken: whitespace only" {
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
-test "nextToken: newline terminates" {
+test "nextToken: newline emits separator" {
     var reader = std.io.Reader.fixed("hello\nworld");
     var lexer = Lexer.init(&reader);
     try expectLiteral(try lexer.nextToken(), "hello");
-    try std.testing.expectEqual(null, try lexer.nextToken()); // newline
+    try expectSeparator(try lexer.nextToken()); // newline
     try expectLiteral(try lexer.nextToken(), "world");
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -1014,16 +1045,13 @@ test "nextToken: fd redirection at EOF emits incomplete token" {
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
-test "nextToken: unhandled metacharacters are skipped" {
-    // Characters like |, ;, & should be consumed and return null
-    // This prevents infinite loops - each call makes progress
+test "nextToken: semicolon emits separator" {
+    // `;` emits Separator token, `|` and `&` are still consumed without token
     var reader = std.io.Reader.fixed("| ; & cmd");
     var lexer = Lexer.init(&reader);
-    // Each metacharacter returns null but is consumed
-    try std.testing.expectEqual(null, try lexer.nextToken()); // |
-    try std.testing.expectEqual(null, try lexer.nextToken()); // ;
-    try std.testing.expectEqual(null, try lexer.nextToken()); // &
-    // Finally we get the literal
+    try std.testing.expectEqual(null, try lexer.nextToken()); // | (unhandled)
+    try expectSeparator(try lexer.nextToken()); // ;
+    try std.testing.expectEqual(null, try lexer.nextToken()); // & (unhandled)
     try expectLiteral(try lexer.nextToken(), "cmd");
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -1034,6 +1062,42 @@ test "nextToken: metacharacter at end of input" {
     var lexer = Lexer.init(&reader);
     try std.testing.expectEqual(null, try lexer.nextToken());
     try std.testing.expectEqual(null, try lexer.nextToken()); // Should hit EOF, not loop
+}
+
+test "nextToken: double semicolon" {
+    var reader = std.io.Reader.fixed(";;");
+    var lexer = Lexer.init(&reader);
+    try expectDoubleSemicolon(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: semicolon followed by semicolon as separate tokens" {
+    // "; ;" should be two Separator tokens (space separates them)
+    var reader = std.io.Reader.fixed("; ;");
+    var lexer = Lexer.init(&reader);
+    try expectSeparator(try lexer.nextToken());
+    try expectSeparator(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: multiple newlines" {
+    var reader = std.io.Reader.fixed("\n\n\n");
+    var lexer = Lexer.init(&reader);
+    try expectSeparator(try lexer.nextToken());
+    try expectSeparator(try lexer.nextToken());
+    try expectSeparator(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: command list with semicolons" {
+    var reader = std.io.Reader.fixed("echo a; echo b");
+    var lexer = Lexer.init(&reader);
+    try expectLiteral(try lexer.nextToken(), "echo");
+    try expectLiteral(try lexer.nextToken(), "a");
+    try expectSeparator(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "echo");
+    try expectLiteral(try lexer.nextToken(), "b");
+    try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
 // --- Parenthesis tests ---
@@ -2191,7 +2255,7 @@ test "nextToken: source fd just over max treated as word" {
     var reader = std.io.Reader.fixed(overflow_fd_str);
     var lexer = Lexer.init(&reader);
 
-    // First token: the overflow number as a literal word
+    // First token: the overflow number as literal (incomplete)
     const tok1 = (try lexer.nextToken()).?;
     try std.testing.expectEqualStrings(std.fmt.comptimePrint("{d}", .{overflow_fd}), tok1.type.Literal);
     try std.testing.expectEqual(false, tok1.complete);
