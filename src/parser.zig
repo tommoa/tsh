@@ -1610,6 +1610,37 @@ test "parseCommand: single-quoted redirection-like string is literal" {
     try std.testing.expectEqual(@as(usize, 0), cmd.redirections.len);
 }
 
+test "parseCommand: command followed by double-quoted expansion" {
+    // echo "$@" should produce exactly 2 argv items, not 3
+    var reader = std.io.Reader.fixed("echo \"$@\"\n");
+    var lex = lexer.Lexer.init(&reader);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    const cmd = result orelse return error.ExpectedCommand;
+
+    // Should have exactly 2 argv items: "echo" and "$@" (in double quotes)
+    try std.testing.expectEqual(@as(usize, 2), cmd.argv.len);
+    try expectWord(cmd.argv[0], &.{"echo"});
+
+    // Second word should be a double_quoted containing a parameter expansion
+    try std.testing.expectEqual(@as(usize, 1), cmd.argv[1].parts.len);
+    switch (cmd.argv[1].parts[0]) {
+        .double_quoted => |inner| {
+            try std.testing.expectEqual(@as(usize, 1), inner.len);
+            switch (inner[0]) {
+                .parameter => |param| {
+                    try std.testing.expectEqualStrings("@", param.name);
+                },
+                else => return error.ExpectedParameterExpansion,
+            }
+        },
+        else => return error.ExpectedDoubleQuoted,
+    }
+}
+
 test "parseCommand: mixed quotes in word" {
     var reader = std.io.Reader.fixed("a'b'c\n");
     var lex = lexer.Lexer.init(&reader);

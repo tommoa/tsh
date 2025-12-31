@@ -36,11 +36,18 @@ pub fn main() !u8 {
     var is_login_shell = program_name.len > 0 and program_name[0] == '-';
 
     // Parse command line arguments
+    // TODO: Refactor to use options.zig once it supports:
+    //   - Long options (--dump-tokens, --dump-ast, --login, --help)
+    //   - Options with required arguments (-c <command>)
+    //   - Special handling for script filename stopping option parsing
+    //   - Collecting remaining args as positional parameters
     var processing_mode: tsh.ProcessingMode = .execute;
     var filename: ?[]const u8 = null;
     var command_string: ?[]const u8 = null;
     var force_interactive = false;
     var show_help = false;
+    var positional_params: std.ArrayListUnmanaged([]const u8) = .{};
+    defer positional_params.deinit(allocator);
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--dump-tokens")) {
@@ -53,6 +60,11 @@ pub fn main() !u8 {
                 printUsage();
                 return 1;
             };
+            // Remaining args after -c command become positional parameters
+            while (args.next()) |positional| {
+                try positional_params.append(allocator, positional);
+            }
+            break;
         } else if (std.mem.eql(u8, arg, "--login") or std.mem.eql(u8, arg, "-l")) {
             is_login_shell = true;
         } else if (std.mem.eql(u8, arg, "-i")) {
@@ -67,7 +79,12 @@ pub fn main() !u8 {
             printUsage();
             return 1;
         } else {
+            // Script filename - remaining args become positional parameters
             filename = arg;
+            while (args.next()) |positional| {
+                try positional_params.append(allocator, positional);
+            }
+            break;
         }
     }
 
@@ -93,6 +110,22 @@ pub fn main() !u8 {
     var shell_state = try tsh.ShellState.init(allocator);
     defer shell_state.deinit();
     shell_state.options.interactive = is_interactive;
+
+    // Set $0 (shell/script name)
+    // For -c mode: first positional param becomes $0, rest are $1, $2, ...
+    // For script mode: script filename is $0
+    // For interactive/stdin: program name is $0
+    if (command_string != null) {
+        if (positional_params.items.len > 0) {
+            shell_state.shell_name = positional_params.items[0];
+            try shell_state.setPositionalParams(positional_params.items[1..]);
+        }
+        // else shell_name stays "tsh"
+    } else if (filename) |fname| {
+        shell_state.shell_name = fname;
+        try shell_state.setPositionalParams(positional_params.items);
+    }
+    // else interactive mode: shell_name stays "tsh", no positional params
 
     // Determine input source and create reader
     var file: ?std.fs.File = null;

@@ -754,9 +754,13 @@ pub const Lexer = struct {
                         else => return LexerError.UnexpectedEndOfFile,
                     };
                     self.consume(buf);
-                    // Check if word continues
+                    // Check if word continues. If we're inside double quotes, the closing
+                    // quote ends the quoted region but not the word, so don't mark complete.
                     const after = try self.peekByte();
-                    const at_boundary = self.isWordComplete(after);
+                    const at_boundary = if (self.parse_context == .double_quote)
+                        false
+                    else
+                        self.isWordComplete(after);
                     break :state self.makeToken(.{ .SimpleExpansion = buf }, at_boundary);
                 } else if (isParamStartChar(next)) {
                     // Variable name: $VAR
@@ -764,8 +768,13 @@ pub const Lexer = struct {
                         // Shouldn't happen since we peeked a valid char
                         break :state self.makeToken(.{ .Literal = "$" }, true);
                     };
+                    // Check if word continues. If we're inside double quotes, the closing
+                    // quote ends the quoted region but not the word, so don't mark complete.
                     const after = try self.peekByte();
-                    const at_boundary = self.isWordComplete(after);
+                    const at_boundary = if (self.parse_context == .double_quote)
+                        false
+                    else
+                        self.isWordComplete(after);
                     break :state self.makeToken(.{ .SimpleExpansion = result.slice }, at_boundary);
                 } else {
                     // $ followed by invalid char - $ is literal

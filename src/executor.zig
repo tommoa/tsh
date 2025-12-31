@@ -225,7 +225,7 @@ pub const Executor = struct {
             // Apply assignments to shell variables
             // POSIX Reference: Section 2.9.1 - variable assignments without command
             for (cmd.assignments) |assignment| {
-                const value = try expandWord(self.allocator, assignment.value, self.shell_state);
+                const value = try expandWordJoined(self.allocator, assignment.value, self.shell_state);
                 try self.shell_state.setVariable(assignment.name, value);
             }
 
@@ -268,7 +268,7 @@ pub const Executor = struct {
             // For special builtins, variable assignments are persistent
             // POSIX Reference: Section 2.14 - Special Built-In Utilities
             for (cmd.assignments) |assignment| {
-                const value = try expandWord(self.allocator, assignment.value, self.shell_state);
+                const value = try expandWordJoined(self.allocator, assignment.value, self.shell_state);
                 try self.shell_state.setVariable(assignment.name, value);
             }
 
@@ -433,7 +433,7 @@ pub const Executor = struct {
 
         // Add/override with command-specific assignments
         for (assignments) |assignment| {
-            const value = try expandWord(self.allocator, assignment.value, self.shell_state);
+            const value = try expandWordJoined(self.allocator, assignment.value, self.shell_state);
             try env_map.put(assignment.name, value);
         }
 
@@ -550,198 +550,461 @@ const ExpandedPart = struct {
     complete: bool,
 };
 
-/// Concatenate expanded parts into a null-terminated string.
-fn concatExpandedParts(
+/// A buffer for building a single word during expansion.
+/// Multiple WordBuffers form the argv array.
+const WordBuffer = std.ArrayListUnmanaged(u8);
+
+/// A list of word buffers being built during expansion.
+const WordBufferList = std.ArrayListUnmanaged(WordBuffer);
+
+/// Start a new empty word in the word buffer list.
+fn startNewWord(allocator: Allocator, words: *WordBufferList) Allocator.Error!void {
+    try words.append(allocator, .{});
+}
+
+/// Append content to the current (last) word being built.
+/// If no word exists, starts a new one first.
+fn appendToCurrentWord(allocator: Allocator, words: *WordBufferList, content: []const u8) Allocator.Error!void {
+    if (words.items.len == 0) {
+        try startNewWord(allocator, words);
+    }
+    try words.items[words.items.len - 1].appendSlice(allocator, content);
+}
+
+/// Append expanded parameter parts to word buffers, handling word boundaries.
+///
+/// When a part has `complete = true`, it signals a word boundary (used by $@ to
+/// produce multiple words). This function handles starting new words when needed
+/// and tracks whether any complete parts have been seen.
+///
+/// Returns true if any content was added.
+fn appendParameterParts(
     allocator: Allocator,
+    words: *WordBufferList,
     parts: []const ExpandedPart,
-) Allocator.Error![:0]const u8 {
-    var total_len: usize = 0;
-    for (parts) |part| {
-        total_len += part.content.len;
-    }
-
-    const buf = try allocator.allocSentinel(u8, total_len, 0);
-    var offset: usize = 0;
-    for (parts) |part| {
-        @memcpy(buf[offset..][0..part.content.len], part.content);
-        offset += part.content.len;
-    }
-
-    return buf;
-}
-
-/// Expand a Word into a null-terminated string.
-///
-/// Performs tilde expansion on unquoted ~ at the start of the word.
-/// Currently returns a single string; when field splitting is implemented,
-/// this will need to return [][:0]const u8 to handle cases where one word
-/// expands into multiple arguments.
-fn expandWord(allocator: Allocator, word: Word, shell: *const ShellState) Allocator.Error![:0]const u8 {
-    // Pre-process: apply tilde expansion to first part if applicable
-    const parts = try applyTildeExpansion(allocator, word.parts, shell.home);
-
-    var expanded: std.ArrayListUnmanaged(ExpandedPart) = .{};
-    try expanded.ensureTotalCapacity(allocator, parts.len);
-
-    for (parts) |part| {
-        switch (part) {
-            .literal => |lit| try expanded.append(allocator, .{ .content = lit, .complete = false }),
-            .quoted => |q| try expanded.append(allocator, .{ .content = q, .complete = false }),
-            .double_quoted => |inner| {
-                // Inner parts may contain .literal, .quoted, or .parameter
-                // Concatenate them into a single ExpandedPart
-                const content = try expandInnerParts(allocator, inner);
-                try expanded.append(allocator, .{ .content = content, .complete = false });
-            },
-            .parameter => |param| {
-                // TODO: Evaluate the expansion using shell state.
-                // For now, output a literal representation of the expansion.
-                const content = try formatParameterExpansion(allocator, param);
-                try expanded.append(allocator, .{ .content = content, .complete = false });
-            },
+    seen_complete: *bool,
+) Allocator.Error!bool {
+    var content_added = false;
+    for (parts, 0..) |p, i| {
+        // If this part is complete and not the first, start a new word
+        if (p.complete and (seen_complete.* or i > 0)) {
+            try startNewWord(allocator, words);
+        }
+        try appendToCurrentWord(allocator, words, p.content);
+        content_added = true;
+        if (p.complete) {
+            seen_complete.* = true;
         }
     }
-
-    return concatExpandedParts(allocator, expanded.items);
+    return content_added;
 }
 
-/// Expand inner parts of a double-quoted region into a single string.
-/// Inner parts may contain .literal, .quoted, or .parameter (which are recursively expanded).
-fn expandInnerParts(allocator: Allocator, inner: []const WordPart) Allocator.Error![]const u8 {
-    var result: std.ArrayListUnmanaged(u8) = .{};
+/// Convert word buffers to null-terminated argv array for execve.
+/// Each word buffer becomes a null-terminated string.
+fn wordBuffersToArgv(allocator: Allocator, words: *const WordBufferList) Allocator.Error![:null]const ?[*:0]const u8 {
+    const argv = try allocator.allocSentinel(?[*:0]const u8, words.items.len, null);
 
-    for (inner) |part| {
-        switch (part) {
-            .literal => |l| try result.appendSlice(allocator, l),
-            .quoted => |q| try result.appendSlice(allocator, q),
-            .double_quoted => unreachable, // Parser doesn't nest double_quoted
-            .parameter => |param| {
-                const formatted = try formatParameterExpansion(allocator, param);
-                try result.appendSlice(allocator, formatted);
-            },
-        }
-    }
-
-    return result.toOwnedSlice(allocator);
-}
-
-/// Format a ParameterExpansion into its shell syntax representation.
-/// TODO: Replace with actual evaluation logic that looks up variable values
-/// from shell state.
-///
-/// NOTE: This duplicates some logic from parser.ParameterExpansion.format().
-/// The duplication is intentional since:
-/// 1. This outputs $VAR for simple expansions vs ${VAR} in the parser
-/// 2. This function will be replaced with evaluation logic
-fn formatParameterExpansion(allocator: Allocator, param: parser.ParameterExpansion) Allocator.Error![]const u8 {
-    // Use an ArrayList to build the formatted string
-    var result: std.ArrayListUnmanaged(u8) = .{};
-
-    // For simple expansions without modifiers, use $VAR format
-    if (param.modifier == null) {
-        try result.appendSlice(allocator, "$");
-        try result.appendSlice(allocator, param.name);
-        return result.toOwnedSlice(allocator);
-    }
-
-    // For expansions with modifiers, use ${...} format
-    try result.appendSlice(allocator, "${");
-
-    const mod = param.modifier.?;
-
-    // Handle length modifier (prefix)
-    if (mod.op == .Length) {
-        try result.append(allocator, '#');
-        try result.appendSlice(allocator, param.name);
-        try result.append(allocator, '}');
-        return result.toOwnedSlice(allocator);
-    }
-
-    try result.appendSlice(allocator, param.name);
-
-    // Write colon if check_null is set (for applicable modifiers)
-    switch (mod.op) {
-        .UseDefault, .AssignDefault, .ErrorIfUnset, .UseAlternative => {
-            if (mod.check_null) try result.append(allocator, ':');
-        },
-        else => {},
-    }
-
-    // Write the operator
-    switch (mod.op) {
-        .Length => unreachable,
-        .UseDefault => try result.append(allocator, '-'),
-        .AssignDefault => try result.append(allocator, '='),
-        .ErrorIfUnset => try result.append(allocator, '?'),
-        .UseAlternative => try result.append(allocator, '+'),
-        .RemoveSmallestPrefix => try result.append(allocator, '#'),
-        .RemoveLargestPrefix => try result.appendSlice(allocator, "##"),
-        .RemoveSmallestSuffix => try result.append(allocator, '%'),
-        .RemoveLargestSuffix => try result.appendSlice(allocator, "%%"),
-    }
-
-    // Write the word if present
-    if (mod.word) |word_parts| {
-        for (word_parts) |part| {
-            switch (part) {
-                .literal => |lit| try result.appendSlice(allocator, lit),
-                .quoted => |q| {
-                    try result.append(allocator, '\'');
-                    try result.appendSlice(allocator, q);
-                    try result.append(allocator, '\'');
-                },
-                .double_quoted => |parts| {
-                    try result.append(allocator, '"');
-                    for (parts) |p| {
-                        const inner = try formatWordPartInner(allocator, p);
-                        try result.appendSlice(allocator, inner);
-                    }
-                    try result.append(allocator, '"');
-                },
-                .parameter => |p| {
-                    const inner = try formatParameterExpansion(allocator, p);
-                    try result.appendSlice(allocator, inner);
-                },
-            }
-        }
-    }
-
-    try result.append(allocator, '}');
-    return result.toOwnedSlice(allocator);
-}
-
-/// Format a WordPart for output inside double quotes.
-///
-/// NOTE: The returned slice has mixed ownership semantics:
-/// - For `.literal`: Returns the input slice directly (borrowed from AST)
-/// - For `.quoted` and `.parameter`: Returns newly allocated memory
-///
-/// Callers should not free the returned slice directly. Memory is managed
-/// by the arena allocator, which outlives the command execution.
-fn formatWordPartInner(allocator: Allocator, part: WordPart) Allocator.Error![]const u8 {
-    return switch (part) {
-        .literal => |lit| lit,
-        .quoted => |q| blk: {
-            var result: std.ArrayListUnmanaged(u8) = .{};
-            try result.append(allocator, '\'');
-            try result.appendSlice(allocator, q);
-            try result.append(allocator, '\'');
-            break :blk result.toOwnedSlice(allocator);
-        },
-        .double_quoted => unreachable,
-        .parameter => |param| formatParameterExpansion(allocator, param),
-    };
-}
-
-/// Expand an array of Words into a null-terminated array of null-terminated strings.
-fn expandArgv(allocator: Allocator, words: []const Word, shell: *const ShellState) Allocator.Error![:null]const ?[*:0]const u8 {
-    const argv = try allocator.allocSentinel(?[*:0]const u8, words.len, null);
-
-    for (words, 0..) |word, i| {
-        argv[i] = (try expandWord(allocator, word, shell)).ptr;
+    for (words.items, 0..) |*buf, i| {
+        const str = try allocator.dupeZ(u8, buf.items);
+        argv[i] = str.ptr;
     }
 
     return argv;
+}
+
+/// Join word buffers into a single string with the given separator.
+///
+/// POSIX 2.5.2: For $*, "when the expansion occurs within double-quotes, it shall
+/// expand to a single field with the value of each parameter separated by the
+/// first character of the IFS variable."
+///
+/// Note: Returns a static empty string ("") for empty/zero-length cases instead of
+/// allocating. This is safe because callers use arena allocators and don't free
+/// individual strings. If ownership semantics change, this should allocate instead.
+///
+/// TODO: Use first char of IFS as separator. Currently uses space.
+fn joinWordBuffers(allocator: Allocator, words: *const WordBufferList, separator: []const u8) Allocator.Error![]const u8 {
+    if (words.items.len == 0) {
+        return "";
+    }
+
+    // Calculate total length
+    var total_len: usize = 0;
+    for (words.items) |*buf| {
+        total_len += buf.items.len;
+    }
+    // Add separator lengths (one less than number of words)
+    if (words.items.len > 1) {
+        total_len += separator.len * (words.items.len - 1);
+    }
+
+    if (total_len == 0) {
+        return "";
+    }
+
+    const result = try allocator.alloc(u8, total_len);
+    var offset: usize = 0;
+
+    for (words.items, 0..) |*buf, i| {
+        @memcpy(result[offset..][0..buf.items.len], buf.items);
+        offset += buf.items.len;
+        if (i < words.items.len - 1) {
+            @memcpy(result[offset..][0..separator.len], separator);
+            offset += separator.len;
+        }
+    }
+
+    return result;
+}
+
+/// Expand a single Word into word buffers, appending to the provided list.
+///
+/// This is the core expansion function that handles the `complete` flag for word
+/// boundaries. When `$@` expands to multiple parameters, each parameter has
+/// `complete = true`, which signals a word boundary.
+///
+/// POSIX 2.5.2 specifies that "$@" expands such that "each positional parameter
+/// shall expand as a separate field." The `complete` flag implements this by
+/// marking where word splits occur.
+///
+/// Prefix/suffix handling:
+///   - Content before $@ attaches to the first parameter
+///   - Content after $@ attaches to the last parameter
+///   - Example: "prefix$@suffix" with params ["a", "b"] → ["prefixa", "bsuffix"]
+///
+/// TODO: Apply field splitting to unquoted expansions (POSIX 2.6.5)
+/// TODO: Apply pathname expansion (globbing) after field splitting (POSIX 2.6.6)
+fn expandWordIntoBuffers(
+    allocator: Allocator,
+    word: Word,
+    shell: *const ShellState,
+    words: *WordBufferList,
+) Allocator.Error!void {
+    // Pre-process: apply tilde expansion to first part if applicable
+    const parts = try applyTildeExpansion(allocator, word.parts, shell.home);
+
+    // Track the starting position so we can detect if this Word produced zero fields.
+    // This is needed for "$@" with no positional parameters, which should produce
+    // zero words per POSIX 2.5.2: "If there are no positional parameters, the
+    // expansion of '@' shall generate zero fields."
+    const starting_word_count = words.items.len;
+
+    // Start a new word for this Word. We may remove it at the end if nothing was added
+    // (e.g., "$@" with no params).
+    try startNewWord(allocator, words);
+
+    // Track if we've seen any complete=true parts (for proper prefix/suffix handling)
+    var seen_complete = false;
+
+    // Track whether any expansion produced content (even empty content like $* → "").
+    // This is different from the buffer being non-empty: "$*" with no params returns
+    // one empty part, which counts as "content added" and should produce one empty field.
+    // "$@" with no params returns zero parts, so no content is added, producing zero fields.
+    var content_added = false;
+
+    for (parts) |part| {
+        switch (part) {
+            .literal => |lit| {
+                try appendToCurrentWord(allocator, words, lit);
+                content_added = true;
+            },
+            .quoted => |q| {
+                try appendToCurrentWord(allocator, words, q);
+                content_added = true;
+            },
+            .double_quoted => |inner| {
+                if (inner.len == 0) {
+                    // Empty quoted string "" should produce one empty word.
+                    // The word was already started above, so just mark content as added.
+                    // This is distinct from "$@" with no params, which produces zero words.
+                    // For "$@", inner.len > 0 (contains the $@ expansion), but the expansion
+                    // returns zero parts, so content_added stays false.
+                    content_added = true;
+                } else {
+                    // Expand inner parts in quoted context
+                    const inner_added = try expandInnerPartsIntoBuffers(allocator, inner, shell, words, &seen_complete);
+                    if (inner_added) content_added = true;
+                }
+            },
+            .parameter => |param| {
+                // Evaluate parameter expansion (unquoted context)
+                const paramParts = try evaluateParameterExpansion(allocator, shell, param, false);
+                if (try appendParameterParts(allocator, words, paramParts, &seen_complete)) {
+                    content_added = true;
+                }
+            },
+        }
+    }
+
+    // If this Word started a new word but no content was added, remove the empty word.
+    // This handles "$@" with no params producing zero fields per POSIX 2.5.2.
+    //
+    // Cases:
+    // - "" (empty double_quoted) → content_added = true → keep empty word
+    // - "$*" with no params → returns 1 empty part → content_added = true → keep empty word
+    // - "$@" with no params → returns 0 parts → content_added = false → remove empty word
+    if (!content_added and words.items.len == starting_word_count + 1) {
+        // Remove the empty word - this expansion produced zero fields
+        _ = words.pop();
+    }
+}
+
+/// Expand inner parts of a double-quoted region into word buffers.
+///
+/// This handles the special case where "$@" inside double quotes should still
+/// produce multiple words. POSIX 2.5.2: "When the expansion occurs within
+/// double-quotes [...] each positional parameter shall expand as a separate field."
+///
+/// Returns true if any content was added (even empty content from $*), false if
+/// no content was added (e.g., $@ with no params returns zero parts).
+fn expandInnerPartsIntoBuffers(
+    allocator: Allocator,
+    inner: []const WordPart,
+    shell: *const ShellState,
+    words: *WordBufferList,
+    seen_complete: *bool,
+) Allocator.Error!bool {
+    var content_added = false;
+
+    for (inner) |part| {
+        switch (part) {
+            .literal => |l| {
+                try appendToCurrentWord(allocator, words, l);
+                content_added = true;
+            },
+            .quoted => |q| {
+                try appendToCurrentWord(allocator, words, q);
+                content_added = true;
+            },
+            .double_quoted => unreachable, // Parser doesn't nest double_quoted
+            .parameter => |param| {
+                // Evaluate in quoted context
+                const paramParts = try evaluateParameterExpansion(allocator, shell, param, true);
+                if (try appendParameterParts(allocator, words, paramParts, seen_complete)) {
+                    content_added = true;
+                }
+            },
+        }
+    }
+
+    return content_added;
+}
+
+/// Expand a Word and return a joined string for assignment/redirection contexts.
+///
+/// POSIX 2.9.1 (Simple Commands): Variable assignments undergo "tilde expansion,
+/// parameter expansion, command substitution, arithmetic expansion, and quote
+/// removal" but NOT field splitting or pathname expansion.
+///
+/// POSIX 2.7 (Redirection): Redirection targets undergo similar expansion.
+/// Following dash behavior, field splitting and pathname expansion are not
+/// performed on redirection targets.
+///
+/// TODO: Use first char of IFS as separator for $* per POSIX 2.5.2
+fn expandWordJoined(allocator: Allocator, word: Word, shell: *const ShellState) Allocator.Error![]const u8 {
+    var words: WordBufferList = .{};
+    try expandWordIntoBuffers(allocator, word, shell, &words);
+    return joinWordBuffers(allocator, &words, " ");
+}
+
+/// Evaluate a parameter expansion and return the expanded parts.
+///
+/// Handles both regular variables ($VAR, ${VAR}) and special parameters
+/// ($?, $#, $@, $*, $$, $-, $0-$9, ${10}+).
+///
+/// The `quoted` parameter indicates whether the expansion is inside double quotes,
+/// which affects the behavior of $@ and $*.
+///
+/// TODO: Implement modifier evaluation (:-, :=, :?, :+, #, ##, %, %%)
+fn evaluateParameterExpansion(
+    allocator: Allocator,
+    shell: *const ShellState,
+    param: parser.ParameterExpansion,
+    quoted: bool,
+) Allocator.Error![]ExpandedPart {
+    // Check for special parameters first
+    if (try getSpecialParameter(allocator, shell, param.name, quoted)) |parts| {
+        // TODO: Apply modifiers to special parameters.
+        // POSIX 2.6.2 allows modifiers on special parameters (e.g., ${?:-0}, ${#:+x}).
+        // Currently modifiers are silently ignored on special parameters. When
+        // modifier support is implemented, this should apply them to the expanded
+        // value. For now, users should be aware that ${?:-default} returns $?'s
+        // value, not "default" if $? is unset (which it never is anyway).
+        if (param.modifier != null) {
+            // Silently ignored - see TODO above
+        }
+        return parts;
+    }
+
+    // Regular variable lookup
+    const value = shell.getVariable(param.name) orelse "";
+
+    // No modifier - just return the value
+    if (param.modifier == null) {
+        const result = try allocator.alloc(ExpandedPart, 1);
+        result[0] = .{ .content = value, .complete = false };
+        return result;
+    }
+
+    // TODO: Apply modifiers (UseDefault, AssignDefault, ErrorIfUnset, UseAlternative,
+    // Length, RemoveSmallestPrefix, RemoveLargestPrefix, RemoveSmallestSuffix, RemoveLargestSuffix)
+    // For now, just return the value unchanged
+    const result = try allocator.alloc(ExpandedPart, 1);
+    result[0] = .{ .content = value, .complete = false };
+    return result;
+}
+
+/// Get the value of a special parameter.
+///
+/// Returns null if the name is not a special parameter.
+/// POSIX Reference: Section 2.5.2 - Special Parameters
+fn getSpecialParameter(
+    allocator: Allocator,
+    shell: *const ShellState,
+    name: []const u8,
+    quoted: bool,
+) Allocator.Error!?[]ExpandedPart {
+    // Single-character special parameters
+    if (name.len == 1) {
+        switch (name[0]) {
+            '?' => {
+                // Exit status of last command
+                const result = try allocator.alloc(ExpandedPart, 1);
+                const str = try std.fmt.allocPrint(allocator, "{d}", .{shell.last_status.toExitCode()});
+                result[0] = .{ .content = str, .complete = false };
+                return result;
+            },
+            '#' => {
+                // Number of positional parameters
+                const result = try allocator.alloc(ExpandedPart, 1);
+                const str = try std.fmt.allocPrint(allocator, "{d}", .{shell.positional_params.items.len});
+                result[0] = .{ .content = str, .complete = false };
+                return result;
+            },
+            '@' => {
+                // POSIX 2.5.2: "@ - Expands to the positional parameters, starting
+                // from one. When the expansion occurs within double-quotes, [...] each
+                // positional parameter shall expand as a separate field".
+                //
+                // Note: The `quoted` parameter is intentionally not checked here because
+                // $@ always expands to separate words regardless of quoting context. The
+                // difference is that unquoted $@ is subject to field splitting afterward
+                // (not yet implemented), but the initial expansion is identical.
+                const params = shell.positional_params.items;
+                if (params.len == 0) {
+                    // POSIX 2.5.2: "If there are no positional parameters, the
+                    // expansion of '@' shall generate zero fields"
+                    return try allocator.alloc(ExpandedPart, 0);
+                }
+                const parts = try allocator.alloc(ExpandedPart, params.len);
+                for (params, 0..) |p, i| {
+                    parts[i] = .{ .content = p, .complete = true };
+                }
+                return parts;
+            },
+            '*' => {
+                // POSIX 2.5.2: "* - Expands to the positional parameters, starting
+                // from one. When the expansion occurs within double-quotes, it shall
+                // expand to a single field with the value of each parameter separated
+                // by the first character of the IFS variable".
+                const params = shell.positional_params.items;
+                if (params.len == 0) {
+                    if (quoted) {
+                        // POSIX 2.5.2: When within double-quotes with no positional
+                        // parameters, "$*" expands to a single empty field.
+                        const result = try allocator.alloc(ExpandedPart, 1);
+                        result[0] = .{ .content = "", .complete = false };
+                        return result;
+                    } else {
+                        // Unquoted $* with no params = zero fields (subject to
+                        // field splitting which produces nothing from empty string)
+                        return try allocator.alloc(ExpandedPart, 0);
+                    }
+                }
+                // Join with spaces (TODO: use first char of IFS per POSIX 2.5.2)
+                const joined = try std.mem.join(allocator, " ", params);
+                const result = try allocator.alloc(ExpandedPart, 1);
+                result[0] = .{ .content = joined, .complete = false };
+                return result;
+            },
+            '$' => {
+                // PID of shell (cached at startup)
+                const result = try allocator.alloc(ExpandedPart, 1);
+                const str = try std.fmt.allocPrint(allocator, "{d}", .{shell.pid});
+                result[0] = .{ .content = str, .complete = false };
+                return result;
+            },
+            '!' => {
+                // TODO: PID of last background command (requires job control)
+                const result = try allocator.alloc(ExpandedPart, 1);
+                result[0] = .{ .content = "", .complete = false };
+                return result;
+            },
+            '-' => {
+                // Current option flags
+                const result = try allocator.alloc(ExpandedPart, 1);
+                var flags: [16]u8 = undefined;
+                var len: usize = 0;
+                if (shell.options.interactive) {
+                    flags[len] = 'i';
+                    len += 1;
+                }
+                // TODO: Add these as options are implemented:
+                // 'e' - errexit
+                // 'u' - nounset
+                // 'x' - xtrace
+                // 'v' - verbose
+                // 'f' - noglob
+                // 'C' - noclobber
+                // 'a' - allexport
+                const str = try allocator.dupe(u8, flags[0..len]);
+                result[0] = .{ .content = str, .complete = false };
+                return result;
+            },
+            else => {},
+        }
+    }
+
+    // Positional parameters: $0 (shell name), $1-$9, ${10}, ${11}, etc.
+    // The lexer ensures $10 is parsed as $1 + literal "0", so single-digit
+    // names come from $0-$9 and multi-digit names come from ${10}+.
+    if (std.fmt.parseInt(usize, name, 10)) |idx| {
+        const result = try allocator.alloc(ExpandedPart, 1);
+        if (idx == 0) {
+            result[0] = .{ .content = shell.shell_name, .complete = false };
+        } else {
+            const params = shell.positional_params.items;
+            if (idx <= params.len) {
+                result[0] = .{ .content = params[idx - 1], .complete = false };
+            } else {
+                result[0] = .{ .content = "", .complete = false };
+            }
+        }
+        return result;
+    } else |_| {}
+
+    return null; // Not a special parameter
+}
+
+/// Expand an array of Words into a null-terminated array of null-terminated strings.
+///
+/// Each Word may expand to one or more argv entries (e.g., "$@" expands to
+/// multiple entries when there are multiple positional parameters).
+///
+/// POSIX 2.6 specifies the order of word expansions:
+/// 1. Tilde expansion
+/// 2. Parameter expansion, command substitution, arithmetic expansion
+/// 3. Field splitting (TODO)
+/// 4. Pathname expansion (TODO)
+/// 5. Quote removal
+fn expandArgv(allocator: Allocator, words: []const Word, shell: *const ShellState) Allocator.Error![:null]const ?[*:0]const u8 {
+    var wordBuffers: WordBufferList = .{};
+
+    for (words) |word| {
+        try expandWordIntoBuffers(allocator, word, shell, &wordBuffers);
+    }
+
+    return wordBuffersToArgv(allocator, &wordBuffers);
 }
 
 /// Find an executable in PATH or return the command if it contains a slash.
@@ -751,6 +1014,11 @@ fn expandArgv(allocator: Allocator, words: []const Word, shell: *const ShellStat
 /// - Otherwise, search each directory in PATH
 ///
 /// Returns FindResult indicating success, not found (exit 127), or not executable (exit 126).
+///
+/// TODO: Implement PATH lookup caching to avoid repeated filesystem searches for
+/// frequently-used commands. Shells like bash maintain a hash table (accessible via
+/// the `hash` builtin) that maps command names to their resolved paths. The cache
+/// should be invalidated when PATH changes or when `hash -r` is invoked.
 fn findExecutable(allocator: Allocator, cmd: [*:0]const u8, env_map: *const process.EnvMap) FindResult {
     const cmd_slice = std.mem.span(cmd);
 
@@ -810,8 +1078,13 @@ fn applyRedirections(allocator: Allocator, redirections: []const ParsedRedirecti
 
         switch (redir.target) {
             .file => |word| {
-                const path = expandWord(allocator, word, shell) catch {
+                // POSIX 2.7 (Redirection): Following dash behavior, field splitting and
+                // pathname expansion are not performed on redirection targets.
+                const path_slice = expandWordJoined(allocator, word, shell) catch {
                     return .{ .err = "failed to expand redirection target" };
+                };
+                const path = allocator.dupeZ(u8, path_slice) catch {
+                    return .{ .err = "failed to allocate redirection path" };
                 };
                 const flags = openFlagsForOp(redir.op);
                 const fd = posix.openZ(path, flags, 0o666) catch |err| {
@@ -1138,7 +1411,7 @@ test "execute: fd duplication 2>&1" {
     std.fs.deleteFileAbsolute(tmp_path) catch {};
 }
 
-test "expandWord: single literal" {
+test "expandWordJoined: single literal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1152,11 +1425,11 @@ test "expandWord: single literal" {
         .column = 1,
     };
 
-    const result = try expandWord(arena.allocator(), word, &shell);
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
     try std.testing.expectEqualStrings("hello", result);
 }
 
-test "expandWord: multiple literals" {
+test "expandWordJoined: multiple literals" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1173,7 +1446,7 @@ test "expandWord: multiple literals" {
         .column = 1,
     };
 
-    const result = try expandWord(arena.allocator(), word, &shell);
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
     try std.testing.expectEqualStrings("helloworld", result);
 }
 
@@ -1233,7 +1506,7 @@ test "expandTilde: tilde not at start returns null" {
     try std.testing.expect(result == null);
 }
 
-test "expandWord: tilde expands in unquoted literal" {
+test "expandWordJoined: tilde expands in unquoted literal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1248,11 +1521,11 @@ test "expandWord: tilde expands in unquoted literal" {
         .column = 1,
     };
 
-    const result = try expandWord(arena.allocator(), word, &shell);
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
     try std.testing.expectEqualStrings("/home/testuser", result);
 }
 
-test "expandWord: tilde with path expands" {
+test "expandWordJoined: tilde with path expands" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1267,11 +1540,11 @@ test "expandWord: tilde with path expands" {
         .column = 1,
     };
 
-    const result = try expandWord(arena.allocator(), word, &shell);
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
     try std.testing.expectEqualStrings("/home/testuser/bin", result);
 }
 
-test "expandWord: quoted tilde does not expand" {
+test "expandWordJoined: quoted tilde does not expand" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1286,11 +1559,11 @@ test "expandWord: quoted tilde does not expand" {
         .column = 1,
     };
 
-    const result = try expandWord(arena.allocator(), word, &shell);
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
     try std.testing.expectEqualStrings("~", result);
 }
 
-test "expandWord: double-quoted tilde does not expand" {
+test "expandWordJoined: double-quoted tilde does not expand" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1305,11 +1578,11 @@ test "expandWord: double-quoted tilde does not expand" {
         .column = 1,
     };
 
-    const result = try expandWord(arena.allocator(), word, &shell);
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
     try std.testing.expectEqualStrings("~", result);
 }
 
-test "expandWord: tilde with no HOME stays literal" {
+test "expandWordJoined: tilde with no HOME stays literal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1323,11 +1596,11 @@ test "expandWord: tilde with no HOME stays literal" {
         .column = 1,
     };
 
-    const result = try expandWord(arena.allocator(), word, &shell);
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
     try std.testing.expectEqualStrings("~", result);
 }
 
-test "expandWord: quoted prefix prevents tilde expansion" {
+test "expandWordJoined: quoted prefix prevents tilde expansion" {
     // Tests that tilde expansion only occurs when the FIRST part of a word is
     // an unquoted literal starting with ~. Any quoted content before the tilde
     // (even empty quotes like ""~) prevents expansion per POSIX 2.6.1.
@@ -1349,7 +1622,7 @@ test "expandWord: quoted prefix prevents tilde expansion" {
         .column = 1,
     };
 
-    const result = try expandWord(arena.allocator(), word, &shell);
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
     try std.testing.expectEqualStrings("~", result);
 }
 
@@ -1425,31 +1698,7 @@ test "applyTildeExpansion: empty parts returns empty" {
     try std.testing.expectEqual(@as(usize, 0), result.len);
 }
 
-test "concatExpandedParts: multiple parts" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const parts = [_]ExpandedPart{
-        .{ .content = "hello", .complete = false },
-        .{ .content = " ", .complete = false },
-        .{ .content = "world", .complete = false },
-    };
-
-    const result = try concatExpandedParts(arena.allocator(), &parts);
-    try std.testing.expectEqualStrings("hello world", result);
-}
-
-test "concatExpandedParts: empty parts" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const parts = [_]ExpandedPart{};
-
-    const result = try concatExpandedParts(arena.allocator(), &parts);
-    try std.testing.expectEqualStrings("", result);
-}
-
-test "expandWord: double-quoted inner parts concatenated" {
+test "expandWordJoined: double-quoted inner parts concatenated" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1470,7 +1719,7 @@ test "expandWord: double-quoted inner parts concatenated" {
         .column = 1,
     };
 
-    const result = try expandWord(arena.allocator(), word, &shell);
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
     try std.testing.expectEqualStrings("hello~", result);
 }
 
@@ -1668,4 +1917,314 @@ test "execute: builtin redirection error" {
 
     // Should return error status
     try std.testing.expectEqual(ExitStatus{ .exited = ExitStatus.GENERAL_ERROR }, status);
+}
+
+// --- Parameter expansion tests ---
+
+test "expandWordJoined: simple variable expansion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("FOO", "hello");
+
+    // Construct a word with a parameter expansion: $FOO
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{ .name = "FOO", .modifier = null } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("hello", result);
+}
+
+test "expandWordJoined: undefined variable expands to empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{ .name = "UNDEFINED", .modifier = null } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "expandWordJoined: variable in double quotes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("NAME", "world");
+
+    // Construct "hello $NAME"
+    const inner_parts = [_]WordPart{
+        .{ .literal = "hello " },
+        .{ .parameter = .{ .name = "NAME", .modifier = null } },
+    };
+    const word = Word{
+        .parts = &[_]WordPart{.{ .double_quoted = &inner_parts }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("hello world", result);
+}
+
+test "expandWordJoined: special parameter $?" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    shell.last_status = .{ .exited = 42 };
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{ .name = "?", .modifier = null } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("42", result);
+}
+
+test "expandWordJoined: special parameter $#" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b", "c" });
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{ .name = "#", .modifier = null } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("3", result);
+}
+
+test "expandWordJoined: special parameter $0" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    shell.shell_name = "myscript.sh";
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{ .name = "0", .modifier = null } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("myscript.sh", result);
+}
+
+test "expandWordJoined: positional parameter $1" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "first", "second" });
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{ .name = "1", .modifier = null } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("first", result);
+}
+
+test "expandWordJoined: positional parameter out of range" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{"only_one"});
+
+    // $5 when only $1 is set
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{ .name = "5", .modifier = null } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "expandWordJoined: special parameter $$" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{ .name = "$", .modifier = null } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    // Result should be a valid PID (non-empty number)
+    try std.testing.expect(result.len > 0);
+    // Should be parseable as a number
+    _ = try std.fmt.parseInt(i32, result, 10);
+}
+
+test "expandWordIntoBuffers: quoted $@ produces multiple words" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b", "c" });
+
+    // Construct "$@" - a double_quoted word containing a parameter expansion
+    const inner_parts = [_]WordPart{
+        .{ .parameter = .{ .name = "@", .modifier = null } },
+    };
+    const word = Word{
+        .parts = &[_]WordPart{.{ .double_quoted = &inner_parts }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    var words: WordBufferList = .{};
+    try expandWordIntoBuffers(arena.allocator(), word, &shell, &words);
+
+    // Should produce exactly 3 words: "a", "b", "c"
+    try std.testing.expectEqual(@as(usize, 3), words.items.len);
+    try std.testing.expectEqualStrings("a", words.items[0].items);
+    try std.testing.expectEqualStrings("b", words.items[1].items);
+    try std.testing.expectEqualStrings("c", words.items[2].items);
+}
+
+test "expandWordIntoBuffers: quoted $@ with no params produces zero words" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // No positional params set
+
+    // Construct "$@"
+    const inner_parts = [_]WordPart{
+        .{ .parameter = .{ .name = "@", .modifier = null } },
+    };
+    const word = Word{
+        .parts = &[_]WordPart{.{ .double_quoted = &inner_parts }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    var words: WordBufferList = .{};
+    try expandWordIntoBuffers(arena.allocator(), word, &shell, &words);
+
+    // POSIX 2.5.2: "If there are no positional parameters, the expansion of '@'
+    // shall generate zero fields"
+    try std.testing.expectEqual(@as(usize, 0), words.items.len);
+}
+
+test "expandWordIntoBuffers: prefix$@suffix produces correct words" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b" });
+
+    // Construct "prefix$@suffix"
+    const inner_parts = [_]WordPart{
+        .{ .literal = "prefix" },
+        .{ .parameter = .{ .name = "@", .modifier = null } },
+        .{ .literal = "suffix" },
+    };
+    const word = Word{
+        .parts = &[_]WordPart{.{ .double_quoted = &inner_parts }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    var words: WordBufferList = .{};
+    try expandWordIntoBuffers(arena.allocator(), word, &shell, &words);
+
+    // Should produce 2 words: "prefixa", "bsuffix"
+    try std.testing.expectEqual(@as(usize, 2), words.items.len);
+    try std.testing.expectEqualStrings("prefixa", words.items[0].items);
+    try std.testing.expectEqualStrings("bsuffix", words.items[1].items);
+}
+
+test "expandArgv: echo with $@ produces correct argv" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b", "c" });
+
+    // Construct: echo "$@"
+    // Word 1: echo (literal)
+    const word1 = Word{
+        .parts = &[_]WordPart{.{ .literal = "echo" }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    // Word 2: "$@" (double_quoted containing parameter)
+    const inner_parts = [_]WordPart{
+        .{ .parameter = .{ .name = "@", .modifier = null } },
+    };
+    const word2 = Word{
+        .parts = &[_]WordPart{.{ .double_quoted = &inner_parts }},
+        .position = 5,
+        .line = 1,
+        .column = 6,
+    };
+
+    const words = [_]Word{ word1, word2 };
+    const argv = try expandArgv(arena.allocator(), &words, &shell);
+
+    // Should produce: ["echo", "a", "b", "c", null]
+    // Count non-null entries
+    var argc: usize = 0;
+    while (argv[argc] != null) : (argc += 1) {}
+
+    try std.testing.expectEqual(@as(usize, 4), argc);
+    try std.testing.expectEqualStrings("echo", std.mem.span(argv[0].?));
+    try std.testing.expectEqualStrings("a", std.mem.span(argv[1].?));
+    try std.testing.expectEqualStrings("b", std.mem.span(argv[2].?));
+    try std.testing.expectEqualStrings("c", std.mem.span(argv[3].?));
 }

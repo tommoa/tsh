@@ -157,9 +157,25 @@ pub const ShellState = struct {
     /// Shell options (interactive mode, etc.).
     options: ShellOptions,
 
-    // Future fields:
-    // /// Positional parameters ($1, $2, etc.).
-    // positional_params: []const []const u8,
+    /// Positional parameters ($1, $2, ...).
+    /// Set from script arguments or the `set` builtin.
+    /// POSIX Reference: Section 2.5.1 - Positional Parameters
+    positional_params: std.ArrayListUnmanaged([]const u8) = .{},
+
+    /// Shell/script name ($0).
+    /// Set from the script path or shell invocation name.
+    /// POSIX Reference: Section 2.5.2 - Special Parameters
+    ///
+    /// Ownership: This is a borrowed pointer, not owned by ShellState.
+    /// The caller (typically main.zig) must ensure the backing memory
+    /// (e.g., from argv or a filename string) outlives the ShellState.
+    /// This field is not freed by deinit().
+    shell_name: []const u8 = "tsh",
+
+    /// Process ID of the shell ($$).
+    /// Cached at initialization since it never changes during process lifetime.
+    /// POSIX Reference: Section 2.5.2 - Special Parameters
+    pid: std.posix.pid_t,
 
     /// Initialize shell state by inheriting the current process environment.
     ///
@@ -194,6 +210,7 @@ pub const ShellState = struct {
             .home = env.get("HOME"),
             .ps1 = env.get("PS1") orelse DEFAULT_PS1,
             .options = .{},
+            .pid = std.c.getpid(),
         };
     }
 
@@ -219,6 +236,12 @@ pub const ShellState = struct {
         if (self.oldcwd) |old| {
             self.allocator.free(old);
         }
+
+        // Free positional parameters
+        for (self.positional_params.items) |p| {
+            self.allocator.free(p);
+        }
+        self.positional_params.deinit(self.allocator);
 
         self.env.deinit();
     }
@@ -301,6 +324,28 @@ pub const ShellState = struct {
                 errdefer self.allocator.free(duped_name);
                 try self.variables.put(duped_name, duped_value);
             }
+        }
+    }
+
+    /// Set positional parameters ($1, $2, ...).
+    ///
+    /// Replaces all existing positional parameters with the provided values.
+    /// The values are copied, so the caller retains ownership of the input.
+    /// Used by script argument handling and the `set` builtin.
+    ///
+    /// POSIX Reference: Section 2.5.1 - Positional Parameters
+    pub fn setPositionalParams(self: *ShellState, params: []const []const u8) !void {
+        // Free old params
+        for (self.positional_params.items) |p| {
+            self.allocator.free(p);
+        }
+        self.positional_params.clearRetainingCapacity();
+
+        // Copy new params
+        try self.positional_params.ensureTotalCapacity(self.allocator, params.len);
+        for (params) |p| {
+            const duped = try self.allocator.dupe(u8, p);
+            self.positional_params.appendAssumeCapacity(duped);
         }
     }
 };
