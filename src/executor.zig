@@ -17,7 +17,7 @@ const state = @import("state.zig");
 const builtins = @import("builtins.zig");
 const SimpleCommand = parser.SimpleCommand;
 const Command = parser.Command;
-const CommandList = parser.CommandList;
+
 const Word = parser.Word;
 const WordPart = parser.WordPart;
 const Assignment = parser.Assignment;
@@ -344,22 +344,22 @@ pub const Executor = struct {
         return self.shell_state.last_status;
     }
 
-    /// Execute a command list (multiple commands sequentially).
+    /// Execute a command (simple or compound).
     ///
-    /// Returns the exit status of the last command executed, or
-    /// error.ExitRequested if the exit builtin was invoked.
-    pub fn executeList(self: *Executor, list: CommandList) ExecuteError!ExitStatus {
-        var last_status: ExitStatus = .{ .exited = 0 };
-
-        for (list.commands) |cmd| {
-            switch (cmd) {
-                .simple => |simple| {
-                    last_status = try self.execute(simple);
-                },
-            }
+    /// This is the primary interface for pull-based execution.
+    /// Returns the exit status of the command, or error.ExitRequested
+    /// if the exit builtin was invoked.
+    ///
+    /// Example usage with parser iterator:
+    /// ```
+    /// while (try parser.next()) |cmd| {
+    ///     _ = try executor.executeCommand(cmd);
+    /// }
+    /// ```
+    pub fn executeCommand(self: *Executor, cmd: Command) ExecuteError!ExitStatus {
+        switch (cmd) {
+            .simple => |simple| return self.execute(simple),
         }
-
-        return last_status;
     }
 
     /// Execute in the child process (after fork).
@@ -1731,14 +1731,7 @@ test "ExitStatus.toExitCode" {
     try std.testing.expectEqual(@as(u8, 143), (ExitStatus{ .signaled = 15 }).toExitCode()); // SIGTERM
 }
 
-fn parseCommandList(allocator: Allocator, input: []const u8) !?parser.CommandList {
-    var reader = std.io.Reader.fixed(input);
-    var lex = lexer.Lexer.init(&reader);
-    var p = parser.Parser.init(allocator, &lex);
-    return p.parseCommandList();
-}
-
-test "executeList: redirection-only command does not affect subsequent command" {
+test "executeCommand: redirection-only command does not affect subsequent command" {
     // Verify that `> file; echo hello` works correctly:
     // - First command creates/truncates the file
     // - Second command outputs to stdout, not to the file
@@ -1749,11 +1742,18 @@ test "executeList: redirection-only command does not affect subsequent command" 
     std.fs.deleteFileAbsolute(tmp_path) catch {};
 
     const input = "> " ++ tmp_path ++ "; /bin/echo hello\n";
-    const cmd_list = try parseCommandList(arena.allocator(), input) orelse return error.NoCommand;
+    var reader = std.io.Reader.fixed(input);
+    var lex = lexer.Lexer.init(&reader);
+    var p = parser.Parser.init(arena.allocator(), &lex);
 
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = try exec.executeList(cmd_list);
+
+    // Execute commands one at a time using the iterator
+    var status: ExitStatus = .{ .exited = 0 };
+    while (try p.next()) |cmd| {
+        status = try exec.executeCommand(cmd);
+    }
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 

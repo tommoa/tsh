@@ -210,25 +210,35 @@ fn runAstDumpTest(input: []const u8) ![]u8 {
     errdefer writer.deinit();
 
     var reader = std.io.Reader.fixed(input);
-    var lexer = tsh.Lexer.init(&reader);
-    var parser = tsh.Parser.init(arena.allocator(), &lexer);
+    var lex = tsh.Lexer.init(&reader);
+    var parser = tsh.Parser.init(arena.allocator(), &lex);
 
-    const cmd_list = parser.parseCommandList() catch |err| {
-        if (parser.getErrorInfo()) |info| {
-            try writer.writer.print("[{d}:{d}] Error: {s} ({s})\n", .{
-                info.line,
-                info.column,
-                info.message,
-                @errorName(err),
-            });
+    var first = true;
+    while (true) {
+        const cmd = parser.next() catch |err| {
+            if (parser.getErrorInfo()) |info| {
+                try writer.writer.print("[{d}:{d}] Error: {s} ({s})\n", .{
+                    info.line,
+                    info.column,
+                    info.message,
+                    @errorName(err),
+                });
+            } else {
+                try writer.writer.print("Error: {s}\n", .{@errorName(err)});
+            }
+            return writer.toOwnedSlice();
+        };
+
+        if (cmd) |c| {
+            if (!first) try writer.writer.writeByte('\n');
+            first = false;
+            try c.format(&writer.writer);
         } else {
-            try writer.writer.print("Error: {s}\n", .{@errorName(err)});
+            break;
         }
-        return writer.toOwnedSlice();
-    };
+    }
 
-    if (cmd_list) |list| {
-        try list.format(&writer.writer);
+    if (!first) {
         try writer.writer.writeByte('\n');
     }
 

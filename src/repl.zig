@@ -140,7 +140,11 @@ const ExecuteResult = enum {
     exit_requested,
 };
 
-/// Parse and execute commands from the line.
+/// Parse and execute commands from the line using pull-based execution.
+///
+/// Commands are parsed and executed one at a time. If a parse error occurs,
+/// any commands that were already executed remain executed (POSIX-compliant
+/// behavior for sequential command lists).
 fn executeCommands(
     allocator: Allocator,
     state: *ShellState,
@@ -150,33 +154,39 @@ fn executeCommands(
     var line_reader = std.io.Reader.fixed(command_line);
     var lexer = Lexer.init(&line_reader);
     var parser = Parser.init(allocator, &lexer);
+    var exec = Executor.init(allocator, state);
 
-    const cmd_list = parser.parseCommandList() catch |err| {
-        if (parser.getErrorInfo()) |info| {
-            try stderr.print("tsh: [{d}:{d}] {s}\n", .{
-                info.line,
-                info.column,
-                info.message,
-            });
-        } else {
-            try stderr.print("tsh: parse error: {s}\n", .{@errorName(err)});
-        }
-        try stderr.flush();
-        state.last_status = .{ .exited = 1 };
-        return .ok;
-    };
-
-    if (cmd_list) |list| {
-        var exec = Executor.init(allocator, state);
-        state.last_status = exec.executeList(list) catch |err| switch (err) {
-            error.ExitRequested => return .exit_requested,
-            else => {
-                try stderr.print("tsh: execution error: {s}\n", .{@errorName(err)});
-                try stderr.flush();
-                state.last_status = .{ .exited = 1 };
-                return .ok;
-            },
+    // Pull and execute commands one at a time
+    while (true) {
+        const cmd = parser.next() catch |err| {
+            if (parser.getErrorInfo()) |info| {
+                try stderr.print("tsh: [{d}:{d}] {s}\n", .{
+                    info.line,
+                    info.column,
+                    info.message,
+                });
+            } else {
+                try stderr.print("tsh: parse error: {s}\n", .{@errorName(err)});
+            }
+            try stderr.flush();
+            state.last_status = .{ .exited = 1 };
+            return .ok;
         };
+
+        if (cmd) |c| {
+            state.last_status = exec.executeCommand(c) catch |err| switch (err) {
+                error.ExitRequested => return .exit_requested,
+                else => {
+                    try stderr.print("tsh: execution error: {s}\n", .{@errorName(err)});
+                    try stderr.flush();
+                    state.last_status = .{ .exited = 1 };
+                    return .ok;
+                },
+            };
+        } else {
+            // No more commands
+            break;
+        }
     }
 
     return .ok;
@@ -220,7 +230,10 @@ fn dumpTokens(
     }
 }
 
-/// Parse the line and dump AST to stdout.
+/// Parse the line and dump AST to stdout using pull-based parsing.
+///
+/// Commands are parsed and printed one at a time. If a parse error occurs,
+/// any commands that were already parsed are still printed.
 fn dumpAst(
     allocator: Allocator,
     command_line: []const u8,
@@ -231,22 +244,33 @@ fn dumpAst(
     var lexer = Lexer.init(&line_reader);
     var parser = Parser.init(allocator, &lexer);
 
-    const cmd_list = parser.parseCommandList() catch |err| {
-        if (parser.getErrorInfo()) |info| {
-            try stderr.print("tsh: [{d}:{d}] {s}\n", .{
-                info.line,
-                info.column,
-                info.message,
-            });
-        } else {
-            try stderr.print("tsh: parse error: {s}\n", .{@errorName(err)});
-        }
-        try stderr.flush();
-        return;
-    };
+    var first = true;
+    while (true) {
+        const cmd = parser.next() catch |err| {
+            if (parser.getErrorInfo()) |info| {
+                try stderr.print("tsh: [{d}:{d}] {s}\n", .{
+                    info.line,
+                    info.column,
+                    info.message,
+                });
+            } else {
+                try stderr.print("tsh: parse error: {s}\n", .{@errorName(err)});
+            }
+            try stderr.flush();
+            return;
+        };
 
-    if (cmd_list) |list| {
-        try list.format(stdout);
+        if (cmd) |c| {
+            if (!first) try stdout.writeByte('\n');
+            first = false;
+            try c.format(stdout);
+        } else {
+            // No more commands
+            break;
+        }
+    }
+
+    if (!first) {
         try stdout.writeByte('\n');
     }
 }
