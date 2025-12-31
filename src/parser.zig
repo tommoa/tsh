@@ -582,6 +582,14 @@ pub const Parser = struct {
                         self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
                         return ParseError.UnsupportedSyntax;
                     },
+                    .Pipe => {
+                        self.setError("syntax error near unexpected token `|'", tok.position, tok.line, tok.column);
+                        return ParseError.UnsupportedSyntax;
+                    },
+                    .DoublePipe => {
+                        self.setError("syntax error near unexpected token `||'", tok.position, tok.line, tok.column);
+                        return ParseError.UnsupportedSyntax;
+                    },
                     else => {
                         self.startWord(tok);
                         try self.addTokenToParts(tok);
@@ -618,6 +626,16 @@ pub const Parser = struct {
                     },
                     .RightParen => {
                         self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
+                        return ParseError.UnsupportedSyntax;
+                    },
+                    .Pipe => {
+                        // TODO: Pipeline support - for now, error
+                        self.setError("pipelines are not yet implemented", tok.position, tok.line, tok.column);
+                        return ParseError.UnsupportedSyntax;
+                    },
+                    .DoublePipe => {
+                        // TODO: OR list support - for now, error
+                        self.setError("OR lists (||) are not yet implemented", tok.position, tok.line, tok.column);
                         return ParseError.UnsupportedSyntax;
                     },
                     else => {
@@ -686,11 +704,12 @@ pub const Parser = struct {
                         self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
                         return ParseError.UnsupportedSyntax;
                     },
-                    .Newline, .Semicolon, .DoubleSemicolon => {
-                        // Unreachable: The lexer marks words complete when followed by separators.
-                        // Even on a buffer boundary, the lexer emits a complete empty Continuation
-                        // token before the separator, which transitions us to .word_complete first.
-                        // This invariant is verified by the buffer boundary tests in this file.
+                    .Newline, .Semicolon, .DoubleSemicolon, .Pipe, .DoublePipe => {
+                        // Unreachable: The lexer marks words complete when followed by separators
+                        // or operators. Even on a buffer boundary, the lexer emits a complete empty
+                        // Continuation token before the separator/operator, which transitions us to
+                        // .word_complete first. This invariant is verified by the buffer boundary
+                        // tests in this file.
                         unreachable;
                     },
                     else => {
@@ -965,6 +984,9 @@ pub const Parser = struct {
                 // Shouldn't happen during word collection - handled by state machine
             },
             .Newline, .Semicolon, .DoubleSemicolon => {
+                // Shouldn't happen during word collection - handled by state machine
+            },
+            .Pipe, .DoublePipe => {
                 // Shouldn't happen during word collection - handled by state machine
             },
         }

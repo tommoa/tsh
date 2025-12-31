@@ -97,6 +97,12 @@ pub const TokenType = union(enum) {
     Semicolon,
     /// Double semicolon `;;` - terminates a case clause in case/esac statements.
     DoubleSemicolon,
+    /// Pipe operator `|` - connects commands in a pipeline (Section 2.9.2).
+    /// Each command in a pipeline runs in a subshell environment.
+    Pipe,
+    /// Double pipe `||` - OR list operator (Section 2.9.3).
+    /// Executes second command only if first fails.
+    DoublePipe,
     /// Simple parameter expansion: $VAR, $1, $?, etc.
     /// Contains the name/symbol (no $ prefix).
     SimpleExpansion: []const u8,
@@ -157,6 +163,8 @@ pub const Token = struct {
             .Newline => try writer.writeAll("Newline"),
             .Semicolon => try writer.writeAll("Semicolon"),
             .DoubleSemicolon => try writer.writeAll("DoubleSemicolon"),
+            .Pipe => try writer.writeAll("Pipe"),
+            .DoublePipe => try writer.writeAll("DoublePipe"),
             .SimpleExpansion => |name| try writer.print("SimpleExpansion(\"{s}\")", .{name}),
             .BraceExpansionBegin => try writer.writeAll("BraceExpansionBegin"),
             .BraceExpansionEnd => try writer.writeAll("BraceExpansionEnd"),
@@ -1411,6 +1419,16 @@ pub const Lexer = struct {
                         }
                         break :state self.makeToken(.Semicolon, true);
                     },
+                    '|' => {
+                        _ = try self.consumeOne();
+                        const next = try self.peekByte();
+                        if (next == '|') {
+                            // || is OR list operator (Section 2.9.3)
+                            _ = try self.consumeOne();
+                            break :state self.makeToken(.DoublePipe, true);
+                        }
+                        break :state self.makeToken(.Pipe, true);
+                    },
                     '$' => {
                         // Parameter expansion - need to determine type
                         _ = try self.consumeOne();
@@ -1727,10 +1745,10 @@ test "nextToken: fd redirection at EOF emits incomplete token" {
 }
 
 test "nextToken: semicolon emits separator" {
-    // `;` emits Separator token, `|` and `&` are still consumed without token
+    // `;` emits Semicolon token, `|` emits Pipe, `&` is still consumed without token
     var reader = std.io.Reader.fixed("| ; & cmd");
     var lexer = Lexer.init(&reader);
-    try std.testing.expectEqual(null, try lexer.nextToken()); // | (unhandled)
+    try expectPipe(try lexer.nextToken()); // |
     try expectSeparator(try lexer.nextToken()); // ;
     try std.testing.expectEqual(null, try lexer.nextToken()); // & (unhandled)
     try expectLiteral(try lexer.nextToken(), "cmd");
@@ -1739,9 +1757,10 @@ test "nextToken: semicolon emits separator" {
 
 test "nextToken: metacharacter at end of input" {
     // Ensure we don't infinite loop on metachar at end
+    // `|` now emits Pipe token, `&` is still unhandled
     var reader = std.io.Reader.fixed("|");
     var lexer = Lexer.init(&reader);
-    try std.testing.expectEqual(null, try lexer.nextToken());
+    try expectPipe(try lexer.nextToken());
     try std.testing.expectEqual(null, try lexer.nextToken()); // Should hit EOF, not loop
 }
 
@@ -1777,6 +1796,99 @@ test "nextToken: command list with semicolons" {
     try expectLiteral(try lexer.nextToken(), "a");
     try expectSeparator(try lexer.nextToken());
     try expectLiteral(try lexer.nextToken(), "echo");
+    try expectLiteral(try lexer.nextToken(), "b");
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+// --- Pipe and Bang tests ---
+
+fn expectPipe(token: ?Token) !void {
+    const t = token orelse return error.ExpectedToken;
+    switch (t.type) {
+        .Pipe => {},
+        else => return error.ExpectedPipe,
+    }
+}
+
+test "nextToken: pipe operator" {
+    var reader = std.io.Reader.fixed("a | b");
+    var lexer = Lexer.init(&reader);
+    try expectLiteral(try lexer.nextToken(), "a");
+    try expectPipe(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "b");
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: pipe without spaces" {
+    var reader = std.io.Reader.fixed("a|b");
+    var lexer = Lexer.init(&reader);
+    try expectLiteral(try lexer.nextToken(), "a");
+    try expectPipe(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "b");
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: multiple pipes" {
+    var reader = std.io.Reader.fixed("a | b | c");
+    var lexer = Lexer.init(&reader);
+    try expectLiteral(try lexer.nextToken(), "a");
+    try expectPipe(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "b");
+    try expectPipe(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "c");
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+fn expectDoublePipe(token: ?Token) !void {
+    const t = token orelse return error.ExpectedToken;
+    switch (t.type) {
+        .DoublePipe => {},
+        else => return error.ExpectedDoublePipe,
+    }
+}
+
+test "nextToken: double pipe emits DoublePipe token" {
+    // || is the OR list operator (Section 2.9.3)
+    var reader = std.io.Reader.fixed("a || b");
+    var lexer = Lexer.init(&reader);
+    try expectLiteral(try lexer.nextToken(), "a");
+    try expectDoublePipe(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "b");
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: bang as standalone literal" {
+    // `!` is a reserved word handled by the parser, not the lexer.
+    // The lexer emits it as a regular literal.
+    var reader = std.io.Reader.fixed("! cmd");
+    var lexer = Lexer.init(&reader);
+    try expectLiteral(try lexer.nextToken(), "!");
+    try expectLiteral(try lexer.nextToken(), "cmd");
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: bang in word is part of literal" {
+    // `!cmd` should be a single literal, not Bang + literal
+    var reader = std.io.Reader.fixed("!cmd");
+    var lexer = Lexer.init(&reader);
+    try expectLiteral(try lexer.nextToken(), "!cmd");
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: bang at end of word" {
+    var reader = std.io.Reader.fixed("cmd!");
+    var lexer = Lexer.init(&reader);
+    try expectLiteral(try lexer.nextToken(), "cmd!");
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: bang with pipeline" {
+    // Parser will recognize `!` as negation based on position
+    var reader = std.io.Reader.fixed("! a | b");
+    var lexer = Lexer.init(&reader);
+    try expectLiteral(try lexer.nextToken(), "!");
+    try expectLiteral(try lexer.nextToken(), "a");
+    try expectPipe(try lexer.nextToken());
     try expectLiteral(try lexer.nextToken(), "b");
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -3028,6 +3140,8 @@ fn fuzzRandomBytes(_: void, input: []const u8) anyerror!void {
             .Newline => {},
             .Semicolon => {},
             .DoubleSemicolon => {},
+            .Pipe => {},
+            .DoublePipe => {},
             .SimpleExpansion => {},
             .BraceExpansionBegin => {},
             .BraceExpansionEnd => {},
