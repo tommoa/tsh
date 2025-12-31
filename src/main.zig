@@ -179,7 +179,7 @@ fn runTokenDumpTest(input: []const u8) ![]u8 {
 
         if (token) |tok| {
             switch (tok.type) {
-                .Separator => {
+                .Newline, .Semicolon => {
                     try writer.writer.writeByte('\n');
                 },
                 else => {

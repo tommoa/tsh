@@ -214,7 +214,7 @@ fn dumpTokens(
 
         if (token) |tok| {
             switch (tok.type) {
-                .Separator => {
+                .Newline, .Semicolon => {
                     // End of command in this line - print blank line
                     try stdout.writeByte('\n');
                 },

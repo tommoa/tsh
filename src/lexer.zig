@@ -85,8 +85,16 @@ pub const TokenType = union(enum) {
     /// TODO: When implementing arithmetic expansion, `))` needs special handling
     /// to close `$((...))` arithmetic expressions.
     RightParen,
-    /// Command separator - `;` or newline. Separates commands in a command list.
-    Separator,
+    /// Newline character - command separator, also serves as <newline> in the
+    /// POSIX grammar (Section 2.3). Unlike semicolon, newline is allowed after
+    /// `|` to continue a pipeline on the next line (Section 2.10.2).
+    /// TODO: Pipeline support not yet implemented.
+    Newline,
+    /// Semicolon `;` - sequential execution separator_op (Section 2.9.3).
+    /// Unlike newline, semicolon is NOT part of <linebreak> and cannot appear
+    /// after `|` in a pipeline (Section 2.10.2).
+    /// TODO: Pipeline support not yet implemented.
+    Semicolon,
     /// Double semicolon `;;` - terminates a case clause in case/esac statements.
     DoubleSemicolon,
     /// Simple parameter expansion: $VAR, $1, $?, etc.
@@ -146,7 +154,8 @@ pub const Token = struct {
             },
             .LeftParen => try writer.writeAll("LeftParen"),
             .RightParen => try writer.writeAll("RightParen"),
-            .Separator => try writer.writeAll("Separator"),
+            .Newline => try writer.writeAll("Newline"),
+            .Semicolon => try writer.writeAll("Semicolon"),
             .DoubleSemicolon => try writer.writeAll("DoubleSemicolon"),
             .SimpleExpansion => |name| try writer.print("SimpleExpansion(\"{s}\")", .{name}),
             .BraceExpansionBegin => try writer.writeAll("BraceExpansionBegin"),
@@ -1310,10 +1319,10 @@ pub const Lexer = struct {
 
                 const first = try self.peekByte() orelse break :state null;
 
-                // Handle newline - command separator
+                // Handle newline - command separator (POSIX <newline>)
                 if (first == '\n') {
                     _ = try self.consumeOne();
-                    break :state self.makeToken(.Separator, true);
+                    break :state self.makeToken(.Newline, true);
                 }
 
                 switch (first) {
@@ -1400,7 +1409,7 @@ pub const Lexer = struct {
                             _ = try self.consumeOne();
                             break :state self.makeToken(.DoubleSemicolon, true);
                         }
-                        break :state self.makeToken(.Separator, true);
+                        break :state self.makeToken(.Semicolon, true);
                     },
                     '$' => {
                         // Parameter expansion - need to determine type
@@ -1499,7 +1508,7 @@ fn expectRedirection(token: ?Token, expected_op: Redirection) !void {
 fn expectSeparator(token: ?Token) !void {
     const t = token orelse return error.ExpectedToken;
     switch (t.type) {
-        .Separator => {},
+        .Newline, .Semicolon => {},
         else => return error.ExpectedSeparator,
     }
 }
@@ -3016,7 +3025,8 @@ fn fuzzRandomBytes(_: void, input: []const u8) anyerror!void {
             .EscapedLiteral => {},
             .LeftParen => {},
             .RightParen => {},
-            .Separator => {},
+            .Newline => {},
+            .Semicolon => {},
             .DoubleSemicolon => {},
             .SimpleExpansion => {},
             .BraceExpansionBegin => {},

@@ -565,7 +565,7 @@ pub const Parser = struct {
                 };
 
                 switch (tok.type) {
-                    .Separator, .DoubleSemicolon => {
+                    .Newline, .Semicolon, .DoubleSemicolon => {
                         // Empty command (e.g., leading semicolon or blank line) - skip
                         // TODO: DoubleSemicolon (`;;`) will need special handling for case/esac
                         continue :state .start;
@@ -603,7 +603,7 @@ pub const Parser = struct {
                 };
 
                 switch (tok.type) {
-                    .Separator, .DoubleSemicolon => {
+                    .Newline, .Semicolon, .DoubleSemicolon => {
                         // Command is complete, separator consumed
                         // TODO: DoubleSemicolon (`;;`) will need special handling for case/esac
                         continue :state .done;
@@ -686,7 +686,7 @@ pub const Parser = struct {
                         self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
                         return ParseError.UnsupportedSyntax;
                     },
-                    .Separator, .DoubleSemicolon => {
+                    .Newline, .Semicolon, .DoubleSemicolon => {
                         // Unreachable: The lexer marks words complete when followed by separators.
                         // Even on a buffer boundary, the lexer emits a complete empty Continuation
                         // token before the separator, which transitions us to .word_complete first.
@@ -716,7 +716,7 @@ pub const Parser = struct {
                 };
 
                 switch (tok.type) {
-                    .Separator, .DoubleSemicolon => {
+                    .Newline, .Semicolon, .DoubleSemicolon => {
                         // Separator where redirection target was expected
                         const redir = self.pending_redir.?;
                         self.setError("missing redirection target", redir.position, redir.end_line, redir.end_column);
@@ -964,7 +964,7 @@ pub const Parser = struct {
             .LeftParen, .RightParen => {
                 // Shouldn't happen during word collection - handled by state machine
             },
-            .Separator, .DoubleSemicolon => {
+            .Newline, .Semicolon, .DoubleSemicolon => {
                 // Shouldn't happen during word collection - handled by state machine
             },
         }
