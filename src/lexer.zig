@@ -223,6 +223,8 @@ pub const ParseContext = enum {
     brace_hash_ambiguous,
     /// Saw ${## - need next char to disambiguate ${##} (length of #) vs ${###...} (# with ## modifier).
     brace_hash_double_ambiguous,
+    /// After emitting Literal "#" for ${##...}, need to emit the # modifier.
+    brace_emit_single_hash_modifier,
     /// After emitting Literal "#" for ${###...}, need to emit the ## modifier.
     brace_emit_double_hash_modifier,
     /// After length modifier, reading parameter name.
@@ -260,7 +262,9 @@ pub const Lexer = struct {
     token_start_line: usize,
     token_start_column: usize,
     /// Whether the previous token was incomplete and we're continuing it.
-    in_continuation: bool,
+    needs_continuation: bool,
+    /// Check whether the next thing is the end of a word.
+    check_end_of_word: bool,
     /// Current parsing context.
     parse_context: ParseContext,
     /// Context stack for nested constructs (${...}, quotes, etc.).
@@ -277,27 +281,38 @@ pub const Lexer = struct {
             .token_start_position = 0,
             .token_start_line = 1,
             .token_start_column = 1,
-            .in_continuation = false,
+            .needs_continuation = false,
+            .check_end_of_word = false,
             .parse_context = .none,
+            .context_stack = [_]ParseContext{.none} ** 32,
         };
     }
 
+    /// Swap the current context to a new context without pushing onto the stack.
+    fn swapContext(self: *Lexer, ctx: ParseContext) ParseContext {
+        self.parse_context = ctx;
+        self.context_stack[self.context_depth] = ctx;
+        return ctx;
+    }
+
     /// Push the current context onto the stack and switch to a new context.
-    fn pushContext(self: *Lexer, ctx: ParseContext) LexerError!void {
+    fn pushContext(self: *Lexer, ctx: ParseContext) LexerError!ParseContext {
         if (self.context_depth >= self.context_stack.len) return LexerError.NestingTooDeep;
         self.context_stack[self.context_depth] = self.parse_context;
         self.context_depth += 1;
         self.parse_context = ctx;
+        return ctx;
     }
 
     /// Pop the context stack and restore the previous context.
-    fn popContext(self: *Lexer) void {
+    fn popContext(self: *Lexer) ParseContext {
         if (self.context_depth > 0) {
             self.context_depth -= 1;
             self.parse_context = self.context_stack[self.context_depth];
         } else {
             self.parse_context = .none;
         }
+        return self.parse_context;
     }
 
     /// Valid first char for parameter name: [A-Za-z_]
@@ -397,44 +412,11 @@ pub const Lexer = struct {
     /// The parser is responsible for determining if the preceding word is a
     /// valid fd number or should be treated as a regular argument.
     fn isWordComplete(self: *Lexer, c: ?u8) bool {
-        const char = c orelse return true; // EOF is always a boundary
-
-        return switch (self.parse_context) {
-            .none, .none_escape, .dollar, .simple_expansion => switch (char) {
-                // Whitespace and metacharacters end words
-                // Quotes and backslash do NOT end words - they continue the word
-                // Note: < and > do NOT end words - see comment above
-                ' ', '\t', '\n', '|', ';', '&', '(', ')' => true,
-                else => false,
-            },
-            .double_quote, .double_quote_escape => switch (char) {
-                // Inside double quotes, these characters end the current literal segment
-                // but " ends the quote context entirely
-                '"', '$', '`', '\\' => true,
-                else => false,
-            },
-            .single_quote => char == '\'',
-            .brace_expansion_start,
-            .brace_hash_ambiguous,
-            .brace_hash_double_ambiguous,
-            .brace_emit_double_hash_modifier,
-            .brace_expansion_after_length,
-            .brace_expansion,
-            .brace_expansion_colon,
-            .brace_expansion_hash,
-            .brace_expansion_percent,
-            .brace_expansion_escape,
-            => switch (char) {
-                // Inside brace expansion (modifier position), these characters have special meaning
-                '}', ':', '$', '\\', '"', '\'' => true,
-                else => false,
-            },
-            .brace_expansion_word => switch (char) {
-                // Inside brace expansion word (after modifier), only structural chars are special
-                // :, #, %, -, +, =, ? are NOT special here - they're literal content
-                '}', '$', '\\', '"', '\'' => true,
-                else => false,
-            },
+        if (self.context_depth > 0) return false;
+        const char = c orelse return true;
+        return switch (char) {
+            ' ', '\t', '\n', '|', ';', '&', '(', ')' => true,
+            else => false,
         };
     }
 
@@ -516,49 +498,9 @@ pub const Lexer = struct {
         return self.readWhile(isPlainCharacter);
     }
 
-    /// Read the content of a single-quoted string (everything until closing ').
-    /// The opening quote should already be consumed.
-    /// Returns the content (without quotes) and whether it's complete.
-    /// If complete, the closing quote is also consumed.
-    /// Returns null on EOF (unterminated quote should be handled by caller).
-    fn readSingleQuoted(self: *Lexer) LexerError!?ReadResult {
-        // Check if we're immediately at a closing quote (empty string case)
-        const first = try self.peekByte() orelse return null;
-        if (first == '\'') {
-            _ = try self.consumeOne();
-            return .{ .slice = "", .complete = true };
-        }
-
-        // Read until closing quote
-        const result = try self.readUntil("'") orelse return null;
-
-        if (result.complete) {
-            // Found closing quote - consume it
-            _ = try self.consumeOne();
-            return .{ .slice = result.slice, .complete = true };
-        }
-
-        // No closing quote found - check if this is EOF or buffer limit
-        const more = self.reader.peek(1) catch |err| switch (err) {
-            error.EndOfStream => {
-                // EOF - return content as incomplete, next call will error
-                return .{ .slice = result.slice, .complete = false };
-            },
-            else => return LexerError.UnexpectedEndOfFile,
-        };
-
-        if (more.len == 0) {
-            return .{ .slice = result.slice, .complete = false };
-        }
-
-        // More data available - continuation
-        return .{ .slice = result.slice, .complete = false };
-    }
-
     /// Create a token from the current state.
-    /// Also updates in_continuation flag based on whether the token is complete.
     inline fn makeToken(self: *Lexer, token_type: TokenType, complete: bool) Token {
-        self.in_continuation = !complete;
+        self.check_end_of_word = !complete;
         return Token{
             .position = self.token_start_position,
             .end_position = self.position,
@@ -600,22 +542,49 @@ pub const Lexer = struct {
 
         return state: switch (self.parse_context) {
             .single_quote => {
-                // Inside single quotes - we're continuing from a previous incomplete token
-                // All tokens from here should be Continuation
-                const result = try self.readSingleQuoted() orelse {
+                // Inside single quotes.
+                const readSingleQuoted = struct {
+                    fn f(lexer: *Lexer) LexerError!?ReadResult {
+                        // Check if we're immediately at a closing quote (empty string case)
+                        const first = try lexer.peekByte() orelse return null;
+                        if (first == '\'') {
+                            _ = try lexer.consumeOne();
+                            return .{ .slice = "", .complete = true };
+                        }
+                        // Read until closing quote
+                        const result = try lexer.readUntil("'") orelse return null;
+
+                        if (result.complete) {
+                            // Found closing quote - consume it
+                            _ = try lexer.consumeOne();
+                            return .{ .slice = result.slice, .complete = true };
+                        } else {
+                            // More data available - continuation
+                            return .{ .slice = result.slice, .complete = false };
+                        }
+                    }
+                }.f;
+                const result = try readSingleQuoted(self) orelse {
                     // EOF inside single quote
                     return LexerError.UnterminatedQuote;
                 };
+                const token_type: TokenType = if (self.needs_continuation)
+                    .{ .Continuation = result.slice }
+                else
+                    .{ .SingleQuoted = result.slice };
+
+                // We don't know if the word continues after this quotation mark
+                // as it could be at a buffer boundary and cause any further
+                // reads to invalidate the buffer.
                 if (result.complete) {
                     // Found closing quote - done with single-quoted string
-                    self.parse_context = .none;
-                    // Check if word continues after closing quote
-                    const next = try self.peekByte();
-                    const at_boundary = self.isWordComplete(next);
-                    break :state self.makeToken(.{ .Continuation = result.slice }, at_boundary);
+                    _ = self.popContext();
+                    const token = self.makeToken(token_type, false);
+                    break :state token;
                 } else {
-                    // Buffer full, need more continuations
-                    break :state self.makeToken(.{ .Continuation = result.slice }, false);
+                    // Buffer full, need continuations
+                    self.needs_continuation = true;
+                    break :state self.makeToken(token_type, false);
                 }
             },
             .double_quote => {
@@ -629,94 +598,68 @@ pub const Lexer = struct {
                     '"' => {
                         // End of double quote
                         _ = try self.consumeOne();
-                        self.popContext();
-                        // Check if word continues after closing quote
-                        const next = try self.peekByte();
-                        const at_boundary = self.isWordComplete(next);
+                        _ = self.popContext();
+                        // NOTE: This is safe because we don't emit a buffer here.
+                        const after = try self.peekByte();
+                        const at_boundary = self.isWordComplete(after);
+                        self.needs_continuation = false;
                         break :state self.makeToken(.DoubleQuoteEnd, at_boundary);
                     },
                     '\\' => {
-                        // Escape sequence - try to peek at both backslash and next char
-                        const buf = self.reader.peekGreedy(2) catch |err| switch (err) {
-                            error.EndOfStream => return LexerError.UnterminatedQuote,
-                            else => return LexerError.UnexpectedEndOfFile,
-                        };
-                        if (buf.len < 2) {
-                            // Buffer boundary - can't see next char yet.
-                            // Consume backslash and transition to escape state.
-                            self.consume(buf[0..1]);
-                            self.parse_context = .double_quote_escape;
-                            // Intra-call transition: continue processing in escape state
-                            continue :state .double_quote_escape;
-                        }
-                        // POSIX: only \$, \`, \", \\, and \newline are special in double quotes
-                        // Other backslashes are literal (e.g., \n becomes \ and n)
-                        const escaped_char = buf[1];
-                        if (escaped_char == '$' or escaped_char == '`' or
-                            escaped_char == '"' or escaped_char == '\\' or
-                            escaped_char == '\n')
-                        {
-                            // Special escape - consume both, return the escaped char
-                            const escaped_slice = buf[1..2];
-                            self.consume(buf[0..2]);
-                            break :state self.makeToken(.{ .EscapedLiteral = escaped_slice }, false);
-                        } else {
-                            // Not a special escape - backslash is literal
-                            // Consume just the backslash, next char handled in next iteration
-                            // Note: This is a regular Literal because the backslash is literal content.
-                            self.consume(buf[0..1]);
-                            break :state self.makeToken(.{ .Literal = buf[0..1] }, false);
-                        }
+                        // Escape sequence. Pass onto the `double_quote_escape` sub-state.
+                        // NOTE: Sub-states do not require pushing onto the stack.
+                        _ = try self.consumeOne();
+                        continue :state self.swapContext(.double_quote_escape);
                     },
                     '$' => {
                         // Parameter expansion inside double quotes
                         _ = try self.consumeOne();
-                        continue :state .dollar;
+                        continue :state try self.pushContext(.dollar);
                     },
                     '`' => {
                         // TODO: Command substitution - for now, treat as literal
-                        const buf = self.reader.peek(1) catch |err| switch (err) {
-                            error.EndOfStream => return LexerError.UnterminatedQuote,
-                            else => return LexerError.UnexpectedEndOfFile,
-                        };
-                        self.consume(buf);
+                        _ = try self.consumeOne();
                         // complete=false: still inside double quotes, more content follows
-                        break :state self.makeToken(.{ .Literal = buf }, false);
+                        break :state self.makeToken(.{ .Literal = &.{first} }, false);
                     },
                     else => {
                         // Regular literal content - read until special char
                         const result = try self.readUntil("\"$`\\") orelse {
                             return LexerError.UnterminatedQuote;
                         };
+                        const token_type: TokenType = if (self.needs_continuation)
+                            .{ .Continuation = result.slice }
+                        else
+                            .{ .Literal = result.slice };
                         // complete=false: still inside double quotes
-                        break :state self.makeToken(.{ .Literal = result.slice }, false);
+                        self.needs_continuation = !result.complete;
+                        break :state self.makeToken(token_type, false);
                     },
                 }
             },
             .double_quote_escape => {
-                // We saw a backslash inside double quotes on the previous call.
+                // We saw a backslash inside double quotes.
                 // The backslash was consumed but not emitted.
                 // Now we can see the next character and determine the escape behavior.
                 const next = try self.peekByte() orelse {
                     return LexerError.UnterminatedQuote;
                 };
 
+                // NOTE: We will only need a continuation after this if we eventually support
+                // multi-char escape sequences.
+                self.needs_continuation = false;
                 // POSIX: only \$, \`, \", \\, and \newline are special in double quotes
                 if (next == '$' or next == '`' or next == '"' or next == '\\' or next == '\n') {
                     // Special escape - consume and return the escaped char
-                    const buf = self.reader.peek(1) catch |err| switch (err) {
-                        error.EndOfStream => return LexerError.UnterminatedQuote,
-                        else => return LexerError.UnexpectedEndOfFile,
-                    };
-                    self.consume(buf);
-                    self.parse_context = .double_quote;
-                    break :state self.makeToken(.{ .EscapedLiteral = buf }, false);
+                    _ = try self.consumeOne();
+                    _ = self.swapContext(.double_quote);
+                    break :state self.makeToken(.{ .EscapedLiteral = &.{next} }, false);
                 } else {
                     // Not a special escape - the backslash we consumed was literal.
                     // Emit a backslash literal using a static string slice.
                     // Note: This is a regular Literal, not EscapedLiteral, because the
                     // backslash itself is literal content (not an escape sequence result).
-                    self.parse_context = .double_quote;
+                    _ = self.swapContext(.double_quote);
                     break :state self.makeToken(.{ .Literal = "\\" }, false);
                 }
             },
@@ -725,105 +668,91 @@ pub const Lexer = struct {
                 // Backslash escapes the next character (makes it literal).
                 const next = try self.peekByte() orelse {
                     // EOF after backslash outside quotes - backslash is discarded per POSIX
-                    self.parse_context = .none;
+                    _ = self.swapContext(.none);
                     break :state null;
                 };
 
                 if (next == '\n') {
                     // Line continuation - backslash-newline is removed entirely
                     _ = try self.consumeOne();
-                    self.parse_context = .none;
                     // Intra-call transition: continue processing on the next line
-                    continue :state .none;
+                    continue :state self.swapContext(.none);
                 }
 
                 // Consume the escaped character and return it as an escaped literal
-                const buf = self.reader.peek(1) catch |err| switch (err) {
-                    error.EndOfStream => {
-                        self.parse_context = .none;
-                        break :state null;
-                    },
-                    else => return LexerError.UnexpectedEndOfFile,
-                };
-                self.consume(buf);
-                self.parse_context = .none;
-                // Check if word continues after this escaped char
-                const after = try self.peekByte();
-                const at_boundary = self.isWordComplete(after);
-                break :state self.makeToken(.{ .EscapedLiteral = buf }, at_boundary);
+                _ = try self.consumeOne();
+                _ = self.swapContext(.none);
+                break :state self.makeToken(.{ .EscapedLiteral = &.{next} }, false);
             },
             .dollar => {
-                // We saw $ - determine what kind of expansion this is
+                // We saw $ - determine what kind of expansion this is.
+                // NOTE: This is a transitional state. You MUST push this state to
+                // the context stack, or the logic will fail when it attempts to go
+                // back to the previous state.
                 const next = try self.peekByte() orelse {
                     // $ at EOF - treat as literal
+                    _ = self.popContext();
                     break :state self.makeToken(.{ .Literal = "$" }, true);
                 };
 
+                self.needs_continuation = false;
                 if (next == '{') {
                     // Braced expansion: ${...}
                     _ = try self.consumeOne();
-                    try self.pushContext(.brace_expansion_start);
+                    _ = self.swapContext(.brace_expansion_start);
                     break :state self.makeToken(.BraceExpansionBegin, false);
                 } else if (isSpecialParam(next)) {
+                    // NOTE: We don't need continuations after this, because
+                    // special parameters are always 1-byte names.
                     // Special parameter: $@, $*, $#, $?, $-, $$, $!, $0-$9
-                    const buf = self.reader.peek(1) catch |err| switch (err) {
-                        error.EndOfStream => break :state self.makeToken(.{ .Literal = "$" }, true),
-                        else => return LexerError.UnexpectedEndOfFile,
-                    };
-                    self.consume(buf);
-                    // Check if word continues. If we're inside double quotes, the closing
-                    // quote ends the quoted region but not the word, so don't mark complete.
-                    const after = try self.peekByte();
-                    const at_boundary = if (self.parse_context == .double_quote)
-                        false
-                    else
-                        self.isWordComplete(after);
-                    break :state self.makeToken(.{ .SimpleExpansion = buf }, at_boundary);
+                    _ = try self.consumeOne();
+                    _ = self.popContext();
+                    break :state self.makeToken(.{ .SimpleExpansion = &.{next} }, false);
                 } else if (isParamStartChar(next)) {
-                    // Variable name: $VAR
-                    const result = try self.readWhile(isParamChar) orelse {
-                        // Shouldn't happen since we peeked a valid char
-                        break :state self.makeToken(.{ .Literal = "$" }, true);
-                    };
-                    // Check if word continues. If we're inside double quotes, the closing
-                    // quote ends the quoted region but not the word, so don't mark complete.
-                    const after = try self.peekByte();
-                    const at_boundary = if (self.parse_context == .double_quote)
-                        false
-                    else
-                        self.isWordComplete(after);
-                    break :state self.makeToken(.{ .SimpleExpansion = result.slice }, at_boundary);
+                    // This is a simple expansion. Hop over to that branch.
+                    continue :state self.swapContext(.simple_expansion);
                 } else {
                     // $ followed by invalid char - $ is literal
+                    _ = self.popContext();
+                    self.needs_continuation = true; // We need continuation to join the Literal.
                     break :state self.makeToken(.{ .Literal = "$" }, false);
                 }
             },
             .simple_expansion => {
-                // Continuing to read a simple expansion name after buffer boundary
                 // The $ was consumed, we're reading the rest of the name
                 const next = try self.peekByte() orelse {
-                    // EOF - emit what we have
-                    self.parse_context = .none;
-                    break :state null;
+                    // EOF - pop out of this context to continue handling.
+                    continue :state self.popContext();
                 };
 
                 if (isParamChar(next)) {
                     const result = try self.readWhile(isParamChar) orelse {
-                        self.parse_context = .none;
+                        _ = self.popContext();
                         break :state null;
                     };
-                    self.parse_context = .none;
-                    const after = try self.peekByte();
-                    const at_boundary = self.isWordComplete(after);
-                    break :state self.makeToken(.{ .Continuation = result.slice }, at_boundary);
+                    const token_type: TokenType = if (self.needs_continuation)
+                        .{ .Continuation = result.slice }
+                    else
+                        .{ .SimpleExpansion = result.slice };
+                    if (result.complete) {
+                        _ = self.popContext();
+                        self.needs_continuation = false;
+                        break :state self.makeToken(token_type, false);
+                    } else {
+                        // We still have more to read.
+                        self.needs_continuation = true;
+                        break :state self.makeToken(token_type, false);
+                    }
                 } else {
                     // No more param chars
-                    self.parse_context = .none;
+                    _ = self.popContext();
                     const at_boundary = self.isWordComplete(next);
+                    self.needs_continuation = false;
                     break :state self.makeToken(.{ .Continuation = "" }, at_boundary);
                 }
             },
             .brace_expansion_start => {
+                std.debug.assert(!self.needs_continuation);
                 // Just entered ${...}, first char has special handling for #
                 const first = try self.peekByte() orelse {
                     return LexerError.UnterminatedBraceExpansion;
@@ -831,96 +760,45 @@ pub const Lexer = struct {
 
                 if (first == '}') {
                     // Empty ${} - emit end, parser will error
+                    _ = self.popContext();
                     _ = try self.consumeOne();
-                    self.popContext();
+                    // NOTE: This is safe because we don't emit a buffer here.
                     const after = try self.peekByte();
                     const at_boundary = self.isWordComplete(after);
                     break :state self.makeToken(.BraceExpansionEnd, at_boundary);
                 } else if (first == '#') {
-                    // Could be length operator or param #
-                    // Need to peek next char to disambiguate
-                    const buf = self.reader.peekGreedy(2) catch |err| switch (err) {
-                        error.EndOfStream => return LexerError.UnterminatedBraceExpansion,
-                        else => return LexerError.UnexpectedEndOfFile,
-                    };
-                    if (buf.len < 2) {
-                        // Buffer boundary - consume # and defer decision
-                        self.consume(buf[0..1]);
-                        self.parse_context = .brace_hash_ambiguous;
-                        continue :state .brace_hash_ambiguous;
-                    }
-
-                    const second = buf[1];
-                    if (second == '}') {
-                        // ${#} - # is the parameter (value of $#)
-                        self.consume(buf[0..1]);
-                        self.parse_context = .brace_expansion;
-                        break :state self.makeToken(.{ .Literal = "#" }, false);
-                    } else if (second == '#') {
-                        // ${## - could be ${##} (length of #) or ${###...} (# with ## modifier)
-                        // Need third char to disambiguate
-                        self.consume(buf[0..1]); // consume first #
-                        self.parse_context = .brace_hash_ambiguous;
-                        continue :state .brace_hash_ambiguous;
-                    } else if (isSpecialParam(second) or isParamStartChar(second)) {
-                        // ${#name} - first # is length operator (but not ${##})
-                        self.consume(buf[0..1]);
-                        self.parse_context = .brace_expansion_after_length;
-                        break :state self.makeToken(.{ .Modifier = .{ .op = .Length, .check_null = false } }, false);
-                    } else {
-                        // ${#<modifier>} - # is the parameter
-                        self.consume(buf[0..1]);
-                        self.parse_context = .brace_expansion;
-                        break :state self.makeToken(.{ .Literal = "#" }, false);
-                    }
-                } else if (first >= '0' and first <= '9') {
+                    // Could be length operator or param #, and requires one
+                    // more peek to disambiguate.
+                    _ = try self.consumeOne();
+                    continue :state self.swapContext(.brace_hash_ambiguous);
+                } else if (std.ascii.isDigit(first)) {
                     // Positional parameter - in braces, can be multi-digit (${10}, ${123}, etc.)
                     // Check digits BEFORE isSpecialParam since digits are special params outside braces
                     // but multi-digit inside braces.
                     const result = try self.readWhile(std.ascii.isDigit) orelse {
                         return LexerError.UnterminatedBraceExpansion;
                     };
-                    self.parse_context = .brace_expansion;
+                    _ = self.swapContext(.brace_expansion);
+                    self.needs_continuation = !result.complete;
                     break :state self.makeToken(.{ .Literal = result.slice }, false);
                 } else if (isSpecialParam(first)) {
                     // Special param: ${?}, ${@}, etc. (but not digits - handled above)
-                    const buf = self.reader.peek(1) catch |err| switch (err) {
-                        error.EndOfStream => return LexerError.UnterminatedBraceExpansion,
-                        else => return LexerError.UnexpectedEndOfFile,
-                    };
-                    self.consume(buf);
-                    self.parse_context = .brace_expansion;
-                    break :state self.makeToken(.{ .Literal = buf }, false);
-                } else if (isParamStartChar(first)) {
-                    // Variable name
-                    const result = try self.readWhile(isParamChar) orelse {
-                        return LexerError.UnterminatedBraceExpansion;
-                    };
-                    self.parse_context = .brace_expansion;
-                    break :state self.makeToken(.{ .Literal = result.slice }, false);
-                } else if (first >= '0' and first <= '9') {
-                    // Positional parameter - in braces, can be multi-digit (${10}, ${123}, etc.)
-                    // Check digits BEFORE isSpecialParam since digits are special params outside braces
-                    // but multi-digit inside braces.
-                    const result = try self.readWhile(std.ascii.isDigit) orelse {
-                        return LexerError.UnterminatedBraceExpansion;
-                    };
-                    self.parse_context = .brace_expansion;
-                    break :state self.makeToken(.{ .Literal = result.slice }, false);
+                    _ = try self.consumeOne();
+                    _ = self.swapContext(.brace_expansion);
+                    break :state self.makeToken(.{ .Literal = &.{first} }, false);
                 } else if (first == ':') {
                     // Modifier without parameter name (e.g., ${:-foo}) - let brace_expansion_colon handle it
                     _ = try self.consumeOne();
-                    self.parse_context = .brace_expansion_colon;
-                    continue :state .brace_expansion_colon;
+                    continue :state self.swapContext(.brace_expansion_colon);
+                } else if (isParamStartChar(first)) {
+                    // This is the start of a parameter. We can swap directly to that logic.
+                    continue :state self.swapContext(.brace_expansion);
                 } else {
-                    // Invalid char after ${ - emit as literal, parser will handle
-                    const buf = self.reader.peek(1) catch |err| switch (err) {
-                        error.EndOfStream => return LexerError.UnterminatedBraceExpansion,
-                        else => return LexerError.UnexpectedEndOfFile,
-                    };
-                    self.consume(buf);
-                    self.parse_context = .brace_expansion;
-                    break :state self.makeToken(.{ .Literal = buf }, false);
+                    // This is an invalid character to start a variable expansion.
+                    // Send the character as a literal and let the parser deal with it.
+                    _ = self.swapContext(.brace_expansion);
+                    _ = try self.consumeOne();
+                    break :state self.makeToken(.{ .Literal = &.{first} }, false);
                 }
             },
             .brace_hash_ambiguous => {
@@ -931,7 +809,7 @@ pub const Lexer = struct {
 
                 if (next == '}') {
                     // ${#} - the # was the parameter (value of $#)
-                    self.parse_context = .brace_expansion;
+                    _ = self.swapContext(.brace_expansion);
                     break :state self.makeToken(.{ .Literal = "#" }, false);
                 } else if (next == '#') {
                     // ${## - could be:
@@ -939,15 +817,14 @@ pub const Lexer = struct {
                     // - ${###...} → $# with ## modifier
                     // Need to peek one more char to decide
                     _ = try self.consumeOne(); // consume second #
-                    self.parse_context = .brace_hash_double_ambiguous;
-                    continue :state .brace_hash_double_ambiguous;
+                    continue :state self.swapContext(.brace_hash_double_ambiguous);
                 } else if (isSpecialParam(next) or isParamStartChar(next)) {
                     // ${#name} - the # was length operator
-                    self.parse_context = .brace_expansion_after_length;
+                    _ = self.swapContext(.brace_expansion_after_length);
                     break :state self.makeToken(.{ .Modifier = .{ .op = .Length, .check_null = false } }, false);
                 } else {
                     // ${#<modifier>} - the # was parameter (e.g., ${#%...})
-                    self.parse_context = .brace_expansion;
+                    _ = self.swapContext(.brace_expansion);
                     break :state self.makeToken(.{ .Literal = "#" }, false);
                 }
             },
@@ -963,31 +840,34 @@ pub const Lexer = struct {
                 if (next == '}') {
                     // ${##} - this is ${#<length op>#<param>}
                     // First # was length operator, second # is parameter name
-                    self.parse_context = .brace_expansion_after_length;
+                    _ = self.swapContext(.brace_expansion_after_length);
                     break :state self.makeToken(.{ .Modifier = .{ .op = .Length, .check_null = false } }, false);
                 } else if (next == '#') {
                     // ${###...} - this is ${#<param>##<modifier>}
                     // First # was the parameter name, positions 2-3 are the ## modifier
                     // Consume the third # (part of ## modifier) and emit Literal "#" for param
                     _ = try self.consumeOne();
-                    self.parse_context = .brace_emit_double_hash_modifier;
+                    _ = self.swapContext(.brace_emit_double_hash_modifier);
                     break :state self.makeToken(.{ .Literal = "#" }, false);
                 } else {
-                    // ${##X...} where X is not # or } - this is invalid or edge case
-                    // Treat first # as length op, second # as param name, X is part of modifier
-                    // Actually: ${##foo} is length of "foo"? No, that would be ${#foo}.
-                    // ${##foo} with ## as modifier of what? There's no param before ##.
-                    // This is actually invalid syntax. But let's handle it gracefully.
-                    // Treat as: # is length op, # is param, rest is modifier
-                    self.parse_context = .brace_expansion_after_length;
-                    break :state self.makeToken(.{ .Modifier = .{ .op = .Length, .check_null = false } }, false);
+                    // ${##X...} where X is not # or } - this is ${#<param>#<modifier>}
+                    // First # was the parameter name, position 2 is the # modifier
+                    _ = self.swapContext(.brace_emit_single_hash_modifier);
+                    break :state self.makeToken(.{ .Literal = "#" }, false);
                 }
+            },
+            .brace_emit_single_hash_modifier => {
+                // We already determined this is ${##...} and emitted Literal "#".
+                // Now emit the # (RemoveSmallestPrefix) modifier.
+                // Both of the # chars were consumed in brace_hash_double_ambiguous.
+                _ = self.swapContext(.brace_expansion_word);
+                break :state self.makeToken(.{ .Modifier = .{ .op = .RemoveSmallestPrefix, .check_null = false } }, false);
             },
             .brace_emit_double_hash_modifier => {
                 // We already determined this is ${###...} and emitted Literal "#".
                 // Now emit the ## (RemoveLargestPrefix) modifier.
                 // The two # chars were already consumed in brace_hash_double_ambiguous.
-                self.parse_context = .brace_expansion_word;
+                _ = self.swapContext(.brace_expansion_word);
                 break :state self.makeToken(.{ .Modifier = .{ .op = .RemoveLargestPrefix, .check_null = false } }, false);
             },
             .brace_expansion_after_length => {
@@ -999,31 +879,32 @@ pub const Lexer = struct {
                 if (first == '}') {
                     // ${##} case - we already consumed both #s, second # was the param
                     // Emit Literal "#" for the param name
-                    self.parse_context = .brace_expansion;
+                    _ = self.swapContext(.brace_expansion);
                     break :state self.makeToken(.{ .Literal = "#" }, false);
                 } else if (isSpecialParam(first)) {
                     _ = try self.consumeOne();
-                    self.parse_context = .brace_expansion;
+                    _ = self.swapContext(.brace_expansion);
                     break :state self.makeToken(.{ .Literal = &.{first} }, false);
                 } else if (isParamStartChar(first)) {
                     const result = try self.readWhile(isParamChar) orelse {
                         return LexerError.UnterminatedBraceExpansion;
                     };
-                    self.parse_context = .brace_expansion;
+                    _ = self.swapContext(.brace_expansion);
                     break :state self.makeToken(.{ .Literal = result.slice }, false);
                 } else if (first >= '0' and first <= '9') {
                     // Positional parameter after length (e.g., ${#10})
                     const result = try self.readWhile(std.ascii.isDigit) orelse {
                         return LexerError.UnterminatedBraceExpansion;
                     };
-                    self.parse_context = .brace_expansion;
+                    _ = self.swapContext(.brace_expansion);
                     break :state self.makeToken(.{ .Literal = result.slice }, false);
                 } else {
                     return LexerError.InvalidModifier;
                 }
             },
             .brace_expansion => {
-                // Inside ${...} after parameter name, expecting modifier or }
+                // Inside ${...} after first character. Expecting either a continuation of
+                // the parameter name, the start of a modifier, or '}'.
                 const first = try self.peekByte() orelse {
                     return LexerError.UnterminatedBraceExpansion;
                 };
@@ -1031,81 +912,87 @@ pub const Lexer = struct {
                 switch (first) {
                     '}' => {
                         _ = try self.consumeOne();
-                        self.popContext();
+                        _ = self.popContext();
+                        // NOTE: This is safe because we aren't emitting a reference to the buffer.
                         const after = try self.peekByte();
                         const at_boundary = self.isWordComplete(after);
+                        self.needs_continuation = false;
                         break :state self.makeToken(.BraceExpansionEnd, at_boundary);
                     },
                     ':' => {
                         _ = try self.consumeOne();
-                        self.parse_context = .brace_expansion_colon;
-                        continue :state .brace_expansion_colon;
+                        self.needs_continuation = false;
+                        continue :state self.swapContext(.brace_expansion_colon);
                     },
                     '-' => {
                         _ = try self.consumeOne();
-                        self.parse_context = .brace_expansion_word;
+                        self.needs_continuation = false;
+                        _ = self.swapContext(.brace_expansion_word);
                         break :state self.makeToken(.{ .Modifier = .{ .op = .UseDefault, .check_null = false } }, false);
                     },
                     '=' => {
                         _ = try self.consumeOne();
-                        self.parse_context = .brace_expansion_word;
+                        self.needs_continuation = false;
+                        _ = self.swapContext(.brace_expansion_word);
                         break :state self.makeToken(.{ .Modifier = .{ .op = .AssignDefault, .check_null = false } }, false);
                     },
                     '?' => {
                         _ = try self.consumeOne();
-                        self.parse_context = .brace_expansion_word;
+                        self.needs_continuation = false;
+                        _ = self.swapContext(.brace_expansion_word);
                         break :state self.makeToken(.{ .Modifier = .{ .op = .ErrorIfUnset, .check_null = false } }, false);
                     },
                     '+' => {
                         _ = try self.consumeOne();
-                        self.parse_context = .brace_expansion_word;
+                        self.needs_continuation = false;
+                        _ = self.swapContext(.brace_expansion_word);
                         break :state self.makeToken(.{ .Modifier = .{ .op = .UseAlternative, .check_null = false } }, false);
                     },
                     '#' => {
                         _ = try self.consumeOne();
-                        self.parse_context = .brace_expansion_hash;
-                        continue :state .brace_expansion_hash;
+                        self.needs_continuation = false;
+                        continue :state self.swapContext(.brace_expansion_hash);
                     },
                     '%' => {
                         _ = try self.consumeOne();
-                        self.parse_context = .brace_expansion_percent;
-                        continue :state .brace_expansion_percent;
+                        self.needs_continuation = false;
+                        continue :state self.swapContext(.brace_expansion_percent);
                     },
                     '$' => {
                         // Nested expansion in word
                         _ = try self.consumeOne();
-                        continue :state .dollar;
+                        self.needs_continuation = false;
+                        continue :state try self.pushContext(.dollar);
                     },
                     '\\' => {
                         _ = try self.consumeOne();
-                        self.parse_context = .brace_expansion_escape;
-                        continue :state .brace_expansion_escape;
+                        self.needs_continuation = false;
+                        continue :state try self.pushContext(.brace_expansion_escape);
                     },
                     '\'' => {
                         // Single quote inside ${...}
                         _ = try self.consumeOne();
-                        const result = try self.readSingleQuoted() orelse {
-                            return LexerError.UnterminatedBraceExpansion;
-                        };
-                        if (result.complete) {
-                            break :state self.makeToken(.{ .SingleQuoted = result.slice }, false);
-                        } else {
-                            try self.pushContext(.single_quote);
-                            break :state self.makeToken(.{ .SingleQuoted = result.slice }, false);
-                        }
+                        self.needs_continuation = false;
+                        continue :state try self.pushContext(.single_quote);
                     },
                     '"' => {
                         // Double quote inside ${...}
                         _ = try self.consumeOne();
-                        try self.pushContext(.double_quote);
+                        self.needs_continuation = false;
+                        _ = try self.pushContext(.double_quote);
                         break :state self.makeToken(.DoubleQuoteBegin, false);
                     },
                     else => {
                         // Read word content until special char
-                        const result = try self.readUntil("}:$\\\"'") orelse {
+                        const result = try self.readUntil("}:$\\\"'#%+?=-") orelse {
                             return LexerError.UnterminatedBraceExpansion;
                         };
-                        break :state self.makeToken(.{ .Literal = result.slice }, false);
+                        const token_type: TokenType = if (self.needs_continuation)
+                            .{ .Continuation = result.slice }
+                        else
+                            .{ .Literal = result.slice };
+                        self.needs_continuation = !result.complete;
+                        break :state self.makeToken(token_type, false);
                     },
                 }
             },
@@ -1118,22 +1005,22 @@ pub const Lexer = struct {
                 switch (next) {
                     '-' => {
                         _ = try self.consumeOne();
-                        self.parse_context = .brace_expansion_word;
+                        _ = self.swapContext(.brace_expansion_word);
                         break :state self.makeToken(.{ .Modifier = .{ .op = .UseDefault, .check_null = true } }, false);
                     },
                     '=' => {
                         _ = try self.consumeOne();
-                        self.parse_context = .brace_expansion_word;
+                        _ = self.swapContext(.brace_expansion_word);
                         break :state self.makeToken(.{ .Modifier = .{ .op = .AssignDefault, .check_null = true } }, false);
                     },
                     '?' => {
                         _ = try self.consumeOne();
-                        self.parse_context = .brace_expansion_word;
+                        _ = self.swapContext(.brace_expansion_word);
                         break :state self.makeToken(.{ .Modifier = .{ .op = .ErrorIfUnset, .check_null = true } }, false);
                     },
                     '+' => {
                         _ = try self.consumeOne();
-                        self.parse_context = .brace_expansion_word;
+                        _ = self.swapContext(.brace_expansion_word);
                         break :state self.makeToken(.{ .Modifier = .{ .op = .UseAlternative, .check_null = true } }, false);
                     },
                     else => {
@@ -1148,7 +1035,7 @@ pub const Lexer = struct {
                     return LexerError.UnterminatedBraceExpansion;
                 };
 
-                self.parse_context = .brace_expansion_word;
+                _ = self.swapContext(.brace_expansion_word);
                 if (next == '#') {
                     _ = try self.consumeOne();
                     break :state self.makeToken(.{ .Modifier = .{ .op = .RemoveLargestPrefix, .check_null = false } }, false);
@@ -1162,7 +1049,7 @@ pub const Lexer = struct {
                     return LexerError.UnterminatedBraceExpansion;
                 };
 
-                self.parse_context = .brace_expansion_word;
+                _ = self.swapContext(.brace_expansion_word);
                 if (next == '%') {
                     _ = try self.consumeOne();
                     break :state self.makeToken(.{ .Modifier = .{ .op = .RemoveLargestSuffix, .check_null = false } }, false);
@@ -1172,23 +1059,20 @@ pub const Lexer = struct {
             },
             .brace_expansion_escape => {
                 // Saw \ inside ${...}
+                // NOTE: You must push to get to this state, as you can come from either a name or a pattern/word.
                 const next = try self.peekByte() orelse {
                     return LexerError.UnterminatedBraceExpansion;
                 };
 
-                self.parse_context = .brace_expansion;
+                const context = self.popContext();
                 // POSIX: $, `, ", \, } and newline are special inside ${...}
                 if (next == '$' or next == '`' or next == '"' or next == '\\' or next == '}') {
-                    const buf = self.reader.peek(1) catch |err| switch (err) {
-                        error.EndOfStream => return LexerError.UnterminatedBraceExpansion,
-                        else => return LexerError.UnexpectedEndOfFile,
-                    };
-                    self.consume(buf);
-                    break :state self.makeToken(.{ .EscapedLiteral = buf }, false);
+                    _ = try self.consumeOne();
+                    break :state self.makeToken(.{ .EscapedLiteral = &.{next} }, false);
                 } else if (next == '\n') {
                     // Line continuation
                     _ = try self.consumeOne();
-                    continue :state .brace_expansion;
+                    continue :state context;
                 } else {
                     // Backslash is literal
                     break :state self.makeToken(.{ .Literal = "\\" }, false);
@@ -1205,56 +1089,35 @@ pub const Lexer = struct {
                 switch (first) {
                     '}' => {
                         _ = try self.consumeOne();
-                        self.popContext();
+                        _ = self.popContext();
+                        // NOTE: This is safe because we don't emit a reference to the buffer.
                         const after = try self.peekByte();
                         const at_boundary = self.isWordComplete(after);
+                        self.needs_continuation = false;
                         break :state self.makeToken(.BraceExpansionEnd, at_boundary);
                     },
                     '$' => {
                         // Nested expansion in word
                         _ = try self.consumeOne();
-                        continue :state .dollar;
+                        self.needs_continuation = false;
+                        continue :state try self.pushContext(.dollar);
                     },
                     '\\' => {
-                        // Escape in word - reuse brace_expansion_escape but return here
                         _ = try self.consumeOne();
-                        const next = try self.peekByte() orelse {
-                            return LexerError.UnterminatedBraceExpansion;
-                        };
-                        // POSIX: $, `, ", \, } and newline are special
-                        if (next == '$' or next == '`' or next == '"' or next == '\\' or next == '}') {
-                            const buf = self.reader.peek(1) catch |err| switch (err) {
-                                error.EndOfStream => return LexerError.UnterminatedBraceExpansion,
-                                else => return LexerError.UnexpectedEndOfFile,
-                            };
-                            self.consume(buf);
-                            break :state self.makeToken(.{ .EscapedLiteral = buf }, false);
-                        } else if (next == '\n') {
-                            // Line continuation
-                            _ = try self.consumeOne();
-                            continue :state .brace_expansion_word;
-                        } else {
-                            // Backslash is literal
-                            break :state self.makeToken(.{ .Literal = "\\" }, false);
-                        }
+                        self.needs_continuation = false;
+                        continue :state try self.pushContext(.brace_expansion_escape);
                     },
                     '\'' => {
                         // Single quote inside word
                         _ = try self.consumeOne();
-                        const result = try self.readSingleQuoted() orelse {
-                            return LexerError.UnterminatedBraceExpansion;
-                        };
-                        if (result.complete) {
-                            break :state self.makeToken(.{ .SingleQuoted = result.slice }, false);
-                        } else {
-                            try self.pushContext(.single_quote);
-                            break :state self.makeToken(.{ .SingleQuoted = result.slice }, false);
-                        }
+                        self.needs_continuation = false;
+                        continue :state try self.pushContext(.single_quote);
                     },
                     '"' => {
                         // Double quote inside word
                         _ = try self.consumeOne();
-                        try self.pushContext(.double_quote);
+                        self.needs_continuation = false;
+                        _ = try self.pushContext(.double_quote);
                         break :state self.makeToken(.DoubleQuoteBegin, false);
                     },
                     else => {
@@ -1262,40 +1125,53 @@ pub const Lexer = struct {
                         const result = try self.readUntil("}$\\\"'") orelse {
                             return LexerError.UnterminatedBraceExpansion;
                         };
-                        break :state self.makeToken(.{ .Literal = result.slice }, false);
+                        const token_type: TokenType = if (self.needs_continuation)
+                            .{ .Continuation = result.slice }
+                        else
+                            .{ .Literal = result.slice };
+                        self.needs_continuation = !result.complete;
+                        break :state self.makeToken(token_type, false);
                     },
                 }
             },
             .none => {
                 // Normal processing
 
+                // If we couldn't previously tell whether we were at the end of a word, check now and
+                // send a continuation.
+                if (self.check_end_of_word) {
+                    const nextByte = try self.peekByte();
+                    if (nextByte == null or nextByte == ' ' or nextByte == '\n') {
+                        // If this is the end of a word, then we also know that we are not continuing
+                        // the previous token.
+                        self.needs_continuation = false;
+                        break :state self.makeToken(.{ .Continuation = "" }, true);
+                    }
+                }
+
                 // If the previous token was incomplete, handle continuation
-                if (self.in_continuation) {
+                if (self.needs_continuation) {
                     const next = try self.peekByte();
 
                     // Check what follows the incomplete token
-                    if (next == null) {
-                        // EOF - word is complete
-                        self.in_continuation = false;
-                        break :state null;
-                    } else if (next == '\'' or next == '"' or next == '\\' or next == '$') {
+                    if (next == '\'' or next == '"' or next == '\\' or next == '$') {
                         // Quote, escape, or expansion follows - process it normally (word continues)
                         // Don't emit a continuation, fall through to normal processing
-                        self.in_continuation = false;
+                        self.needs_continuation = false;
                     } else if (next == '<' or next == '>') {
                         // Redirection operator - don't emit continuation, let normal processing handle it.
                         // Parser will join incomplete digits with the redirection if applicable.
                         // This handles cases like "2>&1" split across buffer boundaries.
-                        self.in_continuation = false;
+                        self.needs_continuation = false;
                         continue :state .none;
                     } else if (self.isWordComplete(next)) {
                         // Whitespace or other metachar - word is complete, emit empty continuation
-                        self.in_continuation = false;
+                        self.needs_continuation = false;
                         break :state self.makeToken(.{ .Continuation = "" }, true);
                     } else {
                         // Word char - read as continuation
                         const result = try self.readWord() orelse {
-                            self.in_continuation = false;
+                            self.needs_continuation = false;
                             break :state null;
                         };
                         // Check if word continues after this.
@@ -1308,6 +1184,7 @@ pub const Lexer = struct {
                             // Don't mark complete if followed by redirection operator - parser may need to join
                             break :blk if (after == '<' or after == '>') false else self.isWordComplete(after);
                         } else false;
+                        self.needs_continuation = !result.complete;
                         break :state self.makeToken(.{ .Continuation = result.slice }, at_boundary);
                     }
                 }
@@ -1327,74 +1204,41 @@ pub const Lexer = struct {
 
                 const first = try self.peekByte() orelse break :state null;
 
-                // Handle newline - command separator (POSIX <newline>)
-                if (first == '\n') {
-                    _ = try self.consumeOne();
-                    break :state self.makeToken(.Newline, true);
-                }
-
                 switch (first) {
+                    '\n' => {
+                        // Handle newline - command separator (POSIX <newline>)
+                        _ = try self.consumeOne();
+                        break :state self.makeToken(.Newline, true);
+                    },
                     '\'' => {
                         // Single quote - consume it and read content
                         _ = try self.consumeOne();
-                        const result = try self.readSingleQuoted() orelse {
-                            return LexerError.UnterminatedQuote;
-                        };
-                        if (result.complete) {
-                            // Check if word continues after closing quote
-                            const next = try self.peekByte();
-                            const at_boundary = self.isWordComplete(next);
-                            break :state self.makeToken(.{ .SingleQuoted = result.slice }, at_boundary);
-                        } else {
-                            // Need continuation - first chunk is SingleQuoted with complete=false
-                            self.parse_context = .single_quote;
-                            self.in_continuation = true;
-                            break :state self.makeToken(.{ .SingleQuoted = result.slice }, false);
-                        }
+                        self.needs_continuation = false;
+                        continue :state try self.pushContext(.single_quote);
                     },
                     '"' => {
                         // Double quote - consume it and enter double quote state
                         _ = try self.consumeOne();
-                        self.parse_context = .double_quote;
+                        _ = try self.pushContext(.double_quote);
+                        self.needs_continuation = false;
                         // DoubleQuoteBegin always has complete=false (content follows)
                         break :state self.makeToken(.DoubleQuoteBegin, false);
                     },
                     '\\' => {
-                        // Escape - try to peek both backslash and next char
-                        const buf = self.reader.peekGreedy(2) catch |err| switch (err) {
-                            error.EndOfStream => break :state null,
-                            else => return LexerError.UnexpectedEndOfFile,
-                        };
-                        if (buf.len < 2) {
-                            // Buffer boundary or EOF - transition to escape state
-                            self.consume(buf[0..1]);
-                            self.parse_context = .none_escape;
-                            // Intra-call transition: continue processing in escape state
-                            continue :state .none_escape;
-                        }
-
-                        const escaped_char = buf[1];
-                        if (escaped_char == '\n') {
-                            // Line continuation - backslash-newline is removed entirely
-                            self.consume(buf[0..2]);
-                            // Intra-call transition: continue to next line
-                            continue :state .none;
-                        }
-
-                        // Backslash escapes the next character (makes it literal)
-                        const escaped_slice = buf[1..2];
-                        self.consume(buf[0..2]);
-                        // Check if word continues after this escaped char
-                        const after = try self.peekByte();
-                        const at_boundary = self.isWordComplete(after);
-                        break :state self.makeToken(.{ .EscapedLiteral = escaped_slice }, at_boundary);
+                        // Escape - jump to escape handling and come back.
+                        _ = try self.consumeOne();
+                        continue :state self.swapContext(.none_escape);
                     },
                     '<' => {
                         _ = try self.consumeOne();
+                        self.needs_continuation = false;
                         break :state try self.finishRedirection(.In);
                     },
                     '>' => {
+                        // TODO: Does this break if the buffer boundary is between
+                        // the two '>>'?
                         _ = try self.consumeOne();
+                        self.needs_continuation = false;
                         const next = try self.peekByte();
                         if (next == '>') {
                             _ = try self.consumeOne();
@@ -1404,14 +1248,17 @@ pub const Lexer = struct {
                     },
                     '(' => {
                         _ = try self.consumeOne();
+                        self.needs_continuation = false;
                         break :state self.makeToken(.LeftParen, true);
                     },
                     ')' => {
                         _ = try self.consumeOne();
+                        self.needs_continuation = false;
                         break :state self.makeToken(.RightParen, true);
                     },
                     ';' => {
                         _ = try self.consumeOne();
+                        self.needs_continuation = false;
                         const next = try self.peekByte();
                         if (next == ';') {
                             _ = try self.consumeOne();
@@ -1421,6 +1268,7 @@ pub const Lexer = struct {
                     },
                     '|' => {
                         _ = try self.consumeOne();
+                        self.needs_continuation = false;
                         const next = try self.peekByte();
                         if (next == '|') {
                             // || is OR list operator (Section 2.9.3)
@@ -1432,12 +1280,14 @@ pub const Lexer = struct {
                     '$' => {
                         // Parameter expansion - need to determine type
                         _ = try self.consumeOne();
-                        continue :state .dollar;
+                        self.needs_continuation = false;
+                        continue :state try self.pushContext(.dollar);
                     },
                     else => {
                         if (!isPlainCharacter(first)) {
                             // Consume the unhandled character to avoid infinite loop
                             _ = try self.consumeOne();
+                            self.needs_continuation = false;
                             break :state null;
                         }
                         const result = try self.readWord() orelse break :state null;
@@ -1447,6 +1297,7 @@ pub const Lexer = struct {
                             self.isWordComplete(try self.peekByte())
                         else
                             false;
+                        self.needs_continuation = !result.complete;
                         break :state self.makeToken(.{ .Literal = result.slice }, at_boundary);
                     },
                 }
@@ -1503,6 +1354,15 @@ fn expectIncompleteLiteral(token: ?Token, expected: []const u8) !void {
     try std.testing.expectEqual(false, t.complete);
 }
 
+fn expectContinuation(token: ?Token, expected: []const u8, complete: bool) !void {
+    const t = token orelse return error.ExpectedToken;
+    switch (t.type) {
+        .Continuation => |lit| try std.testing.expectEqualStrings(expected, lit),
+        else => return error.ExpectedContinuation,
+    }
+    try std.testing.expectEqual(complete, t.complete);
+}
+
 fn expectEscapedLiteral(token: ?Token, expected: []const u8) !void {
     const t = token orelse return error.ExpectedToken;
     switch (t.type) {
@@ -1543,6 +1403,7 @@ test "nextToken: simple literal" {
     var reader = std.io.Reader.fixed("hello");
     var lexer = Lexer.init(&reader);
     try expectLiteral(try lexer.nextToken(), "hello");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1552,6 +1413,7 @@ test "nextToken: multiple literals" {
     try expectLiteral(try lexer.nextToken(), "hello");
     try expectLiteral(try lexer.nextToken(), "world");
     try expectLiteral(try lexer.nextToken(), "foo");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1567,6 +1429,7 @@ test "nextToken: numeric literal followed by space" {
     var lexer = Lexer.init(&reader);
     try expectLiteral(try lexer.nextToken(), "123");
     try expectLiteral(try lexer.nextToken(), "456");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1574,6 +1437,7 @@ test "nextToken: alphanumeric literal starting with digit" {
     var reader = std.io.Reader.fixed("123abc");
     var lexer = Lexer.init(&reader);
     try expectLiteral(try lexer.nextToken(), "123abc");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1581,6 +1445,7 @@ test "nextToken: word with equals sign" {
     var reader = std.io.Reader.fixed("FOO=bar");
     var lexer = Lexer.init(&reader);
     try expectLiteral(try lexer.nextToken(), "FOO=bar");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1589,6 +1454,7 @@ test "nextToken: word with equals sign followed by literal" {
     var lexer = Lexer.init(&reader);
     try expectLiteral(try lexer.nextToken(), "FOO=bar");
     try expectLiteral(try lexer.nextToken(), "command");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1597,6 +1463,7 @@ test "nextToken: output redirection" {
     var lexer = Lexer.init(&reader);
     try expectRedirection(try lexer.nextToken(), .Out);
     try expectLiteral(try lexer.nextToken(), "file");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1605,6 +1472,7 @@ test "nextToken: output redirection with space" {
     var lexer = Lexer.init(&reader);
     try expectRedirection(try lexer.nextToken(), .Out);
     try expectLiteral(try lexer.nextToken(), "file");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1613,6 +1481,7 @@ test "nextToken: input redirection" {
     var lexer = Lexer.init(&reader);
     try expectRedirection(try lexer.nextToken(), .In);
     try expectLiteral(try lexer.nextToken(), "input");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1621,6 +1490,7 @@ test "nextToken: append redirection" {
     var lexer = Lexer.init(&reader);
     try expectRedirection(try lexer.nextToken(), .Append);
     try expectLiteral(try lexer.nextToken(), "logfile");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1630,6 +1500,7 @@ test "nextToken: fd-prefixed output redirection" {
     try expectIncompleteLiteral(try lexer.nextToken(), "2");
     try expectRedirection(try lexer.nextToken(), .Out);
     try expectLiteral(try lexer.nextToken(), "errors");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1639,6 +1510,7 @@ test "nextToken: fd-prefixed append redirection" {
     try expectIncompleteLiteral(try lexer.nextToken(), "2");
     try expectRedirection(try lexer.nextToken(), .Append);
     try expectLiteral(try lexer.nextToken(), "errors");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1648,6 +1520,7 @@ test "nextToken: fd-prefixed input redirection" {
     try expectIncompleteLiteral(try lexer.nextToken(), "0");
     try expectRedirection(try lexer.nextToken(), .In);
     try expectLiteral(try lexer.nextToken(), "input");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1657,6 +1530,7 @@ test "nextToken: fd duplication 2>&1" {
     try expectIncompleteLiteral(try lexer.nextToken(), "2");
     try expectRedirection(try lexer.nextToken(), .Fd);
     try expectLiteral(try lexer.nextToken(), "1");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1665,6 +1539,7 @@ test "nextToken: fd duplication >&2" {
     var lexer = Lexer.init(&reader);
     try expectRedirection(try lexer.nextToken(), .Fd);
     try expectLiteral(try lexer.nextToken(), "2");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1680,6 +1555,7 @@ test "nextToken: complex command line" {
     try expectIncompleteLiteral(try lexer.nextToken(), "2");
     try expectRedirection(try lexer.nextToken(), .Fd);
     try expectLiteral(try lexer.nextToken(), "1");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1690,6 +1566,7 @@ test "nextToken: redirection at start" {
     try expectRedirection(try lexer.nextToken(), .Fd);
     try expectLiteral(try lexer.nextToken(), "1");
     try expectLiteral(try lexer.nextToken(), "command");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1711,6 +1588,7 @@ test "nextToken: newline emits separator" {
     try expectLiteral(try lexer.nextToken(), "hello");
     try expectSeparator(try lexer.nextToken()); // newline
     try expectLiteral(try lexer.nextToken(), "world");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1718,6 +1596,7 @@ test "nextToken: single character literal" {
     var reader = std.io.Reader.fixed("a");
     var lexer = Lexer.init(&reader);
     try expectLiteral(try lexer.nextToken(), "a");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1725,6 +1604,7 @@ test "nextToken: single digit" {
     var reader = std.io.Reader.fixed("5");
     var lexer = Lexer.init(&reader);
     try expectLiteral(try lexer.nextToken(), "5");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1752,6 +1632,7 @@ test "nextToken: semicolon emits separator" {
     try expectSeparator(try lexer.nextToken()); // ;
     try std.testing.expectEqual(null, try lexer.nextToken()); // & (unhandled)
     try expectLiteral(try lexer.nextToken(), "cmd");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1797,6 +1678,7 @@ test "nextToken: command list with semicolons" {
     try expectSeparator(try lexer.nextToken());
     try expectLiteral(try lexer.nextToken(), "echo");
     try expectLiteral(try lexer.nextToken(), "b");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1816,6 +1698,7 @@ test "nextToken: pipe operator" {
     try expectLiteral(try lexer.nextToken(), "a");
     try expectPipe(try lexer.nextToken());
     try expectLiteral(try lexer.nextToken(), "b");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1825,6 +1708,7 @@ test "nextToken: pipe without spaces" {
     try expectLiteral(try lexer.nextToken(), "a");
     try expectPipe(try lexer.nextToken());
     try expectLiteral(try lexer.nextToken(), "b");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1836,6 +1720,7 @@ test "nextToken: multiple pipes" {
     try expectLiteral(try lexer.nextToken(), "b");
     try expectPipe(try lexer.nextToken());
     try expectLiteral(try lexer.nextToken(), "c");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1854,6 +1739,7 @@ test "nextToken: double pipe emits DoublePipe token" {
     try expectLiteral(try lexer.nextToken(), "a");
     try expectDoublePipe(try lexer.nextToken());
     try expectLiteral(try lexer.nextToken(), "b");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1864,6 +1750,7 @@ test "nextToken: bang as standalone literal" {
     var lexer = Lexer.init(&reader);
     try expectLiteral(try lexer.nextToken(), "!");
     try expectLiteral(try lexer.nextToken(), "cmd");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1872,6 +1759,7 @@ test "nextToken: bang in word is part of literal" {
     var reader = std.io.Reader.fixed("!cmd");
     var lexer = Lexer.init(&reader);
     try expectLiteral(try lexer.nextToken(), "!cmd");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1879,6 +1767,7 @@ test "nextToken: bang at end of word" {
     var reader = std.io.Reader.fixed("cmd!");
     var lexer = Lexer.init(&reader);
     try expectLiteral(try lexer.nextToken(), "cmd!");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1890,6 +1779,7 @@ test "nextToken: bang with pipeline" {
     try expectLiteral(try lexer.nextToken(), "a");
     try expectPipe(try lexer.nextToken());
     try expectLiteral(try lexer.nextToken(), "b");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -1983,6 +1873,7 @@ test "nextToken: parentheses inside single quotes are literal" {
     var reader = std.io.Reader.fixed("'(foo)'");
     var lex = Lexer.init(&reader);
     try expectSingleQuoted(try lex.nextToken(), "(foo)");
+    try expectContinuation(try lex.nextToken(), "", true);
     try std.testing.expectEqual(null, try lex.nextToken());
 }
 
@@ -2004,6 +1895,7 @@ test "nextToken: escaped tilde produces EscapedLiteral" {
     var reader = std.io.Reader.fixed("\\~");
     var lex = Lexer.init(&reader);
     try expectEscapedLiteral(try lex.nextToken(), "~");
+    try expectContinuation(try lex.nextToken(), "", true);
     try std.testing.expectEqual(null, try lex.nextToken());
 }
 
@@ -2014,7 +1906,8 @@ test "nextToken: escaped tilde in word" {
     try expectLiteral(try lex.nextToken(), "echo");
     try expectEscapedLiteral(try lex.nextToken(), "~");
     const tok3 = (try lex.nextToken()).?;
-    try std.testing.expectEqualStrings("foo", tok3.type.Continuation);
+    try std.testing.expectEqualStrings("foo", tok3.type.Literal);
+    try expectContinuation(try lex.nextToken(), "", true);
     try std.testing.expectEqual(null, try lex.nextToken());
 }
 
@@ -2023,7 +1916,7 @@ test "nextToken: escaped dollar produces EscapedLiteral" {
     var reader = std.io.Reader.fixed("\\$");
     var lex = Lexer.init(&reader);
     try expectEscapedLiteral(try lex.nextToken(), "$");
-    try std.testing.expectEqual(null, try lex.nextToken());
+    try expectContinuation(try lex.nextToken(), "", true);
     try std.testing.expectEqual(null, try lex.nextToken());
 }
 
@@ -2085,6 +1978,7 @@ test "nextToken: large fd numbers stored as strings" {
     var lexer = Lexer.init(&reader);
     try expectRedirection(try lexer.nextToken(), .Fd);
     try expectLiteral(try lexer.nextToken(), "99999999999999999999");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2152,6 +2046,7 @@ test "nextToken: escape at buffer boundary in double quotes - non-special escape
     defer std.posix.close(pipe[0]);
 
     // Write "\n" (backslash-n, NOT a special escape) inside double quotes
+    // '"\\nx" ' -> '"\\"' | 'nx"' | ' '
     _ = try std.posix.write(pipe[1], "\"\\nx\" ");
     std.posix.close(pipe[1]);
 
@@ -2167,8 +2062,7 @@ test "nextToken: escape at buffer boundary in double quotes - non-special escape
     // "nx" follows as literal content
     const tok3 = (try lexer.nextToken()).?;
     try std.testing.expectEqualStrings("n", tok3.type.Literal);
-    const tok4 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings("x", tok4.type.Literal);
+    try expectContinuation(try lexer.nextToken(), "x", false);
     try expectDoubleQuoteEnd(try lexer.nextToken());
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -2185,7 +2079,7 @@ test "nextToken: escape outside quotes" {
     try std.testing.expectEqual(false, tok1.complete);
     // "x" continues the word
     const tok2 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings("x", tok2.type.Continuation);
+    try std.testing.expectEqualStrings("x", tok2.type.Literal);
     try std.testing.expectEqual(true, tok2.complete);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -2220,6 +2114,7 @@ test "nextToken: simple single-quoted string" {
     var reader = std.io.Reader.fixed("'hello'");
     var lexer = Lexer.init(&reader);
     try expectSingleQuoted(try lexer.nextToken(), "hello");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2227,6 +2122,7 @@ test "nextToken: single-quoted string with spaces" {
     var reader = std.io.Reader.fixed("'hello world'");
     var lexer = Lexer.init(&reader);
     try expectSingleQuoted(try lexer.nextToken(), "hello world");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2234,6 +2130,7 @@ test "nextToken: single-quoted string preserves special chars" {
     var reader = std.io.Reader.fixed("'$var > file'");
     var lexer = Lexer.init(&reader);
     try expectSingleQuoted(try lexer.nextToken(), "$var > file");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2241,6 +2138,7 @@ test "nextToken: empty single-quoted string" {
     var reader = std.io.Reader.fixed("''");
     var lexer = Lexer.init(&reader);
     try expectSingleQuoted(try lexer.nextToken(), "");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2344,7 +2242,7 @@ test "nextToken: unquoted escape - backslash escapes next char" {
     try std.testing.expectEqual(false, tok1.complete); // more word follows
     // "HOME" is a continuation of the word started by the escape
     const tok2 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings("HOME", tok2.type.Continuation);
+    try std.testing.expectEqualStrings("HOME", tok2.type.Literal);
     try std.testing.expectEqual(true, tok2.complete);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -2364,12 +2262,13 @@ test "nextToken: unquoted escape - backslash-quote" {
     try std.testing.expectEqual(false, tok2.complete); // more follows
     // "hi" is a continuation
     const tok3 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings("hi", tok3.type.Continuation);
+    try std.testing.expectEqualStrings("hi", tok3.type.Literal);
     try std.testing.expectEqual(false, tok3.complete); // backslash follows
     // \" produces escaped literal "
     const tok4 = (try lexer.nextToken()).?;
     try std.testing.expectEqualStrings("\"", tok4.type.EscapedLiteral);
-    try std.testing.expectEqual(true, tok4.complete); // space follows
+    try std.testing.expectEqual(false, tok4.complete); // space follows
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2378,6 +2277,7 @@ test "nextToken: unquoted escape - backslash-backslash" {
     var reader = std.io.Reader.fixed("\\\\");
     var lexer = Lexer.init(&reader);
     try expectEscapedLiteral(try lexer.nextToken(), "\\");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2388,6 +2288,7 @@ test "nextToken: unquoted escape - backslash-newline is line continuation" {
     try expectLiteral(try lexer.nextToken(), "echo");
     // The \<newline> is consumed silently, then "hello" is read
     try expectLiteral(try lexer.nextToken(), "hello");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2416,7 +2317,7 @@ test "nextToken: unquoted escape - backslash-space" {
     try std.testing.expectEqual(false, tok2.complete); // word continues
     // "world" is a continuation of the same word
     const tok3 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings("world", tok3.type.Continuation);
+    try std.testing.expectEqualStrings("world", tok3.type.Literal);
     try std.testing.expectEqual(true, tok3.complete); // trailing space
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -2433,7 +2334,7 @@ test "nextToken: escape in middle of word" {
     try std.testing.expectEqual(false, tok2.complete); // more word follows
     // "bar" is a continuation
     const tok3 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings("bar", tok3.type.Continuation);
+    try std.testing.expectEqualStrings("bar", tok3.type.Literal);
     try std.testing.expectEqual(true, tok3.complete); // trailing space
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -2463,7 +2364,9 @@ test "nextToken: single-quoted followed by literal" {
     var reader = std.io.Reader.fixed("'hello' world");
     var lexer = Lexer.init(&reader);
     try expectSingleQuoted(try lexer.nextToken(), "hello");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try expectLiteral(try lexer.nextToken(), "world");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2472,6 +2375,7 @@ test "nextToken: literal followed by single-quoted" {
     var lexer = Lexer.init(&reader);
     try expectLiteral(try lexer.nextToken(), "echo");
     try expectSingleQuoted(try lexer.nextToken(), "hello");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2485,7 +2389,8 @@ test "nextToken: adjacent single-quoted strings form one word" {
     // Second single-quoted string - complete=true because EOF follows
     const tok2 = (try lexer.nextToken()).?;
     try std.testing.expectEqualStrings("def", tok2.type.SingleQuoted);
-    try std.testing.expectEqual(true, tok2.complete);
+    try std.testing.expectEqual(false, tok2.complete);
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2524,7 +2429,8 @@ test "nextToken: double-quoted followed by single-quoted" {
     // SingleQuoted - complete=true because EOF follows
     const tok4 = (try lexer.nextToken()).?;
     try std.testing.expectEqualStrings("def", tok4.type.SingleQuoted);
-    try std.testing.expectEqual(true, tok4.complete);
+    try std.testing.expectEqual(false, tok4.complete);
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2541,7 +2447,8 @@ test "nextToken: double-quoted with space after" {
     try std.testing.expectEqual(TokenType.DoubleQuoteEnd, tok3.type);
     try std.testing.expectEqual(true, tok3.complete);
     // Next word
-    try expectLiteral(try lexer.nextToken(), "def");
+    try expectIncompleteLiteral(try lexer.nextToken(), "def");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2555,7 +2462,8 @@ test "nextToken: literal followed by single-quote (adjacent)" {
     // SingleQuoted - complete=true because EOF follows
     const tok2 = (try lexer.nextToken()).?;
     try std.testing.expectEqualStrings("def", tok2.type.SingleQuoted);
-    try std.testing.expectEqual(true, tok2.complete);
+    try std.testing.expectEqual(false, tok2.complete);
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2590,9 +2498,9 @@ test "nextToken: mixed literal and quotes" {
     const tok2 = (try lexer.nextToken()).?;
     try std.testing.expectEqualStrings("def", tok2.type.SingleQuoted);
     try std.testing.expectEqual(false, tok2.complete);
-    // ghi - this is a Continuation because previous token was incomplete
+    // ghi - this is a Literal because previous word was incomplete
     const tok3 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings("ghi", tok3.type.Continuation);
+    try std.testing.expectEqualStrings("ghi", tok3.type.Literal);
     try std.testing.expectEqual(false, tok3.complete); // quote follows
     // "jkl" section
     try expectDoubleQuoteBegin(try lexer.nextToken());
@@ -2622,6 +2530,7 @@ test "nextToken: redirection with single-quoted target" {
     try expectRedirection(try lexer.nextToken(), .Out);
     // Then the single-quoted target
     try expectSingleQuoted(try lexer.nextToken(), "file");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2703,6 +2612,7 @@ test "nextToken: simple expansion $VAR" {
     var reader = std.io.Reader.fixed("$HOME");
     var lexer = Lexer.init(&reader);
     try expectSimpleExpansion(try lexer.nextToken(), "HOME");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2710,6 +2620,7 @@ test "nextToken: simple expansion $1" {
     var reader = std.io.Reader.fixed("$1");
     var lexer = Lexer.init(&reader);
     try expectSimpleExpansion(try lexer.nextToken(), "1");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2719,11 +2630,8 @@ test "nextToken: $10 is $1 followed by 0" {
     const tok1 = (try lexer.nextToken()).?;
     try std.testing.expectEqualStrings("1", tok1.type.SimpleExpansion);
     try std.testing.expectEqual(false, tok1.complete);
-    const tok2 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings("0", tok2.type.Continuation);
-    // With peek safety fix, word is marked incomplete when buffer is exhausted.
-    // Next call sees EOF and returns null.
-    try std.testing.expectEqual(false, tok2.complete);
+    try expectIncompleteLiteral(try lexer.nextToken(), "0");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2731,6 +2639,7 @@ test "nextToken: simple expansion $?" {
     var reader = std.io.Reader.fixed("$?");
     var lexer = Lexer.init(&reader);
     try expectSimpleExpansion(try lexer.nextToken(), "?");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2738,6 +2647,7 @@ test "nextToken: simple expansion $@" {
     var reader = std.io.Reader.fixed("$@");
     var lexer = Lexer.init(&reader);
     try expectSimpleExpansion(try lexer.nextToken(), "@");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2751,11 +2661,9 @@ test "nextToken: $ at EOF is literal" {
 test "nextToken: $ followed by invalid char is literal" {
     var reader = std.io.Reader.fixed("$,rest");
     var lexer = Lexer.init(&reader);
-    const tok1 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings("$", tok1.type.Literal);
-    try std.testing.expectEqual(false, tok1.complete);
-    const tok2 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings(",rest", tok2.type.Continuation);
+    try expectIncompleteLiteral(try lexer.nextToken(), "$");
+    try expectContinuation(try lexer.nextToken(), ",rest", false);
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -2802,6 +2710,26 @@ test "nextToken: ${###} is $# with ## modifier" {
     try expectBraceExpansionBegin(try lexer.nextToken());
     try expectLiteral(try lexer.nextToken(), "#");
     try expectModifier(try lexer.nextToken(), .RemoveLargestPrefix, false);
+    try expectBraceExpansionEnd(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+test "nextToken: ${###word} is $# with ## modifier" {
+    var reader = std.io.Reader.fixed("${###word}");
+    var lexer = Lexer.init(&reader);
+    try expectBraceExpansionBegin(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "#");
+    try expectModifier(try lexer.nextToken(), .RemoveLargestPrefix, false);
+    try expectLiteral(try lexer.nextToken(), "word");
+    try expectBraceExpansionEnd(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+test "nextToken: ${##word} is $# with # modifier" {
+    var reader = std.io.Reader.fixed("${##word}");
+    var lexer = Lexer.init(&reader);
+    try expectBraceExpansionBegin(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "#");
+    try expectModifier(try lexer.nextToken(), .RemoveSmallestPrefix, false);
+    try expectLiteral(try lexer.nextToken(), "word");
     try expectBraceExpansionEnd(try lexer.nextToken());
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -3003,11 +2931,9 @@ test "nextToken: expansion followed by word via braces" {
     const tok4 = (try lexer.nextToken()).?;
     try std.testing.expectEqual(TokenType.BraceExpansionEnd, tok4.type);
     try std.testing.expectEqual(false, tok4.complete); // suffix follows
-    const tok5 = (try lexer.nextToken()).?;
-    try std.testing.expectEqualStrings("suffix", tok5.type.Continuation);
-    // With peek safety fix, word is marked incomplete when buffer is exhausted.
-    // Next call sees EOF and returns null.
-    try std.testing.expectEqual(false, tok5.complete);
+    // word is marked incomplete when buffer is exhausted.
+    try expectIncompleteLiteral(try lexer.nextToken(), "suffix");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -3016,6 +2942,7 @@ test "nextToken: expansion consumes full identifier" {
     var reader = std.io.Reader.fixed("$VARsuffix");
     var lexer = Lexer.init(&reader);
     try expectSimpleExpansion(try lexer.nextToken(), "VARsuffix");
+    try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
 
@@ -3322,6 +3249,117 @@ test "nextToken: multi-digit fd at buffer boundary" {
     try std.testing.expectEqual(true, tok5.complete);
 
     try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: command before quotation at buffer boundary (1)" {
+    // Test cmd '2>&1' with 1-byte buffer.
+    // With such a small buffer, each character is a separate token.
+    // This tests that continuation handling works correctly across buffer boundaries.
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    _ = try std.posix.write(pipe[1], "cmd '2>&1'");
+    std.posix.close(pipe[1]);
+
+    const file = std.fs.File{ .handle = pipe[0] };
+    var small_buf: [1]u8 = undefined;
+    var file_reader = file.reader(&small_buf);
+    var lexer = Lexer.init(&file_reader.interface);
+
+    // First token: "c" incomplete
+    var tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("c", tok.type.Literal);
+    try std.testing.expectEqual(false, tok.complete);
+
+    // Second token: "m" as continuation, incomplete
+    tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("m", tok.type.Continuation);
+    try std.testing.expectEqual(false, tok.complete);
+
+    // Third token: "d" as continuation, incomplete
+    tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("d", tok.type.Continuation);
+    try std.testing.expectEqual(false, tok.complete);
+
+    // Fourth token: "" as continuation, complete
+    tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("", tok.type.Continuation);
+    try std.testing.expectEqual(true, tok.complete);
+
+    // Fifth token: '2' as single quote, incomplete
+    tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("2", tok.type.SingleQuoted);
+    try std.testing.expectEqual(false, tok.complete);
+
+    // Sixth token: '>' as continuation, incomplete
+    tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings(">", tok.type.Continuation);
+    try std.testing.expectEqual(false, tok.complete);
+
+    // Seventh token: '&' as continuation, incomplete
+    tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("&", tok.type.Continuation);
+    try std.testing.expectEqual(false, tok.complete);
+
+    // Eighth token: '1' as continuation, incomplete
+    tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("1", tok.type.Continuation);
+    try std.testing.expectEqual(false, tok.complete);
+
+    // Ninth token: '' as continuation, incomplete
+    tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("", tok.type.Continuation);
+    try std.testing.expectEqual(false, tok.complete);
+}
+
+test "nextToken: command before quotation at buffer boundary (2)" {
+    // Test cmd '2>&1'\n with 2-byte buffer.
+    // This tests that continuation handling works correctly across buffer boundaries.
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    _ = try std.posix.write(pipe[1], "cmd '2>&1'\n");
+    std.posix.close(pipe[1]);
+
+    const file = std.fs.File{ .handle = pipe[0] };
+    var small_buf: [2]u8 = undefined;
+    var file_reader = file.reader(&small_buf);
+    var lexer = Lexer.init(&file_reader.interface);
+
+    // First token: "cm" incomplete
+    var tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("cm", tok.type.Literal);
+    try std.testing.expectEqual(false, tok.complete);
+
+    // Second token: "d" as continuation, complete
+    tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("d", tok.type.Continuation);
+    try std.testing.expectEqual(true, tok.complete);
+
+    // Third token: "2" as SingleQuoted, incomplete
+    tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("2", tok.type.SingleQuoted);
+    try std.testing.expectEqual(false, tok.complete);
+
+    // Fourth token: ">&1" as continuation, incomplete
+    tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings(">&", tok.type.Continuation);
+    try std.testing.expectEqual(false, tok.complete);
+
+    // Fifth token: "1" as continuation, incomplete
+    tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("1", tok.type.Continuation);
+    try std.testing.expectEqual(false, tok.complete);
+
+    // Sixth token: "" as continuation, complete
+    tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqualStrings("", tok.type.Continuation);
+    try std.testing.expectEqual(true, tok.complete);
+
+    // Seventh token: newline, complete
+    tok = (try lexer.nextToken()).?;
+    try expectSeparator(tok);
+    try std.testing.expectEqual(true, tok.complete);
 }
 
 test "nextToken: non-digit word before redirection at buffer boundary" {

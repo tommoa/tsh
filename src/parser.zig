@@ -566,9 +566,15 @@ pub const Parser = struct {
 
                 switch (tok.type) {
                     .Newline, .Semicolon, .DoubleSemicolon => {
-                        // Empty command (e.g., leading semicolon or blank line) - skip
                         // TODO: DoubleSemicolon (`;;`) will need special handling for case/esac
-                        continue :state .start;
+                        if (self.assignments.items.len == 0 and
+                            self.argv.items.len == 0 and
+                            self.redirections.items.len == 0) {
+                            // Empty command (e.g., leading semicolon or blank line) - skip
+                            continue :state .start;
+                        } else {
+                            continue :state .done;
+                        }
                     },
                     .Redirection => |redir| {
                         self.setPendingRedir(redir, tok);
@@ -904,11 +910,7 @@ pub const Parser = struct {
                 try self.addPartToCurrentContext(.{ .quoted = copied });
             },
             .Continuation => |cont| {
-                // Continuation may be empty (signals word boundary with no content)
-                if (cont.len > 0) {
-                    const copied = try self.allocator.dupe(u8, cont);
-                    try self.addPartToCurrentContext(.{ .literal = copied });
-                }
+                try self.continueLastPart(cont);
             },
             .SingleQuoted => |sq| {
                 // SingleQuoted tokens appear outside double quotes (inside double quotes,
@@ -1031,6 +1033,82 @@ pub const Parser = struct {
         } else {
             // No context - add directly to word_parts
             try self.word_parts.append(self.allocator, part);
+        }
+    }
+
+    /// Extend the last part in the current context with additional content.
+    /// Used for Continuation tokens that continue a previous incomplete token.
+    fn continueLastPart(self: *Parser, content: []const u8) ParseError!void {
+        if (content.len == 0) return;
+
+        const ExtendError = ParseError;
+        const allocator = self.allocator;
+
+        // Extend a string with additional content using realloc.
+        // Safe to cast because the parser owns all allocated strings.
+        const extendString = struct {
+            fn f(alloc: Allocator, old: []const u8, suffix: []const u8) ExtendError![]const u8 {
+                const new_len = old.len + suffix.len;
+                // Safe to cast: we own this buffer (allocated by this parser)
+                const old_mut: []u8 = @constCast(old);
+                const resized = try alloc.realloc(old_mut, new_len);
+                @memcpy(resized[old.len..], suffix);
+                return resized;
+            }
+        }.f;
+
+        // Extend the last WordPart in a list with additional content.
+        const extendLastPartInList = struct {
+            fn f(alloc: Allocator, parts: *std.ArrayListUnmanaged(WordPart), cont: []const u8) ExtendError!void {
+                // The lexer only emits Continuation tokens after an incomplete token,
+                // so there must always be a preceding part to continue.
+                if (parts.items.len == 0) unreachable;
+
+                const last = &parts.items[parts.items.len - 1];
+
+                switch (last.*) {
+                    .literal => |old| {
+                        last.* = .{ .literal = try extendString(alloc, old, cont) };
+                    },
+                    .quoted => |old| {
+                        last.* = .{ .quoted = try extendString(alloc, old, cont) };
+                    },
+                    .parameter => |*param| {
+                        param.name = try extendString(alloc, param.name, cont);
+                    },
+                    // double_quoted parts are only created when a double_quote context
+                    // is finalized. While inside double quotes, we're in a double_quote
+                    // context, not looking at a double_quoted part. So continuations
+                    // cannot target a double_quoted part.
+                    .double_quoted => unreachable,
+                }
+            }
+        }.f;
+
+        if (self.context_depth > 0) {
+            const ctx = &self.context_stack[self.context_depth - 1];
+            switch (ctx.*) {
+                .double_quote => |*dq| {
+                    try extendLastPartInList(allocator, &dq.parts, content);
+                },
+                .brace_expansion => |*be| {
+                    if (be.word_parts.items.len > 0) {
+                        // Continuing a word part after the modifier
+                        try extendLastPartInList(allocator, &be.word_parts, content);
+                    } else if (be.name != null) {
+                        // Continuing the parameter name (before any modifier)
+                        be.name = try extendString(allocator, be.name.?, content);
+                    } else {
+                        // The lexer emits BraceExpansionBegin, then a Literal for the
+                        // parameter name. A Continuation can only follow an incomplete
+                        // token, so either name or word_parts must have content.
+                        unreachable;
+                    }
+                },
+            }
+        } else {
+            // No context - extend in top-level word_parts
+            try extendLastPartInList(allocator, &self.word_parts, content);
         }
     }
 
@@ -1249,32 +1327,49 @@ pub const Parser = struct {
 
 // --- Parser tests ---
 
-fn expectWord(word: Word, expected_parts: []const []const u8) !void {
+fn expectWordPart(actual: WordPart, expected: WordPart) !void {
+    switch (expected) {
+        .literal => |exp_lit| {
+            if (actual != .literal) return error.ExpectedLiteral;
+            try std.testing.expectEqualStrings(exp_lit, actual.literal);
+        },
+        .quoted => |exp_q| {
+            if (actual != .quoted) return error.ExpectedQuoted;
+            try std.testing.expectEqualStrings(exp_q, actual.quoted);
+        },
+        .double_quoted => |exp_parts| {
+            if (actual != .double_quoted) return error.ExpectedDoubleQuoted;
+            try std.testing.expectEqual(exp_parts.len, actual.double_quoted.len);
+            for (actual.double_quoted, exp_parts) |act_part, exp_part| {
+                try expectWordPart(act_part, exp_part);
+            }
+        },
+        .parameter => |exp_param| {
+            if (actual != .parameter) return error.ExpectedParameter;
+            try std.testing.expectEqualStrings(exp_param.name, actual.parameter.name);
+            // For now, just check modifier presence matches
+            if (exp_param.modifier == null) {
+                try std.testing.expect(actual.parameter.modifier == null);
+            } else {
+                try std.testing.expect(actual.parameter.modifier != null);
+                try std.testing.expectEqual(exp_param.modifier.?.op, actual.parameter.modifier.?.op);
+                try std.testing.expectEqual(exp_param.modifier.?.check_null, actual.parameter.modifier.?.check_null);
+            }
+        },
+    }
+}
+
+fn expectWord(word: Word, expected_parts: []const WordPart) !void {
     try std.testing.expectEqual(expected_parts.len, word.parts.len);
-    for (word.parts, expected_parts) |part, expected| {
-        // For simple tests, just compare the text content regardless of quote type
-        const text = switch (part) {
-            .literal => |lit| lit,
-            .quoted => |q| q,
-            .double_quoted => {
-                // For double_quoted, we need a more complex comparison
-                // For now, skip - tests that need this should use expectWordPart
-                return error.UseExpectWordPartForDoubleQuoted;
-            },
-            .parameter => {
-                // For parameter expansions, we need a more complex comparison
-                // Tests that need this should check the parameter fields directly
-                return error.UseExpectWordPartForParameter;
-            },
-        };
-        try std.testing.expectEqualStrings(expected, text);
+    for (word.parts, expected_parts) |actual, expected| {
+        try expectWordPart(actual, expected);
     }
 }
 
 fn expectSimpleCommand(
     cmd: ?SimpleCommand,
-    expected_assignments: []const struct { name: []const u8, value: []const []const u8 },
-    expected_argv: []const []const []const u8,
+    expected_assignments: []const struct { name: []const u8, value: []const WordPart },
+    expected_argv: []const []const WordPart,
     expected_redirections: usize,
 ) !void {
     const c = cmd orelse return error.ExpectedCommand;
@@ -1293,7 +1388,7 @@ fn expectSimpleCommand(
     try std.testing.expectEqual(expected_redirections, c.redirections.len);
 }
 
-fn expectFileTarget(target: RedirectionTarget, expected_parts: []const []const u8) !void {
+fn expectFileTarget(target: RedirectionTarget, expected_parts: []const WordPart) !void {
     switch (target) {
         .file => |word| try expectWord(word, expected_parts),
         .fd => return error.ExpectedFileTarget,
@@ -1346,7 +1441,7 @@ test "parseCommand: simple command" {
     try expectSimpleCommand(
         result,
         &.{},
-        &.{ &.{"cmd"}, &.{"arg1"}, &.{"arg2"} },
+        &.{ &.{.{ .literal = "cmd" }}, &.{.{ .literal = "arg1" }}, &.{.{ .literal = "arg2" }} },
         0,
     );
 }
@@ -1361,7 +1456,7 @@ test "parseCommand: simple assignment" {
     const result = try parser_inst.parseCommand();
     try expectSimpleCommand(
         result,
-        &.{.{ .name = "FOO", .value = &.{"bar"} }},
+        &.{.{ .name = "FOO", .value = &.{.{ .literal = "bar" }} }},
         &.{},
         0,
     );
@@ -1393,8 +1488,8 @@ test "parseCommand: assignment with command" {
     const result = try parser_inst.parseCommand();
     try expectSimpleCommand(
         result,
-        &.{.{ .name = "FOO", .value = &.{"bar"} }},
-        &.{ &.{"cmd"}, &.{"arg"} },
+        &.{.{ .name = "FOO", .value = &.{.{ .literal = "bar" }} }},
+        &.{ &.{.{ .literal = "cmd" }}, &.{.{ .literal = "arg" }} },
         0,
     );
 }
@@ -1410,10 +1505,10 @@ test "parseCommand: multiple assignments" {
     try expectSimpleCommand(
         result,
         &.{
-            .{ .name = "FOO", .value = &.{"bar"} },
-            .{ .name = "BAZ", .value = &.{"qux"} },
+            .{ .name = "FOO", .value = &.{.{ .literal = "bar" }} },
+            .{ .name = "BAZ", .value = &.{.{ .literal = "qux" }} },
         },
-        &.{&.{"cmd"}},
+        &.{&.{.{ .literal = "cmd" }}},
         0,
     );
 }
@@ -1429,7 +1524,7 @@ test "parseCommand: non-assignment (equals at start)" {
     try expectSimpleCommand(
         result,
         &.{},
-        &.{&.{"=foo"}},
+        &.{&.{.{ .literal = "=foo" }}},
         0,
     );
 }
@@ -1445,7 +1540,7 @@ test "parseCommand: non-assignment (invalid identifier)" {
     try expectSimpleCommand(
         result,
         &.{},
-        &.{&.{"123=foo"}},
+        &.{&.{.{ .literal = "123=foo" }}},
         0,
     );
 }
@@ -1467,7 +1562,7 @@ test "parseCommand: simple redirection" {
     const redir = cmd.redirections[0];
     try std.testing.expectEqual(lexer.Redirection.Out, redir.op);
     try std.testing.expectEqual(@as(?u32, null), redir.source_fd);
-    try expectFileTarget(redir.target, &.{"file"});
+    try expectFileTarget(redir.target, &.{.{ .literal = "file" }});
 }
 
 test "parseCommand: command with redirection" {
@@ -1482,7 +1577,7 @@ test "parseCommand: command with redirection" {
 
     try std.testing.expectEqual(@as(usize, 1), cmd.argv.len);
     try std.testing.expectEqual(@as(usize, 1), cmd.redirections.len);
-    try expectFileTarget(cmd.redirections[0].target, &.{"out"});
+    try expectFileTarget(cmd.redirections[0].target, &.{.{ .literal = "out" }});
 }
 
 test "parseCommand: fd redirection 2>&1" {
@@ -1548,7 +1643,7 @@ test "parseCommand: single-quoted word" {
     try expectSimpleCommand(
         result,
         &.{},
-        &.{&.{"hello world"}},
+        &.{&.{.{ .quoted = "hello world" }}},
         0,
     );
 }
@@ -1564,7 +1659,7 @@ test "parseCommand: double-quoted word" {
     try expectSimpleCommand(
         result,
         &.{},
-        &.{&.{"hello world"}},
+        &.{&.{.{ .double_quoted = &.{.{ .literal = "hello world" }} }}},
         0,
     );
 }
@@ -1582,8 +1677,9 @@ test "parseCommand: quoted redirection-like string is literal" {
 
     // Should have 2 argv items: "cmd" and "2>&1"
     try std.testing.expectEqual(@as(usize, 2), cmd.argv.len);
-    try expectWord(cmd.argv[0], &.{"cmd"});
-    try expectWord(cmd.argv[1], &.{ "2", ">", "&", "1" }); // Separate tokens from double-quote parsing
+    try expectWord(cmd.argv[0], &.{.{ .literal = "cmd" }});
+    // Separate tokens from double-quote parsing
+    try expectWord(cmd.argv[1], &.{.{ .double_quoted = &.{ .{ .literal = "2>&1" } } }});
 
     // No redirections
     try std.testing.expectEqual(@as(usize, 0), cmd.redirections.len);
@@ -1602,8 +1698,8 @@ test "parseCommand: single-quoted redirection-like string is literal" {
 
     // Should have 2 argv items: "cmd" and "2>&1"
     try std.testing.expectEqual(@as(usize, 2), cmd.argv.len);
-    try expectWord(cmd.argv[0], &.{"cmd"});
-    try expectWord(cmd.argv[1], &.{"2>&1"}); // Single quotes preserve content as-is
+    try expectWord(cmd.argv[0], &.{.{ .literal = "cmd" }});
+    try expectWord(cmd.argv[1], &.{.{ .quoted = "2>&1" }}); // Single quotes preserve content as-is
 
     // No redirections
     try std.testing.expectEqual(@as(usize, 0), cmd.redirections.len);
@@ -1622,7 +1718,7 @@ test "parseCommand: command followed by double-quoted expansion" {
 
     // Should have exactly 2 argv items: "echo" and "$@" (in double quotes)
     try std.testing.expectEqual(@as(usize, 2), cmd.argv.len);
-    try expectWord(cmd.argv[0], &.{"echo"});
+    try expectWord(cmd.argv[0], &.{.{ .literal = "echo" }});
 
     // Second word should be a double_quoted containing a parameter expansion
     try std.testing.expectEqual(@as(usize, 1), cmd.argv[1].parts.len);
@@ -1651,7 +1747,7 @@ test "parseCommand: mixed quotes in word" {
     try expectSimpleCommand(
         result,
         &.{},
-        &.{&.{ "a", "b", "c" }},
+        &.{&.{ .{ .literal = "a" }, .{ .quoted = "b" }, .{ .literal = "c" } }},
         0,
     );
 }
@@ -1667,7 +1763,7 @@ test "parseCommand: escaped character" {
     try expectSimpleCommand(
         result,
         &.{},
-        &.{&.{ "$", "HOME" }},
+        &.{&.{ .{ .quoted = "$" }, .{ .literal = "HOME" } }},
         0,
     );
 }
@@ -1686,8 +1782,8 @@ test "parseCommand: complex command" {
     try std.testing.expectEqualStrings("FOO", cmd.assignments[0].name);
 
     try std.testing.expectEqual(@as(usize, 2), cmd.argv.len);
-    try expectWord(cmd.argv[0], &.{"cmd"});
-    try expectWord(cmd.argv[1], &.{"arg 1"});
+    try expectWord(cmd.argv[0], &.{.{ .literal = "cmd" }});
+    try expectWord(cmd.argv[1], &.{.{ .quoted = "arg 1" }});
 
     try std.testing.expectEqual(@as(usize, 2), cmd.redirections.len);
 }
@@ -1704,7 +1800,7 @@ test "parseCommand: assignment after command is not assignment" {
     try expectSimpleCommand(
         result,
         &.{}, // no assignments
-        &.{ &.{"cmd"}, &.{"FOO=bar"} }, // FOO=bar is an argument
+        &.{ &.{.{ .literal = "cmd" }}, &.{.{ .literal = "FOO=bar" }} }, // FOO=bar is an argument
         0,
     );
 }
@@ -1811,7 +1907,7 @@ test "parseCommand: fd redirection 2>&1 with buffer boundary" {
     const cmd = result orelse return error.ExpectedCommand;
 
     try std.testing.expectEqual(@as(usize, 1), cmd.argv.len);
-    try expectWord(cmd.argv[0], &.{"cmd"});
+    try expectWord(cmd.argv[0], &.{.{ .literal = "cmd" }});
 
     try std.testing.expectEqual(@as(usize, 1), cmd.redirections.len);
     const redir = cmd.redirections[0];
@@ -1871,13 +1967,13 @@ test "parseCommand: non-digit word before redirection with buffer boundary" {
 
     // "a2" should be argv[0], redirection should be separate
     try std.testing.expectEqual(@as(usize, 1), cmd.argv.len);
-    try expectWord(cmd.argv[0], &.{ "a", "2" }); // Split across buffer boundaries
+    try expectWord(cmd.argv[0], &.{ .{ .literal = "a2" } }); // Split across buffer boundaries
 
     try std.testing.expectEqual(@as(usize, 1), cmd.redirections.len);
     const redir = cmd.redirections[0];
     try std.testing.expectEqual(lexer.Redirection.Out, redir.op);
     try std.testing.expectEqual(@as(?u32, null), redir.source_fd);
-    try expectFileTarget(redir.target, &.{"file"});
+    try expectFileTarget(redir.target, &.{.{ .literal = "file" }});
 }
 
 test "parseCommand: input fd redirection 0<&3 with buffer boundary" {
@@ -1901,7 +1997,7 @@ test "parseCommand: input fd redirection 0<&3 with buffer boundary" {
     const cmd = result orelse return error.ExpectedCommand;
 
     try std.testing.expectEqual(@as(usize, 1), cmd.argv.len);
-    try expectWord(cmd.argv[0], &.{"cmd"});
+    try expectWord(cmd.argv[0], &.{.{ .literal = "cmd" }});
 
     try std.testing.expectEqual(@as(usize, 1), cmd.redirections.len);
     const redir = cmd.redirections[0];
@@ -1936,7 +2032,7 @@ test "parseCommand: input redirection 0<file with buffer boundary" {
     const redir = cmd.redirections[0];
     try std.testing.expectEqual(lexer.Redirection.In, redir.op);
     try std.testing.expectEqual(@as(?u32, 0), redir.source_fd);
-    try expectFileTarget(redir.target, &.{"input"});
+    try expectFileTarget(redir.target, &.{.{ .literal = "input" }});
 }
 
 // --- Fuzz test for buffer boundary invariance ---
@@ -2135,6 +2231,8 @@ test "parseCommand: buffer boundary invariance for fd redirections" {
 
             if (!try commandsEqual(arena2.allocator(), ref_result, small_result)) {
                 std.debug.print("Mismatch for input '{s}' with buffer size {d}\n", .{ input, buf_size });
+                std.debug.print("Large buffer: {f}\n", .{ref_result.?});
+                std.debug.print("Small buffer: {f}\n", .{small_result.?});
                 return error.BufferBoundaryMismatch;
             }
         }
@@ -2231,8 +2329,8 @@ test "parseCommand: single-quoted parentheses are valid arguments" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
     try std.testing.expectEqual(@as(usize, 2), cmd.?.argv.len);
-    try expectWord(cmd.?.argv[0], &[_][]const u8{"echo"});
-    try expectWord(cmd.?.argv[1], &[_][]const u8{"(foo)"});
+    try expectWord(cmd.?.argv[0], &.{.{ .literal = "echo" }});
+    try expectWord(cmd.?.argv[1], &.{.{ .quoted = "(foo)" }});
 }
 
 test "parseCommand: double-quoted parentheses are valid arguments" {
@@ -2246,8 +2344,8 @@ test "parseCommand: double-quoted parentheses are valid arguments" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
     try std.testing.expectEqual(@as(usize, 2), cmd.?.argv.len);
-    try expectWord(cmd.?.argv[0], &[_][]const u8{"echo"});
-    try expectWord(cmd.?.argv[1], &[_][]const u8{"(bar)"});
+    try expectWord(cmd.?.argv[0], &.{.{ .literal = "echo" }});
+    try expectWord(cmd.?.argv[1], &.{.{ .double_quoted = &.{.{ .literal = "(bar)" }} }});
 }
 
 // --- Command list tests ---
