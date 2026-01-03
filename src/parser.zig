@@ -188,7 +188,7 @@ pub const Word = struct {
 pub const Assignment = struct {
     /// The variable name (always literal, no expansions).
     name: []const u8,
-    /// The value (may contain expansions in the future).
+    /// The value (including expansions).
     value: Word,
     /// The absolute position in the input where this assignment starts.
     position: usize,
@@ -309,14 +309,25 @@ pub const SimpleCommand = struct {
 };
 
 /// A command that can be executed.
+///
+/// May be negated with the `!` reserved word (Section 2.9.2). Negation only
+/// affects exit status, not execution environment - `! cd /tmp` still changes
+/// the working directory. The `!` must appear literally (not from expansion)
+/// as the first word of the pipeline (Section 2.4). Note that pipelines are
+/// currently not supported.
+///
 /// Currently only supports simple commands, but will expand to include
 /// compound commands (if, while, for, case), pipelines, and subshells.
-pub const Command = union(enum) {
-    simple: SimpleCommand,
+pub const Command = struct {
+    payload: Payload,
+
+    pub const Payload = union(enum) {
+        simple: SimpleCommand,
+    };
 
     /// Format the command for human-readable output.
     pub fn format(self: Command, writer: *std.io.Writer) std.io.Writer.Error!void {
-        switch (self) {
+        switch (self.payload) {
             .simple => |cmd| try cmd.format(writer),
         }
     }
@@ -348,28 +359,6 @@ pub const ErrorInfo = struct {
     column: usize,
 };
 
-/// Parser state machine states.
-const ParseState = enum {
-    /// Initial state - assignments and reserved words are recognized.
-    /// TODO: When compound commands are implemented, check for reserved
-    /// words here (if, while, for, case, {, etc.) and branch to appropriate
-    /// compound command parsing states. Reserved words are recognized
-    /// pre-expansion, only when the literal token matches and is unquoted.
-    /// See POSIX Section 2.4 - Reserved Words.
-    start,
-    /// Seen command name - only arguments and redirections allowed.
-    /// Assignments (FOO=bar) are treated as regular arguments.
-    after_command,
-    /// Collecting tokens for a word until complete=true.
-    collecting_word,
-    /// After redirection operator, must collect target word.
-    need_redir_target,
-    /// Word collection finished, decide what to do with it.
-    word_complete,
-    /// Finished parsing command.
-    done,
-};
-
 /// Pending redirection info while collecting target.
 const PendingRedir = struct {
     op: lexer.Redirection,
@@ -388,518 +377,215 @@ const max_context_depth = 32;
 
 /// Parser context for nested constructs (double quotes, parameter expansions).
 /// The parser maintains a stack of these to handle nesting like "${var:-${other}}".
+///
+/// POSIX section 2.10.2 defines a grammar for parsing POSIX sh, which includes a
+/// number of rules that are specific to the context that you are parsing.
+///
+/// For example:
+///  - Pipelines are N commands, separated by N-1 `|` symbols, and an optional `!` to
+///    negate the exit code of the entire pipeline to begin.
+///  - AND and OR statements are pipelines joined by `&&` or `||` symbols.
+///  - Terms are AND and OR statements, separated by `&` or `;`.
+///  - Brace groups are made up of a list of terms.
+///  - Compound commands are either brace-groups, subshells, for_clauses,
+///    case_clauses, if_clauses, while_clauses or until_clauses.
+///  - Commands are either simple-commands, compound commands or function
+///    definitions.
+///
+/// And the whole set repeats itself.
+///
+/// We use this object to track which of the contexts we are in, and can push/pop
+/// this when a relevant symbol appears. This is also useful in nested scenarios,
+/// e.g. shell expansion (`"$(some-command)"`).
 const ParserContext = union(enum) {
-    /// Inside double quotes - collecting parts for a double_quoted WordPart.
-    double_quote: struct {
-        parts: std.ArrayListUnmanaged(WordPart),
-    },
-    /// Inside ${...} - collecting the parameter expansion.
-    brace_expansion: struct {
-        /// The parameter name (null until we see it).
-        name: ?[]const u8,
-        /// The modifier operation (null if no modifier).
-        modifier_op: ?lexer.ModifierOp,
-        /// Whether the modifier has a colon (for :-, :=, etc.).
-        modifier_check_null: bool,
-        /// Parts being collected for the modifier's word.
-        word_parts: std.ArrayListUnmanaged(WordPart),
-        /// True after we've seen a modifier token.
-        seen_modifier: bool,
+    /// A simple command, as defined by POSIX section 2.9.1.
+    simple_command: struct {
+        state: enum {
+            /// Reserved words are recognized pre-expansion, but only when the
+            /// literal token matches and is unquoted.
+            /// See POSIX Section 2.4 - Reserved Words.
+            start,
+            /// Collecting tokens for a word until complete=true.
+            collecting_word,
+            /// After redirection operator, must collect target word.
+            need_redir_target,
+            /// Word collection finished, decide what to do with it.
+            word_complete,
+            /// Finished parsing command.
+            done,
+        },
+        /// Whether we've seen a command. This helps us track whether we may be doing
+        /// assignments or not.
+        /// Assignments (FOO=bar) are treated as regular arguments if this is `true`.
+        seen_command: bool,
+        /// Pending redirection (while collecting target).
+        pending_redir: ?PendingRedir,
+        /// The builder of the words (arguments) for this command.
+        word_collector: WordCollector,
+
+        /// The assignments for this command.
+        assignments: std.ArrayListUnmanaged(Assignment),
+        /// The arguments for this command.
+        argv: std.ArrayListUnmanaged(Word),
+        /// The redirections for this command.
+        redirections: std.ArrayListUnmanaged(ParsedRedirection),
+
+        /// Set up pending redirection info with default source fd (null).
+        fn setPendingRedir(self: *@This(), redir: lexer.Redirection, tok: lexer.Token) void {
+            self.pending_redir = .{
+                .op = redir,
+                .source_fd = null,
+                .position = tok.position,
+                .line = tok.line,
+                .column = tok.column,
+                .end_line = tok.end_line,
+                .end_column = tok.end_column,
+            };
+        }
     },
 
-    /// Initialize a double_quote context.
-    fn initDoubleQuote() ParserContext {
-        return .{ .double_quote = .{ .parts = .{} } };
-    }
-
-    /// Initialize a brace_expansion context.
-    fn initBraceExpansion() ParserContext {
-        return .{ .brace_expansion = .{
-            .name = null,
-            .modifier_op = null,
-            .modifier_check_null = false,
-            .word_parts = .{},
-            .seen_modifier = false,
+    /// Initialize a simple_command context.
+    fn initSimpleCommand(allocator: Allocator) ParserContext {
+        return .{ .simple_command = .{
+            .state = .start,
+            .seen_command = false,
+            .pending_redir = null,
+            .word_collector = WordCollector.init(allocator),
+            .assignments = .{},
+            .argv = .{},
+            .redirections = .{},
         } };
     }
 
-    /// Clean up any allocated memory in this context.
     fn deinit(self: *ParserContext, allocator: Allocator) void {
         switch (self.*) {
-            .double_quote => |*dq| dq.parts.deinit(allocator),
-            .brace_expansion => |*be| be.word_parts.deinit(allocator),
+            .simple_command => |*sc| {
+                sc.word_collector.deinit();
+                sc.assignments.deinit(allocator);
+                sc.argv.deinit(allocator);
+                sc.redirections.deinit(allocator);
+            },
         }
     }
 };
 
-/// Parser for POSIX shell simple commands.
-///
-/// The parser consumes tokens from a lexer and produces an AST.
-/// All strings are copied to the provided allocator (typically an arena),
-/// since lexer token slices are invalidated on the next `nextToken()` call.
-pub const Parser = struct {
-    /// Allocator for AST nodes and string copies.
+const WordCollector = struct {
     allocator: Allocator,
-    /// The lexer to read tokens from.
-    lex: *lexer.Lexer,
-
-    /// Error context for the most recent error.
-    error_info: ?ErrorInfo,
-
-    // --- State machine fields ---
-
-    /// Current parser state.
-    state: ParseState,
-
     /// In-progress word parts.
-    word_parts: std.ArrayListUnmanaged(WordPart),
-    /// Position where current word started.
-    word_start_position: usize,
-    /// Line where current word started.
-    word_start_line: usize,
-    /// Column where current word started.
-    word_start_column: usize,
+    parts: std.ArrayListUnmanaged(WordPart),
+    /// The quotation stack for potentially nested constructs (double quotes, brace
+    /// expansions).
+    ///
+    /// This is currently set to 8, as doing 8 nested words is relatively
+    /// pathological. It is also worth noting that command expansion won't come
+    /// through here, but instead it will be a nested ParserContext.
+    quote_stack: [8]QuoteContext,
+    quote_depth: u8 = 0,
+    // TODO: Consider removing (or shrinking) these position attributes.
+    /// The position where the word started.
+    start_position: usize,
+    /// The line where the word started.
+    start_line: usize,
+    /// The column where the word started.
+    start_column: usize,
 
-    /// Context stack for nested constructs (double quotes, brace expansions).
-    /// Index 0 is the bottom of the stack; context_depth - 1 is the top.
-    context_stack: [max_context_depth]ParserContext,
-    /// Current depth of the context stack (0 = no active context).
-    context_depth: usize,
+    const QuoteContext = union(enum) {
+        /// Inside double quotes - collecting parts for a double_quoted WordPart.
+        double_quote: struct {
+            parts: std.ArrayListUnmanaged(WordPart),
+        },
+        /// Inside ${...} - collecting the parameter expansion.
+        brace_expansion: struct {
+            /// Parts being collected for the modifier's word.
+            word_parts: std.ArrayListUnmanaged(WordPart),
+            /// The parameter name (null until we see it).
+            name: ?[]const u8,
+            /// The modifier operation (null if no modifier).
+            modifier_op: ?lexer.ModifierOp,
+            /// True after we've seen a modifier token.
+            seen_modifier: bool,
+            /// Whether the modifier has a colon (for :-, :=, etc.).
+            modifier_check_null: bool,
+        },
 
-    /// Pending redirection (while collecting target).
-    pending_redir: ?PendingRedir,
+        /// Initialize a double_quote context.
+        fn initDoubleQuote() QuoteContext {
+            return .{ .double_quote = .{ .parts = .{} } };
+        }
 
-    /// Results being built.
-    assignments: std.ArrayListUnmanaged(Assignment),
-    argv: std.ArrayListUnmanaged(Word),
-    redirections: std.ArrayListUnmanaged(ParsedRedirection),
+        /// Initialize a brace_expansion context.
+        fn initBraceExpansion() QuoteContext {
+            return .{ .brace_expansion = .{
+                .name = null,
+                .modifier_op = null,
+                .modifier_check_null = false,
+                .word_parts = .{},
+                .seen_modifier = false,
+            } };
+        }
 
-    /// Track if we've seen a command (for assignment detection).
-    seen_command: bool,
+        fn deinit(self: *QuoteContext, allocator: Allocator) void {
+            switch (self.*) {
+                .double_quote => |*dq| dq.parts.deinit(allocator),
+                .brace_expansion => |*be| be.word_parts.deinit(allocator),
+            }
+        }
+    };
 
-    /// Initialize a new parser.
-    pub fn init(allocator: Allocator, lex: *lexer.Lexer) Parser {
-        return Parser{
+    fn init(allocator: Allocator) WordCollector {
+        return WordCollector{
             .allocator = allocator,
-            .lex = lex,
-            .error_info = null,
-            .state = .start,
-            .word_parts = .{},
-            .word_start_position = 0,
-            .word_start_line = 0,
-            .word_start_column = 0,
-            .context_stack = undefined,
-            .context_depth = 0,
-            .pending_redir = null,
-            .assignments = .{},
-            .argv = .{},
-            .redirections = .{},
-            .seen_command = false,
+            .parts = .{},
+            .quote_stack = undefined,
+            .quote_depth = 0,
+            .start_position = 0,
+            .start_line = 0,
+            .start_column = 0,
         };
     }
 
-    /// Get error information for the most recent parse error.
-    pub fn getErrorInfo(self: *const Parser) ?ErrorInfo {
-        return self.error_info;
+    fn pushContext(self: *WordCollector, ctx: QuoteContext) void {
+        std.debug.assert(self.quote_depth < self.quote_stack.len);
+        self.quote_stack[self.quote_depth] = ctx;
+        self.quote_depth += 1;
     }
 
-    // --- Context stack operations ---
-
-    /// Push a new context onto the stack.
-    fn pushContext(self: *Parser, ctx: ParserContext) void {
-        std.debug.assert(self.context_depth < max_context_depth);
-        self.context_stack[self.context_depth] = ctx;
-        self.context_depth += 1;
+    /// Pop a quote context.
+    fn popContext(self: *WordCollector) QuoteContext {
+        std.debug.assert(self.quote_depth > 0);
+        self.quote_depth -= 1;
+        return self.quote_stack[self.quote_depth];
     }
 
-    /// Pop the top context from the stack.
-    fn popContext(self: *Parser) ParserContext {
-        std.debug.assert(self.context_depth > 0);
-        self.context_depth -= 1;
-        return self.context_stack[self.context_depth];
-    }
-
-    /// Get a mutable pointer to the current (top) context.
-    fn currentContext(self: *Parser) ?*ParserContext {
-        if (self.context_depth == 0) return null;
-        return &self.context_stack[self.context_depth - 1];
-    }
-
-    /// Check if we're currently inside a double-quote context.
-    fn inDoubleQuote(self: *const Parser) bool {
-        if (self.context_depth == 0) return false;
-        return self.context_stack[self.context_depth - 1] == .double_quote;
-    }
-
-    /// Check if we're currently inside a brace expansion context.
-    fn inBraceExpansion(self: *const Parser) bool {
-        if (self.context_depth == 0) return false;
-        return self.context_stack[self.context_depth - 1] == .brace_expansion;
-    }
-
-    /// Get a user-friendly error message for a lexer error.
-    fn lexerErrorMessage(err: lexer.LexerError) []const u8 {
-        return switch (err) {
-            error.InvalidModifier => "invalid modifier",
-            error.UnterminatedQuote => "unterminated quote",
-            error.UnterminatedBraceExpansion => "unterminated brace expansion",
-            error.NestingTooDeep => "nesting too deep",
-            error.UnexpectedEndOfFile => "unexpected end of file",
-        };
-    }
-
-    /// Parse a simple command from the input.
-    ///
-    /// Returns the parsed command, or `null` if the input is empty.
-    /// Returns an error if the input is malformed.
-    pub fn parseCommand(self: *Parser) ParseError!?SimpleCommand {
-        self.reset();
-
-        state: switch (self.state) {
-            .start => {
-                const tok = self.lex.nextToken() catch |err| {
-                    self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
-                    return err;
-                } orelse {
-                    continue :state .done;
-                };
-
-                switch (tok.type) {
-                    .Newline, .Semicolon, .DoubleSemicolon => {
-                        // TODO: DoubleSemicolon (`;;`) will need special handling for case/esac
-                        if (self.assignments.items.len == 0 and
-                            self.argv.items.len == 0 and
-                            self.redirections.items.len == 0) {
-                            // Empty command (e.g., leading semicolon or blank line) - skip
-                            continue :state .start;
-                        } else {
-                            continue :state .done;
-                        }
-                    },
-                    .Redirection => |redir| {
-                        self.setPendingRedir(redir, tok);
-                        continue :state .need_redir_target;
-                    },
-                    .LeftParen => {
-                        self.setError("subshells are not yet implemented", tok.position, tok.line, tok.column);
-                        return ParseError.UnsupportedSyntax;
-                    },
-                    .RightParen => {
-                        self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
-                        return ParseError.UnsupportedSyntax;
-                    },
-                    .Pipe => {
-                        self.setError("syntax error near unexpected token `|'", tok.position, tok.line, tok.column);
-                        return ParseError.UnsupportedSyntax;
-                    },
-                    .DoublePipe => {
-                        self.setError("syntax error near unexpected token `||'", tok.position, tok.line, tok.column);
-                        return ParseError.UnsupportedSyntax;
-                    },
-                    else => {
-                        self.startWord(tok);
-                        try self.addTokenToParts(tok);
-                        if (tok.complete) {
-                            continue :state .word_complete;
-                        } else {
-                            continue :state .collecting_word;
-                        }
-                    },
-                }
-            },
-
-            .after_command => {
-                const tok = self.lex.nextToken() catch |err| {
-                    self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
-                    return err;
-                } orelse {
-                    continue :state .done;
-                };
-
-                switch (tok.type) {
-                    .Newline, .Semicolon, .DoubleSemicolon => {
-                        // Command is complete, separator consumed
-                        // TODO: DoubleSemicolon (`;;`) will need special handling for case/esac
-                        continue :state .done;
-                    },
-                    .Redirection => |redir| {
-                        self.setPendingRedir(redir, tok);
-                        continue :state .need_redir_target;
-                    },
-                    .LeftParen => {
-                        self.setError("syntax error near unexpected token `('", tok.position, tok.line, tok.column);
-                        return ParseError.UnsupportedSyntax;
-                    },
-                    .RightParen => {
-                        self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
-                        return ParseError.UnsupportedSyntax;
-                    },
-                    .Pipe => {
-                        // TODO: Pipeline support - for now, error
-                        self.setError("pipelines are not yet implemented", tok.position, tok.line, tok.column);
-                        return ParseError.UnsupportedSyntax;
-                    },
-                    .DoublePipe => {
-                        // TODO: OR list support - for now, error
-                        self.setError("OR lists (||) are not yet implemented", tok.position, tok.line, tok.column);
-                        return ParseError.UnsupportedSyntax;
-                    },
-                    else => {
-                        self.startWord(tok);
-                        try self.addTokenToParts(tok);
-                        if (tok.complete) {
-                            continue :state .word_complete;
-                        } else {
-                            continue :state .collecting_word;
-                        }
-                    },
-                }
-            },
-
-            .collecting_word => {
-                const tok = self.lex.nextToken() catch |err| {
-                    self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
-                    return err;
-                } orelse {
-                    // End of input mid-word, finish what we have
-                    continue :state .word_complete;
-                };
-
-                switch (tok.type) {
-                    .Redirection => |redir| {
-                        // Encountered redirection while collecting word.
-                        // Try to interpret word_parts as a source fd number.
-                        // If successful, use it as the source fd for this redirection.
-                        // If not (overflow, non-digits), treat word as a regular argument.
-                        if (wordPartsToFdNumber(self.word_parts.items)) |source_fd| {
-                            // Valid source fd - use it for the redirection
-                            self.word_parts = .{};
-                            self.pending_redir = .{
-                                .op = redir,
-                                .source_fd = source_fd,
-                                .position = self.word_start_position,
-                                .line = self.word_start_line,
-                                .column = self.word_start_column,
-                                .end_line = tok.end_line,
-                                .end_column = tok.end_column,
-                            };
-                            continue :state .need_redir_target;
-                        } else {
-                            // Not a valid fd - finalize word as argument and handle redirection
-                            const word = try self.finishWord();
-                            if (!self.seen_command) {
-                                if (try self.tryBuildAssignment(word)) |assignment| {
-                                    try self.assignments.append(self.allocator, assignment);
-                                } else {
-                                    try self.argv.append(self.allocator, word);
-                                    self.seen_command = true;
-                                }
-                            } else {
-                                try self.argv.append(self.allocator, word);
-                            }
-                            // Now handle the redirection with default source fd
-                            self.setPendingRedir(redir, tok);
-                            continue :state .need_redir_target;
-                        }
-                    },
-                    .LeftParen => {
-                        self.setError("syntax error near unexpected token `('", tok.position, tok.line, tok.column);
-                        return ParseError.UnsupportedSyntax;
-                    },
-                    .RightParen => {
-                        self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
-                        return ParseError.UnsupportedSyntax;
-                    },
-                    .Newline, .Semicolon, .DoubleSemicolon, .Pipe, .DoublePipe => {
-                        // Unreachable: The lexer marks words complete when followed by separators
-                        // or operators. Even on a buffer boundary, the lexer emits a complete empty
-                        // Continuation token before the separator/operator, which transitions us to
-                        // .word_complete first. This invariant is verified by the buffer boundary
-                        // tests in this file.
-                        unreachable;
-                    },
-                    else => {
-                        try self.addTokenToParts(tok);
-                        if (tok.complete) {
-                            continue :state .word_complete;
-                        } else {
-                            continue :state .collecting_word;
-                        }
-                    },
-                }
-            },
-
-            .need_redir_target => {
-                const tok = self.lex.nextToken() catch |err| {
-                    self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
-                    return err;
-                } orelse {
-                    // EOF - error points to end of redirection operator
-                    const redir = self.pending_redir.?;
-                    self.setError("missing redirection target", redir.position, redir.end_line, redir.end_column);
-                    return ParseError.MissingRedirectionTarget;
-                };
-
-                switch (tok.type) {
-                    .Newline, .Semicolon, .DoubleSemicolon => {
-                        // Separator where redirection target was expected
-                        const redir = self.pending_redir.?;
-                        self.setError("missing redirection target", redir.position, redir.end_line, redir.end_column);
-                        return ParseError.MissingRedirectionTarget;
-                    },
-                    .Redirection => {
-                        // Another redirection where target was expected - error points to end of first redirection
-                        const redir = self.pending_redir.?;
-                        self.setError("missing redirection target", redir.position, redir.end_line, redir.end_column);
-                        return ParseError.MissingRedirectionTarget;
-                    },
-                    .LeftParen => {
-                        self.setError("syntax error near unexpected token `('", tok.position, tok.line, tok.column);
-                        return ParseError.UnsupportedSyntax;
-                    },
-                    .RightParen => {
-                        self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
-                        return ParseError.UnsupportedSyntax;
-                    },
-                    else => {
-                        self.startWord(tok);
-                        try self.addTokenToParts(tok);
-                        if (tok.complete) {
-                            continue :state .word_complete;
-                        } else {
-                            continue :state .collecting_word;
-                        }
-                    },
-                }
-            },
-
-            .word_complete => {
-                const word = try self.finishWord();
-
-                // If we have a pending redirection, this word is its target
-                if (self.pending_redir) |redir| {
-                    const target: RedirectionTarget = if (redir.op == .Fd)
-                        try self.parseFdTarget(word)
-                    else
-                        .{ .file = word };
-
-                    try self.redirections.append(self.allocator, .{
-                        .op = redir.op,
-                        .source_fd = redir.source_fd,
-                        .target = target,
-                        .position = redir.position,
-                        .line = redir.line,
-                        .column = redir.column,
-                    });
-                    self.pending_redir = null;
-                    continue :state if (self.seen_command) .after_command else .start;
-                }
-
-                // Check if it's an assignment (only valid before command name)
-                if (!self.seen_command) {
-                    if (try self.tryBuildAssignment(word)) |assignment| {
-                        try self.assignments.append(self.allocator, assignment);
-                        continue :state .start;
-                    }
-                }
-
-                // It's a command/argument
-                try self.argv.append(self.allocator, word);
-                self.seen_command = true;
-                continue :state .after_command;
-            },
-
-            .done => {
-                if (self.assignments.items.len == 0 and
-                    self.argv.items.len == 0 and
-                    self.redirections.items.len == 0)
-                {
-                    return null;
-                }
-
-                return SimpleCommand{
-                    .assignments = try self.assignments.toOwnedSlice(self.allocator),
-                    .argv = try self.argv.toOwnedSlice(self.allocator),
-                    .redirections = try self.redirections.toOwnedSlice(self.allocator),
-                };
-            },
+    fn currentContext(self: *WordCollector) ?*QuoteContext {
+        if (self.quote_depth == 0) {
+            return null;
         }
-    }
-
-    /// Pull the next command from the input.
-    ///
-    /// This is the primary iterator interface for pull-based execution.
-    /// Returns the next parsed command, or `null` when input is exhausted.
-    /// Empty commands (e.g., `;;;` or blank lines) are silently skipped.
-    ///
-    /// Example usage:
-    /// ```
-    /// while (try parser.next()) |cmd| {
-    ///     try executor.execute(cmd);
-    /// }
-    /// ```
-    pub fn next(self: *Parser) ParseError!?Command {
-        const simple_cmd = try self.parseCommand() orelse return null;
-        return .{ .simple = simple_cmd };
-    }
-
-    // --- Helper methods ---
-
-    /// Reset parser state for a new command.
-    fn reset(self: *Parser) void {
-        self.error_info = null;
-        self.state = .start;
-        self.word_parts = .{};
-        self.word_start_position = 0;
-        self.word_start_line = 0;
-        self.word_start_column = 0;
-        // Clean up any leftover contexts (shouldn't happen in normal operation)
-        while (self.context_depth > 0) {
-            var ctx = self.popContext();
-            ctx.deinit(self.allocator);
-        }
-        self.pending_redir = null;
-        self.assignments = .{};
-        self.argv = .{};
-        self.redirections = .{};
-        self.seen_command = false;
+        return &self.quote_stack[self.quote_depth - 1];
     }
 
     /// Start collecting a new word.
-    fn startWord(self: *Parser, tok: lexer.Token) void {
-        self.word_parts = .{};
-        self.word_start_position = tok.position;
-        self.word_start_line = tok.line;
-        self.word_start_column = tok.column;
+    fn startWord(self: *WordCollector, tok: lexer.Token) void {
+        self.parts = .{};
+        self.start_position = tok.position;
+        self.start_line = tok.line;
+        self.start_column = tok.column;
     }
 
     /// Finish collecting the current word and return it.
-    fn finishWord(self: *Parser) ParseError!Word {
+    fn finishWord(self: *WordCollector) ParseError!Word {
         return Word{
-            .parts = try self.word_parts.toOwnedSlice(self.allocator),
-            .position = self.word_start_position,
-            .line = self.word_start_line,
-            .column = self.word_start_column,
-        };
-    }
-
-    /// Set up pending redirection info with default source fd (null).
-    fn setPendingRedir(self: *Parser, redir: lexer.Redirection, tok: lexer.Token) void {
-        self.pending_redir = .{
-            .op = redir,
-            .source_fd = null,
-            .position = tok.position,
-            .line = tok.line,
-            .column = tok.column,
-            .end_line = tok.end_line,
-            .end_column = tok.end_column,
+            .parts = try self.parts.toOwnedSlice(self.allocator),
+            .position = self.start_position,
+            .line = self.start_line,
+            .column = self.start_column,
         };
     }
 
     /// Add a token's content to the word parts list.
     /// Handles nested contexts (double quotes, brace expansions) by collecting
     /// parts into the appropriate context and finalizing when the context ends.
-    fn addTokenToParts(self: *Parser, token: lexer.Token) ParseError!void {
+    fn addTokenToParts(self: *WordCollector, token: lexer.Token) ParseError!void {
         switch (token.type) {
             .Literal => |lit| {
                 const copied = try self.allocator.dupe(u8, lit);
@@ -921,12 +607,12 @@ pub const Parser = struct {
             },
             .DoubleQuoteBegin => {
                 // Push a double-quote context onto the stack.
-                self.pushContext(ParserContext.initDoubleQuote());
+                self.pushContext(QuoteContext.initDoubleQuote());
             },
             .DoubleQuoteEnd => {
                 // Pop the double-quote context and finalize it.
-                std.debug.assert(self.inDoubleQuote());
                 var ctx = self.popContext();
+                std.debug.assert(ctx == .double_quote);
                 errdefer ctx.deinit(self.allocator);
                 const parts_slice = try ctx.double_quote.parts.toOwnedSlice(self.allocator);
                 try self.addPartToCurrentContext(.{ .double_quoted = parts_slice });
@@ -939,26 +625,25 @@ pub const Parser = struct {
             },
             .BraceExpansionBegin => {
                 // Push a brace expansion context onto the stack.
-                self.pushContext(ParserContext.initBraceExpansion());
+                self.pushContext(QuoteContext.initBraceExpansion());
             },
             .Modifier => |mod| {
                 // Modifier inside ${...}
-                std.debug.assert(self.inBraceExpansion());
                 const ctx = self.currentContext().?;
+                std.debug.assert(ctx.* == .brace_expansion);
                 ctx.brace_expansion.modifier_op = mod.op;
                 ctx.brace_expansion.modifier_check_null = mod.check_null;
                 ctx.brace_expansion.seen_modifier = true;
             },
             .BraceExpansionEnd => {
                 // Pop the brace expansion context and build the ParameterExpansion.
-                std.debug.assert(self.inBraceExpansion());
                 var ctx = self.popContext();
+                std.debug.assert(ctx == .brace_expansion);
                 errdefer ctx.deinit(self.allocator);
                 const be = &ctx.brace_expansion;
 
                 // Check for missing parameter name (e.g., ${} or ${:-foo})
                 if (be.name == null) {
-                    self.setError("bad substitution", token.position, token.line, token.column);
                     return error.BadSubstitution;
                 }
 
@@ -997,7 +682,7 @@ pub const Parser = struct {
     /// Add a WordPart to the current context.
     /// If inside a brace expansion, handles the special case where the first
     /// literal becomes the parameter name.
-    fn addPartToCurrentContext(self: *Parser, part: WordPart) !void {
+    fn addPartToCurrentContext(self: *WordCollector, part: WordPart) !void {
         if (self.currentContext()) |ctx| {
             switch (ctx.*) {
                 .double_quote => |*dq| {
@@ -1032,13 +717,13 @@ pub const Parser = struct {
             }
         } else {
             // No context - add directly to word_parts
-            try self.word_parts.append(self.allocator, part);
+            try self.parts.append(self.allocator, part);
         }
     }
 
     /// Extend the last part in the current context with additional content.
     /// Used for Continuation tokens that continue a previous incomplete token.
-    fn continueLastPart(self: *Parser, content: []const u8) ParseError!void {
+    fn continueLastPart(self: *WordCollector, content: []const u8) ParseError!void {
         if (content.len == 0) return;
 
         const ExtendError = ParseError;
@@ -1085,8 +770,8 @@ pub const Parser = struct {
             }
         }.f;
 
-        if (self.context_depth > 0) {
-            const ctx = &self.context_stack[self.context_depth - 1];
+        if (self.quote_depth > 0) {
+            const ctx = &self.quote_stack[self.quote_depth - 1];
             switch (ctx.*) {
                 .double_quote => |*dq| {
                     try extendLastPartInList(allocator, &dq.parts, content);
@@ -1108,8 +793,455 @@ pub const Parser = struct {
             }
         } else {
             // No context - extend in top-level word_parts
-            try extendLastPartInList(allocator, &self.word_parts, content);
+            try extendLastPartInList(allocator, &self.parts, content);
         }
+    }
+
+    /// Clean up any allocated memory in this context.
+    fn deinit(self: *WordCollector) void {
+        self.parts.deinit(self.allocator);
+        for (self.quote_stack[0..self.quote_depth]) |*context| {
+            context.deinit(self.allocator);
+        }
+    }
+};
+
+/// Parser for POSIX shell simple commands.
+///
+/// The parser consumes tokens from a lexer and produces an AST.
+/// All strings are copied to the provided allocator (typically an arena),
+/// since lexer token slices are invalidated on the next `nextToken()` call.
+pub const Parser = struct {
+    /// Allocator for AST nodes and string copies.
+    allocator: Allocator,
+    /// The lexer to read tokens from.
+    lex: *lexer.Lexer,
+    /// The token that has been peeked.
+    peeked: ?lexer.Token = null,
+
+    /// Error context for the most recent error.
+    error_info: ?ErrorInfo,
+
+    // --- State machine fields ---
+
+    /// Context stack for parsing in different contexts.
+    /// Index 0 is the bottom of the stack; context_depth - 1 is the top.
+    context_stack: [max_context_depth]ParserContext,
+    /// Current depth of the context stack (there is always at least one).
+    context_depth: usize,
+
+    /// Initialize a new parser.
+    pub fn init(allocator: Allocator, lex: *lexer.Lexer) Parser {
+        var parser = Parser{
+            .allocator = allocator,
+            .lex = lex,
+            .error_info = null,
+            .context_stack = undefined,
+            .context_depth = 0,
+        };
+        parser.pushContext(ParserContext.initSimpleCommand(allocator));
+        return parser;
+    }
+
+    /// Get error information for the most recent parse error.
+    pub fn getErrorInfo(self: *const Parser) ?ErrorInfo {
+        return self.error_info;
+    }
+
+    // --- Lexer operations ---
+
+    /// Peek a token from the lexer.
+    fn peekToken(self: *Parser) !?lexer.Token {
+        if (self.peeked) |tok| return tok;
+        self.peeked = try self.lex.nextToken();
+        return self.peeked;
+    }
+
+    /// Get the next token from the lexer.
+    fn consumeToken(self: *Parser) !?lexer.Token {
+        if (self.peeked) |tok| {
+            self.peeked = null;
+            return tok;
+        }
+        return try self.lex.nextToken();
+    }
+
+    // --- Context stack operations ---
+
+    /// Push a new context onto the stack.
+    fn pushContext(self: *Parser, ctx: ParserContext) void {
+        std.debug.assert(self.context_depth < max_context_depth);
+        self.context_stack[self.context_depth] = ctx;
+        self.context_depth += 1;
+    }
+
+    /// Pop the top context from the stack.
+    fn popContext(self: *Parser) ParserContext {
+        std.debug.assert(self.context_depth > 0);
+        self.context_depth -= 1;
+        return self.context_stack[self.context_depth];
+    }
+
+    /// Get a mutable pointer to the current (top) context.
+    fn currentContext(self: *Parser) *ParserContext {
+        return &self.context_stack[self.context_depth - 1];
+    }
+
+    /// Get a user-friendly error message for a lexer error.
+    fn lexerErrorMessage(err: lexer.LexerError) []const u8 {
+        return switch (err) {
+            error.InvalidModifier => "invalid modifier",
+            error.UnterminatedQuote => "unterminated quote",
+            error.UnterminatedBraceExpansion => "unterminated brace expansion",
+            error.NestingTooDeep => "nesting too deep",
+            error.UnexpectedEndOfFile => "unexpected end of file",
+        };
+    }
+
+    /// Parse a simple command from the input.
+    ///
+    /// Returns the parsed command, or `null` if the input is empty.
+    /// Returns an error if the input is malformed.
+    pub fn parseCommand(self: *Parser) ParseError!?SimpleCommand {
+        self.reset();
+
+        switch (self.currentContext().*) {
+            .simple_command => |*simple_command| {
+                simple_command: switch (simple_command.state) {
+                    .start => {
+                        const tok = self.peekToken() catch |err| {
+                            self.setError(
+                                lexerErrorMessage(err),
+                                self.lex.position,
+                                self.lex.line,
+                                self.lex.column,
+                            );
+                            return err;
+                        } orelse {
+                            continue :simple_command .done;
+                        };
+
+                        switch (tok.type) {
+                            .Newline, .Semicolon, .DoubleSemicolon => {
+                                // If we get these, we're at the end of our simple
+                                // command. We should yield back up to the context
+                                // above.
+                                // TODO do NOT consume the separator here when we
+                                // have other states.
+                                _ = try self.consumeToken();
+                                continue :simple_command .done;
+                            },
+                            .Redirection => |redir| {
+                                simple_command.setPendingRedir(redir, tok);
+                                _ = try self.consumeToken();
+                                continue :simple_command .need_redir_target;
+                            },
+                            .LeftParen => {
+                                // TODO: Implement subshells.
+                                //
+                                // These are specified in the following subsections:
+                                //  - 2.6.3 (Command substituation).
+                                //  - 2.9.4 (Compound commands).
+                                self.setError(
+                                    "subshells are not yet implemented",
+                                    tok.position,
+                                    tok.line,
+                                    tok.column,
+                                );
+                                return ParseError.UnsupportedSyntax;
+                            },
+                            .RightParen => {
+                                self.setError(
+                                    "syntax error near unexpected token `)'",
+                                    tok.position,
+                                    tok.line,
+                                    tok.column,
+                                );
+                                return ParseError.UnsupportedSyntax;
+                            },
+                            .Pipe => {
+                                // TODO: Implement pipelines, as specified in POSIX
+                                // subsection 2.4.
+                                self.setError(
+                                    "syntax error near unexpected token `|'",
+                                    tok.position,
+                                    tok.line,
+                                    tok.column,
+                                );
+                                return ParseError.UnsupportedSyntax;
+                            },
+                            .DoublePipe => {
+                                // TODO: Implement and_or lists, as specified in
+                                // POSIX subsection 2.9.3 (Lists).
+                                self.setError(
+                                    "syntax error near unexpected token `||'",
+                                    tok.position,
+                                    tok.line,
+                                    tok.column,
+                                );
+                                return ParseError.UnsupportedSyntax;
+                            },
+                            else => {
+                                // Start the first word of the simple_command.
+                                _ = try self.consumeToken();
+                                simple_command.word_collector.startWord(tok);
+                                simple_command.word_collector.addTokenToParts(tok) catch |err| {
+                                    switch (err) {
+                                        error.BadSubstitution => {
+                                            self.setError("bad substitution", self.lex.position, self.lex.line, self.lex.column);
+                                        },
+                                        else => {},
+                                    }
+                                    return err;
+                                };
+                                if (tok.complete) {
+                                    continue :simple_command .word_complete;
+                                } else {
+                                    continue :simple_command .collecting_word;
+                                }
+                            },
+                        }
+                    },
+
+                    .collecting_word => {
+                        const tok = self.peekToken() catch |err| {
+                            self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
+                            return err;
+                        } orelse {
+                            // End of input mid-word, finish what we have
+                            continue :simple_command .word_complete;
+                        };
+
+                        switch (tok.type) {
+                            .Redirection => |redir| {
+                                // Encountered redirection while collecting word.
+                                // Try to interpret word_parts as a source fd number.
+                                // If successful, use it as the source fd for this
+                                // redirection.
+                                // If not (overflow, non-digits), treat word as a
+                                // regular argument.
+                                if (wordPartsToFdNumber(simple_command.word_collector.parts.items)) |source_fd| {
+                                    // Valid source fd - use it for the redirection
+                                    simple_command.setPendingRedir(redir, tok);
+                                    _ = try self.consumeToken();
+                                    simple_command.word_collector.parts = .{};
+                                    simple_command.pending_redir.?.source_fd = source_fd;
+                                    continue :simple_command .need_redir_target;
+                                } else {
+                                    // The word isn't valid for use as an fd.
+                                    // Finalize the previous word and we'll look at
+                                    // the redirection again later.
+                                    continue :simple_command .word_complete;
+                                }
+                            },
+                            .LeftParen => {
+                                self.setError("syntax error near unexpected token `('", tok.position, tok.line, tok.column);
+                                return ParseError.UnsupportedSyntax;
+                            },
+                            .RightParen => {
+                                self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
+                                return ParseError.UnsupportedSyntax;
+                            },
+                            .Newline, .Semicolon, .DoubleSemicolon, .Pipe, .DoublePipe => {
+                                // Unreachable: The lexer marks words complete when followed by separators
+                                // or operators. Even on a buffer boundary, the lexer emits a complete empty
+                                // Continuation token before the separator/operator, which transitions us to
+                                // .word_complete first. This invariant is verified by the buffer boundary
+                                // tests in this file.
+                                unreachable;
+                            },
+                            else => {
+                                _ = try self.consumeToken();
+                                simple_command.word_collector.addTokenToParts(tok) catch |err| {
+                                    switch (err) {
+                                        error.BadSubstitution => {
+                                            self.setError("bad substitution", self.lex.position, self.lex.line, self.lex.column);
+                                        },
+                                        else => {},
+                                    }
+                                    return err;
+                                };
+                                if (tok.complete) {
+                                    continue :simple_command .word_complete;
+                                } else {
+                                    continue :simple_command .collecting_word;
+                                }
+                            },
+                        }
+                    },
+
+                    .need_redir_target => {
+                        const tok = self.peekToken() catch |err| {
+                            self.setError(
+                                lexerErrorMessage(err),
+                                self.lex.position,
+                                self.lex.line,
+                                self.lex.column,
+                            );
+                            return err;
+                        } orelse {
+                            // EOF - error points to end of redirection operator
+                            const redir = simple_command.pending_redir.?;
+                            self.setError(
+                                "missing redirection target",
+                                redir.position,
+                                redir.end_line,
+                                redir.end_column,
+                            );
+                            return ParseError.MissingRedirectionTarget;
+                        };
+
+                        switch (tok.type) {
+                            .Newline, .Semicolon, .DoubleSemicolon => {
+                                // Separator where redirection target was expected
+                                const redir = simple_command.pending_redir.?;
+                                self.setError(
+                                    "missing redirection target",
+                                    redir.position,
+                                    redir.end_line,
+                                    redir.end_column,
+                                );
+                                return ParseError.MissingRedirectionTarget;
+                            },
+                            .Redirection => {
+                                // Another redirection where target was expected -
+                                // error points to end of first redirection
+                                const redir = simple_command.pending_redir.?;
+                                self.setError(
+                                    "missing redirection target",
+                                    redir.position,
+                                    redir.end_line,
+                                    redir.end_column,
+                                );
+                                return ParseError.MissingRedirectionTarget;
+                            },
+                            .LeftParen => {
+                                // TODO: Subshell redirection (not specified by
+                                // POSIX, but useful).
+                                self.setError("syntax error near unexpected token `('", tok.position, tok.line, tok.column);
+                                return ParseError.UnsupportedSyntax;
+                            },
+                            .RightParen => {
+                                self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
+                                return ParseError.UnsupportedSyntax;
+                            },
+                            else => {
+                                _ = try self.consumeToken();
+                                simple_command.word_collector.startWord(tok);
+                                simple_command.word_collector.addTokenToParts(tok) catch |err| {
+                                    switch (err) {
+                                        error.BadSubstitution => {
+                                            self.setError("bad substitution", self.lex.position, self.lex.line, self.lex.column);
+                                        },
+                                        else => {},
+                                    }
+                                    return err;
+                                };
+                                if (tok.complete) {
+                                    continue :simple_command .word_complete;
+                                } else {
+                                    continue :simple_command .collecting_word;
+                                }
+                            },
+                        }
+                    },
+
+                    .word_complete => {
+                        const word = try simple_command.word_collector.finishWord();
+
+                        // If we have a pending redirection, this word is its target
+                        if (simple_command.pending_redir) |redir| {
+                            const target: RedirectionTarget = if (redir.op == .Fd)
+                                try self.parseFdTarget(word)
+                            else
+                                .{ .file = word };
+
+                            try simple_command.redirections.append(self.allocator, .{
+                                .op = redir.op,
+                                .source_fd = redir.source_fd,
+                                .target = target,
+                                .position = redir.position,
+                                .line = redir.line,
+                                .column = redir.column,
+                            });
+                            simple_command.pending_redir = null;
+                            continue :simple_command .start;
+                        }
+
+                        // Check if it's an assignment (only valid before command name)
+                        if (!simple_command.seen_command) {
+                            if (try self.tryBuildAssignment(word)) |assignment| {
+                                try simple_command.assignments.append(self.allocator, assignment);
+                                continue :simple_command .start;
+                            }
+                        }
+
+                        // It's a command/argument
+                        try simple_command.argv.append(self.allocator, word);
+                        simple_command.seen_command = true;
+                        continue :simple_command .start;
+                    },
+
+                    .done => {
+                        // NOTE: This will need to be redone once we have other major states.
+                        if (simple_command.assignments.items.len == 0 and
+                            simple_command.argv.items.len == 0 and
+                            simple_command.redirections.items.len == 0)
+                        {
+                            return null;
+                        }
+
+                        return SimpleCommand{
+                            .assignments = try simple_command.assignments.toOwnedSlice(self.allocator),
+                            .argv = try simple_command.argv.toOwnedSlice(self.allocator),
+                            .redirections = try simple_command.redirections.toOwnedSlice(self.allocator),
+                        };
+                    },
+                }
+            },
+        }
+    }
+
+    /// Pull the next command from the input.
+    ///
+    /// This is the primary iterator interface for pull-based execution.
+    /// Returns the next parsed command, or `null` when input is exhausted.
+    /// Empty commands (e.g., `;;;` or blank lines) are silently skipped.
+    ///
+    /// Example usage:
+    /// ```
+    /// while (try parser.next()) |cmd| {
+    ///     try executor.execute(cmd);
+    /// }
+    /// ```
+    pub fn next(self: *Parser) ParseError!?Command {
+        // TODO: Change this when we support non-simple commands.
+        while (true) {
+            const simple_cmd = try self.parseCommand();
+            if (simple_cmd) |cmd| {
+                return .{
+                    .payload = .{ .simple = cmd },
+                };
+            }
+            // Check if there are more tokens.
+            if (try self.peekToken() == null) {
+                return null;
+            }
+            // Another command is coming.
+        }
+    }
+
+    // --- Helper methods ---
+
+    /// Reset parser state for a new command.
+    fn reset(self: *Parser) void {
+        self.error_info = null;
+        // Clean up any leftover contexts (shouldn't happen in normal operation)
+        while (self.context_depth > 0) {
+            var ctx = self.popContext();
+            ctx.deinit(self.allocator);
+        }
+        self.pushContext(ParserContext.initSimpleCommand(self.allocator));
     }
 
     /// Try to build an assignment from a word.
@@ -1679,7 +1811,7 @@ test "parseCommand: quoted redirection-like string is literal" {
     try std.testing.expectEqual(@as(usize, 2), cmd.argv.len);
     try expectWord(cmd.argv[0], &.{.{ .literal = "cmd" }});
     // Separate tokens from double-quote parsing
-    try expectWord(cmd.argv[1], &.{.{ .double_quoted = &.{ .{ .literal = "2>&1" } } }});
+    try expectWord(cmd.argv[1], &.{.{ .double_quoted = &.{.{ .literal = "2>&1" }} }});
 
     // No redirections
     try std.testing.expectEqual(@as(usize, 0), cmd.redirections.len);
@@ -1967,7 +2099,7 @@ test "parseCommand: non-digit word before redirection with buffer boundary" {
 
     // "a2" should be argv[0], redirection should be separate
     try std.testing.expectEqual(@as(usize, 1), cmd.argv.len);
-    try expectWord(cmd.argv[0], &.{ .{ .literal = "a2" } }); // Split across buffer boundaries
+    try expectWord(cmd.argv[0], &.{.{ .literal = "a2" }}); // Split across buffer boundaries
 
     try std.testing.expectEqual(@as(usize, 1), cmd.redirections.len);
     const redir = cmd.redirections[0];
@@ -2277,7 +2409,7 @@ test "parseCommand: left parenthesis after command returns UnsupportedSyntax" {
 
     const result = parser.parseCommand();
     try std.testing.expectError(ParseError.UnsupportedSyntax, result);
-    try std.testing.expectEqualStrings("syntax error near unexpected token `('", parser.error_info.?.message);
+    try std.testing.expectEqualStrings("subshells are not yet implemented", parser.error_info.?.message);
 }
 
 test "parseCommand: right parenthesis after command returns UnsupportedSyntax" {
@@ -2373,7 +2505,7 @@ test "next: buffer boundary with separator (1 byte buffer)" {
     var commands: [2]SimpleCommand = undefined;
     var count: usize = 0;
     while (try parser_inst.next()) |cmd| {
-        if (count < 2) commands[count] = cmd.simple;
+        if (count < 2) commands[count] = cmd.payload.simple;
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), count);
@@ -2744,7 +2876,7 @@ test "next: single command yields one Command then null" {
     // First call should yield the command
     const cmd1 = try parser.next();
     try std.testing.expect(cmd1 != null);
-    try std.testing.expectEqual(@as(usize, 2), cmd1.?.simple.argv.len);
+    try std.testing.expectEqual(@as(usize, 2), cmd1.?.payload.simple.argv.len);
 
     // Second call should yield null
     const cmd2 = try parser.next();
@@ -2796,7 +2928,185 @@ test "next: returns Command union with simple variant" {
     try std.testing.expect(cmd != null);
 
     // Verify it's a simple command with expected structure
-    const simple = cmd.?.simple;
+    const simple = cmd.?.payload.simple;
     try std.testing.expectEqual(@as(usize, 1), simple.assignments.len);
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
+}
+
+// --- Command.payload access pattern tests ---
+
+test "Command.payload: accessing simple command through payload wrapper" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("cmd arg1 arg2");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.next();
+    try std.testing.expect(cmd != null);
+
+    // Test access via payload.simple (the new pattern after refactoring)
+    const simple = cmd.?.payload.simple;
+    try std.testing.expectEqual(@as(usize, 3), simple.argv.len);
+    try std.testing.expectEqualStrings("cmd", simple.argv[0].parts[0].literal);
+    try std.testing.expectEqualStrings("arg1", simple.argv[1].parts[0].literal);
+    try std.testing.expectEqualStrings("arg2", simple.argv[2].parts[0].literal);
+}
+
+test "Command.payload: switch on payload union" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo hello");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.next();
+    try std.testing.expect(cmd != null);
+
+    // Test switching on the payload union (pattern used by executor)
+    switch (cmd.?.payload) {
+        .simple => |simple| {
+            try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
+            try std.testing.expectEqualStrings("echo", simple.argv[0].parts[0].literal);
+        },
+    }
+}
+
+// --- WordCollector quote stack depth tests ---
+
+test "WordCollector: deeply nested brace expansions at stack boundary" {
+    // Test 7 levels of nested brace expansions (near the limit of 8)
+    // ${a:-${b:-${c:-${d:-${e:-${f:-${g:-default}}}}}}}
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const input = "echo ${a:-${b:-${c:-${d:-${e:-${f:-${g:-default}}}}}}}";
+    var reader = std.io.Reader.fixed(input);
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.next();
+    try std.testing.expect(cmd != null);
+
+    const simple = cmd.?.payload.simple;
+    try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
+    try std.testing.expectEqualStrings("echo", simple.argv[0].parts[0].literal);
+
+    // Verify the nested structure exists (we just check the outer parameter name)
+    const param_part = simple.argv[1].parts[0];
+    try std.testing.expect(param_part == .parameter);
+    try std.testing.expectEqualStrings("a", param_part.parameter.name);
+}
+
+test "WordCollector: nested double quotes and brace expansions" {
+    // Test alternating double quotes and brace expansions
+    // "${a:-"${b:-"${c:-default}"}"}"
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // 3 levels of alternating: double quote -> brace -> double quote -> brace -> double quote -> brace
+    const input = "echo \"${a:-\"${b:-inner}\"}\"";
+    var reader = std.io.Reader.fixed(input);
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.next();
+    try std.testing.expect(cmd != null);
+
+    const simple = cmd.?.payload.simple;
+    try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
+
+    // The second argument should be a double_quoted containing the nested expansion
+    const arg1 = simple.argv[1];
+    try std.testing.expectEqual(@as(usize, 1), arg1.parts.len);
+    try std.testing.expect(arg1.parts[0] == .double_quoted);
+}
+
+test "WordCollector: maximum safe nesting depth (7 levels)" {
+    // Test exactly 7 levels which is within the 8-slot stack
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // 7 nested brace expansions
+    const input = "cmd ${1:-${2:-${3:-${4:-${5:-${6:-${7:-x}}}}}}}";
+    var reader = std.io.Reader.fixed(input);
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.next();
+    try std.testing.expect(cmd != null);
+
+    const simple = cmd.?.payload.simple;
+    try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
+
+    // Verify the outermost parameter
+    const param_part = simple.argv[1].parts[0];
+    try std.testing.expect(param_part == .parameter);
+    try std.testing.expectEqualStrings("1", param_part.parameter.name);
+    try std.testing.expect(param_part.parameter.modifier != null);
+}
+
+// --- popContext pointer validity tests ---
+
+test "WordCollector: popContext pointer remains valid for immediate use" {
+    // This test verifies the popContext API works correctly when the returned
+    // pointer is used immediately (before any pushContext call)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Double quoted string with nested parameter - tests the popContext path
+    const input = "\"${VAR:-default}\"";
+    var reader = std.io.Reader.fixed(input);
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.next();
+    try std.testing.expect(cmd != null);
+
+    const simple = cmd.?.payload.simple;
+    try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
+
+    // The word should be a double_quoted containing a parameter expansion
+    const word = simple.argv[0];
+    try std.testing.expectEqual(@as(usize, 1), word.parts.len);
+    try std.testing.expect(word.parts[0] == .double_quoted);
+
+    const inner = word.parts[0].double_quoted;
+    try std.testing.expectEqual(@as(usize, 1), inner.len);
+    try std.testing.expect(inner[0] == .parameter);
+    try std.testing.expectEqualStrings("VAR", inner[0].parameter.name);
+}
+
+test "WordCollector: multiple sequential pop operations" {
+    // Test that multiple pops in sequence work correctly (pop brace, then pop double quote)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // This creates push(double) -> push(brace) -> pop(brace) -> pop(double) sequence
+    const input = "\"before${VAR}after\"";
+    var reader = std.io.Reader.fixed(input);
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const cmd = try parser.next();
+    try std.testing.expect(cmd != null);
+
+    const simple = cmd.?.payload.simple;
+    try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
+
+    const word = simple.argv[0];
+    try std.testing.expectEqual(@as(usize, 1), word.parts.len);
+    try std.testing.expect(word.parts[0] == .double_quoted);
+
+    // Should have: literal "before", parameter VAR, literal "after"
+    const inner = word.parts[0].double_quoted;
+    try std.testing.expectEqual(@as(usize, 3), inner.len);
+    try std.testing.expect(inner[0] == .literal);
+    try std.testing.expectEqualStrings("before", inner[0].literal);
+    try std.testing.expect(inner[1] == .parameter);
+    try std.testing.expectEqualStrings("VAR", inner[1].parameter.name);
+    try std.testing.expect(inner[2] == .literal);
+    try std.testing.expectEqualStrings("after", inner[2].literal);
 }

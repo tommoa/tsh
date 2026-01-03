@@ -357,7 +357,7 @@ pub const Executor = struct {
     /// }
     /// ```
     pub fn executeCommand(self: *Executor, cmd: Command) ExecuteError!ExitStatus {
-        switch (cmd) {
+        switch (cmd.payload) {
             .simple => |simple| return self.execute(simple),
         }
     }
