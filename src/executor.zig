@@ -39,6 +39,8 @@ pub const ExecuteError = error{
     RedirectionFailed,
     /// The `exit` builtin was invoked. The exit code is in shell_state.exit_code.
     ExitRequested,
+    /// Feature not yet implemented (e.g., multi-command pipelines).
+    NotImplemented,
 } || Allocator.Error || process.GetEnvMapError;
 
 /// Information about an execution error for error reporting.
@@ -358,7 +360,28 @@ pub const Executor = struct {
     /// ```
     pub fn executeCommand(self: *Executor, cmd: Command) ExecuteError!ExitStatus {
         switch (cmd.payload) {
-            .simple => |simple| return self.execute(simple),
+            .pipeline => |pipeline| {
+                if (pipeline.commands.len == 0) {
+                    // Empty pipeline - return success or failure based on negation
+                    return ExitStatus{ .exited = if (pipeline.negated) 1 else 0 };
+                }
+                if (pipeline.commands.len > 1) {
+                    // Multi-command pipelines not yet implemented
+                    return ExecuteError.NotImplemented;
+                }
+                // Single command pipeline - execute it
+                const status = try self.execute(pipeline.commands[0]);
+                // Section 2.9.2: "If the pipeline begins with the reserved word
+                // !, the exit status shall be the logical NOT of the exit status
+                // of the last command."
+                if (pipeline.negated) {
+                    return switch (status) {
+                        .exited => |code| ExitStatus{ .exited = if (code == 0) 1 else 0 },
+                        .signaled => ExitStatus{ .exited = 0 }, // Non-zero exit negated to 0
+                    };
+                }
+                return status;
+            },
         }
     }
 
@@ -1147,7 +1170,7 @@ fn statusFromWaitResult(status: u32) ExitStatus {
 
 // --- Tests ---
 
-fn parseCommand(allocator: Allocator, input: []const u8) !?SimpleCommand {
+fn parseCommand(allocator: Allocator, input: []const u8) !?Command {
     var reader = std.io.Reader.fixed(input);
     var lex = lexer.Lexer.init(&reader);
     var p = parser.Parser.init(allocator, &lex);
@@ -1161,7 +1184,7 @@ test "execute: simple echo" {
     const cmd = try parseCommand(arena.allocator(), "/bin/echo hello\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = try exec.execute(cmd);
+    const status = try exec.executeCommand(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 }
@@ -1173,7 +1196,7 @@ test "execute: exit status success" {
     const cmd = try parseCommand(arena.allocator(), "true\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = try exec.execute(cmd);
+    const status = try exec.executeCommand(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 }
@@ -1185,7 +1208,7 @@ test "execute: exit status failure" {
     const cmd = try parseCommand(arena.allocator(), "false\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = try exec.execute(cmd);
+    const status = try exec.executeCommand(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 1 }, status);
 }
@@ -1197,7 +1220,7 @@ test "execute: PATH lookup" {
     const cmd = try parseCommand(arena.allocator(), "echo hello\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = try exec.execute(cmd);
+    const status = try exec.executeCommand(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 }
@@ -1209,7 +1232,7 @@ test "execute: command not found" {
     const cmd = try parseCommand(arena.allocator(), "nonexistent_cmd_12345\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = try exec.execute(cmd);
+    const status = try exec.executeCommand(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 127 }, status);
 }
@@ -1226,7 +1249,7 @@ test "execute: output redirection" {
     const cmd = try parseCommand(arena.allocator(), "echo hello > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = try exec.execute(cmd);
+    const status = try exec.executeCommand(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 
@@ -1256,7 +1279,7 @@ test "execute: input redirection" {
     const cmd = try parseCommand(arena.allocator(), "cat < " ++ tmp_path ++ "\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = try exec.execute(cmd);
+    const status = try exec.executeCommand(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 
@@ -1277,11 +1300,11 @@ test "execute: append redirection" {
     const cmd1 = try parseCommand(arena.allocator(), "echo first > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    _ = try exec.execute(cmd1);
+    _ = try exec.executeCommand(cmd1);
 
     // Append
     const cmd2 = try parseCommand(arena.allocator(), "echo second >> " ++ tmp_path ++ "\n") orelse return error.NoCommand;
-    const status = try exec.execute(cmd2);
+    const status = try exec.executeCommand(cmd2);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 
@@ -1305,7 +1328,7 @@ test "execute: env assignment" {
     const cmd = try parseCommand(arena.allocator(), "FOO=testvalue sh -c 'echo $FOO' > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = try exec.execute(cmd);
+    const status = try exec.executeCommand(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 
@@ -1324,7 +1347,7 @@ test "execute: assignments only" {
     const cmd = try parseCommand(arena.allocator(), "FOO=bar\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = try exec.execute(cmd);
+    const status = try exec.executeCommand(cmd);
 
     // Assignments-only commands return success
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
@@ -1346,7 +1369,7 @@ test "execute: redirection only (like touch)" {
     const cmd = try parseCommand(arena.allocator(), "> " ++ tmp_path ++ "\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = try exec.execute(cmd);
+    const status = try exec.executeCommand(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 
@@ -1372,7 +1395,7 @@ test "execute: assignment with redirection only" {
     const cmd = try parseCommand(arena.allocator(), "FOO=bar > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = try exec.execute(cmd);
+    const status = try exec.executeCommand(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 
@@ -1399,7 +1422,7 @@ test "execute: fd duplication 2>&1" {
     const cmd = try parseCommand(arena.allocator(), "sh -c 'echo error >&2' > " ++ tmp_path ++ " 2>&1\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = try exec.execute(cmd);
+    const status = try exec.executeCommand(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 
@@ -1776,7 +1799,7 @@ test "execute: exit builtin returns ExitRequested" {
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
 
-    const result = exec.execute(cmd);
+    const result = exec.executeCommand(cmd);
     try std.testing.expectError(ExecuteError.ExitRequested, result);
     try std.testing.expectEqual(@as(u8, 42), shell_state.exit_code);
 }
@@ -1788,7 +1811,7 @@ test "execute: pwd builtin" {
     const cmd = try parseCommand(arena.allocator(), "pwd\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = try exec.execute(cmd);
+    const status = try exec.executeCommand(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 }
@@ -1802,7 +1825,7 @@ test "execute: export and variable visibility" {
     // Set a shell variable
     const cmd1 = try parseCommand(arena.allocator(), "FOO=bar\n") orelse return error.NoCommand;
     var exec = Executor.init(arena.allocator(), &shell_state);
-    _ = try exec.execute(cmd1);
+    _ = try exec.executeCommand(cmd1);
 
     // Should be in variables, not env
     try std.testing.expectEqualStrings("bar", shell_state.getVariable("FOO").?);
@@ -1810,7 +1833,7 @@ test "execute: export and variable visibility" {
 
     // Export it
     const cmd2 = try parseCommand(arena.allocator(), "export FOO\n") orelse return error.NoCommand;
-    _ = try exec.execute(cmd2);
+    _ = try exec.executeCommand(cmd2);
 
     // Should now be in env
     try std.testing.expectEqualStrings("bar", shell_state.env.get("FOO").?);
@@ -1827,7 +1850,7 @@ test "execute: builtin with output redirection" {
     const cmd = try parseCommand(arena.allocator(), "pwd > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = try exec.execute(cmd);
+    const status = try exec.executeCommand(cmd);
 
     try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
 
@@ -1856,7 +1879,7 @@ test "execute: builtin redirection does not affect subsequent commands" {
 
     // First: pwd > file
     const cmd1 = try parseCommand(arena.allocator(), "pwd > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
-    _ = try exec.execute(cmd1);
+    _ = try exec.executeCommand(cmd1);
 
     // Second: pwd (no redirection) - should NOT go to file
     // We can't easily capture stdout in a test, but we can verify the file wasn't appended
@@ -1864,7 +1887,7 @@ test "execute: builtin redirection does not affect subsequent commands" {
     defer std.testing.allocator.free(contents_after_first);
 
     const cmd2 = try parseCommand(arena.allocator(), "pwd\n") orelse return error.NoCommand;
-    _ = try exec.execute(cmd2);
+    _ = try exec.executeCommand(cmd2);
 
     // File should still have the same contents (not doubled)
     const contents_after_second = try std.fs.cwd().readFileAlloc(std.testing.allocator, tmp_path, 4096);
@@ -1887,11 +1910,11 @@ test "execute: builtin with append redirection" {
 
     // pwd > file (create)
     const cmd1 = try parseCommand(arena.allocator(), "pwd > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
-    _ = try exec.execute(cmd1);
+    _ = try exec.executeCommand(cmd1);
 
     // pwd >> file (append)
     const cmd2 = try parseCommand(arena.allocator(), "pwd >> " ++ tmp_path ++ "\n") orelse return error.NoCommand;
-    _ = try exec.execute(cmd2);
+    _ = try exec.executeCommand(cmd2);
 
     // File should contain cwd twice
     const contents = try std.fs.cwd().readFileAlloc(std.testing.allocator, tmp_path, 4096);
@@ -1913,7 +1936,7 @@ test "execute: builtin redirection error" {
     const cmd = try parseCommand(arena.allocator(), "pwd > /nonexistent_dir_12345/file\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
-    const status = try exec.execute(cmd);
+    const status = try exec.executeCommand(cmd);
 
     // Should return error status
     try std.testing.expectEqual(ExitStatus{ .exited = ExitStatus.GENERAL_ERROR }, status);

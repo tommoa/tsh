@@ -88,12 +88,10 @@ pub const TokenType = union(enum) {
     /// Newline character - command separator, also serves as <newline> in the
     /// POSIX grammar (Section 2.3). Unlike semicolon, newline is allowed after
     /// `|` to continue a pipeline on the next line (Section 2.10.2).
-    /// TODO: Pipeline support not yet implemented.
     Newline,
     /// Semicolon `;` - sequential execution separator_op (Section 2.9.3).
     /// Unlike newline, semicolon is NOT part of <linebreak> and cannot appear
     /// after `|` in a pipeline (Section 2.10.2).
-    /// TODO: Pipeline support not yet implemented.
     Semicolon,
     /// Double semicolon `;;` - terminates a case clause in case/esac statements.
     DoubleSemicolon,
