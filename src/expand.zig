@@ -58,6 +58,20 @@
 //!   are not subject to field splitting or pathname expansion. Exception:
 //!   `"$@"` expands to separate fields per POSIX 2.5.2.
 //!
+//! ## Expansion Part Kinds
+//!
+//! During expansion, each part is tagged with a Kind that affects later processing:
+//!
+//! | Kind         | Word Boundary | Field Splitting | Source                      |
+//! |--------------|---------------|-----------------|-----------------------------|
+//! | `.normal`    | No            | Yes (future)    | Unquoted `$VAR`             |
+//! | `.positional`| Conditional*  | No              | `$@` expansion              |
+//! | `.quoted`    | No            | No              | `"$VAR"`, literals in `"…"` |
+//!
+//! *Positional parts create word boundaries between consecutive positional parts,
+//! enabling `"$@"` to expand to separate arguments while allowing prefix/suffix
+//! attachment (e.g., `"prefix$@suffix"` with `["a","b"]` → `["prefixa", "bsuffix"]`).
+//!
 //! ## References
 //!
 //! - POSIX.1-2017 Section 2.5.2: Special Parameters
@@ -112,22 +126,40 @@ pub fn expandWordJoined(allocator: Allocator, word: Word, shell: *const ShellSta
 
 /// Intermediate representation of expanded content within a word.
 ///
-/// The `complete` flag indicates field boundaries for expansions like `$@`
-/// that produce multiple words. When `complete = true`, it signals "this
-/// ends a word boundary" (similar to lexer token completion).
+/// Each part has a `kind` that determines word boundary behavior and future
+/// field splitting:
+///
+/// - `.normal`: Unquoted content, subject to field splitting (when implemented)
+/// - `.positional`: From `$@` expansion, creates word boundaries between
+///   consecutive positional parts. Not subject to field splitting.
+/// - `.quoted`: From quoted context, not subject to field splitting.
+///
+/// Word boundary logic (POSIX 2.5.2):
+/// - `$@` produces separate fields for each positional parameter
+/// - Prefix/suffix attachment: `prefix$@suffix` with ["a","b"] -> ["prefixa", "bsuffix"]
+/// - Consecutive positional parts trigger word breaks
 ///
 /// Field splitting behavior (POSIX 2.6.5):
 /// - Field splitting applies to parameter expansion, command substitution,
 ///   and arithmetic expansion results - NOT to tilde expansion or literals.
 /// - Content inside double quotes is not subject to field splitting.
 /// - Tilde expansion results are "treated as if quoted" (POSIX 2.6.1).
-///
-/// Example with adjacent expansions:
-///   `text$(cmd)` where cmd outputs "a b c" -> `["texta", "b", "c"]`
-///   `$(cmd)text` where cmd outputs "a b c" -> `["a", "b", "ctext"]`
 const ExpandedPart = struct {
     content: []const u8,
-    complete: bool,
+    kind: Kind,
+
+    const Kind = enum {
+        /// Regular unquoted content. Subject to field splitting (when implemented).
+        normal,
+
+        /// From $@ expansion. Creates word boundary before this part if previous
+        /// part was also positional. Not subject to field splitting.
+        positional,
+
+        /// From quoted context ("$VAR", literals in double quotes).
+        /// Not subject to field splitting.
+        quoted,
+    };
 };
 
 /// Builds word lists during expansion, encapsulating buffer management.
@@ -140,10 +172,10 @@ const ExpandedPart = struct {
 pub const WordBuilder = struct {
     allocator: Allocator,
     buffers: std.ArrayListUnmanaged(Buffer) = .{},
-    /// Tracks whether we've seen a complete word boundary from $@ expansion.
-    /// This is word-scoped state: callers must reset it to false before
-    /// expanding each new Word to prevent state leaking between words.
-    seen_complete: bool = false,
+    /// Tracks whether the last appended part was .positional.
+    /// Used to determine if a word break is needed before the next .positional part.
+    /// Must be reset to false before expanding each new Word.
+    last_was_positional: bool = false,
 
     const Buffer = std.ArrayListUnmanaged(u8);
 
@@ -157,28 +189,33 @@ pub const WordBuilder = struct {
     }
 
     /// Append content to the current word. Starts a new word if none exists.
+    ///
+    /// Resets `last_was_positional` to false, since appending non-$@ content
+    /// interrupts any sequence of positional parts. This ensures that patterns
+    /// like "$@ $@" produce correct word boundaries: the space between the two
+    /// $@ expansions prevents spurious word breaks.
+    ///
+    /// Note: When called from `appendParts`, the flag is immediately updated
+    /// based on the part's kind, so this reset has no effect in that path.
     pub fn append(self: *WordBuilder, content: []const u8) Allocator.Error!void {
         if (self.buffers.items.len == 0) {
             try self.startWord();
         }
         try self.buffers.items[self.buffers.items.len - 1].appendSlice(self.allocator, content);
+        self.last_was_positional = false;
     }
 
     /// Append expanded parts, handling word boundaries from $@ expansion.
     /// Returns true if any content was added.
     pub fn appendParts(self: *WordBuilder, parts: []const ExpandedPart) Allocator.Error!bool {
-        var content_added = false;
-        for (parts, 0..) |p, i| {
-            if (p.complete and (self.seen_complete or i > 0)) {
+        for (parts) |p| {
+            if (p.kind == .positional and self.last_was_positional) {
                 try self.startWord();
             }
             try self.append(p.content);
-            content_added = true;
-            if (p.complete) {
-                self.seen_complete = true;
-            }
+            self.last_was_positional = (p.kind == .positional);
         }
-        return content_added;
+        return parts.len > 0;
     }
 
     /// Get current word count.
@@ -233,6 +270,27 @@ pub const WordBuilder = struct {
             }
         }
         return result;
+    }
+
+    /// Convert builder contents to ExpandedPart slice.
+    /// Used when expansion results need to preserve word boundaries (e.g., modifier words).
+    ///
+    /// All parts are marked as .positional to preserve word boundaries when the result
+    /// is later processed by appendParts. This ensures that $@ in modifier words
+    /// (e.g., ${VAR:-$@}) correctly produces separate words.
+    pub fn toParts(self: *WordBuilder) Allocator.Error![]ExpandedPart {
+        if (self.buffers.items.len == 0) {
+            return try self.allocator.alloc(ExpandedPart, 0);
+        }
+
+        const parts = try self.allocator.alloc(ExpandedPart, self.buffers.items.len);
+        for (self.buffers.items, 0..) |*buf, i| {
+            parts[i] = .{
+                .content = buf.items,
+                .kind = .positional,
+            };
+        }
+        return parts;
     }
 };
 
@@ -295,11 +353,10 @@ fn applyTildeExpansion(
 // Parameter Expansion (POSIX 2.6.2)
 // ============================================================================
 
-/// Create a single-element ExpandedPart array with the given content.
-/// Helper to reduce repetition in parameter expansion functions.
-fn makeSinglePart(allocator: Allocator, content: []const u8) Allocator.Error![]ExpandedPart {
+/// Create a single-element ExpandedPart array with the specified kind.
+fn makeSinglePart(allocator: Allocator, content: []const u8, kind: ExpandedPart.Kind) Allocator.Error![]ExpandedPart {
     const result = try allocator.alloc(ExpandedPart, 1);
-    result[0] = .{ .content = content, .complete = false };
+    result[0] = .{ .content = content, .kind = kind };
     return result;
 }
 
@@ -313,6 +370,8 @@ fn getSpecialParameter(
     name: []const u8,
     quoted: bool,
 ) Allocator.Error!?[]ExpandedPart {
+    const kind: ExpandedPart.Kind = if (quoted) .quoted else .normal;
+
     // Single-character special parameters
     if (name.len == 1) {
         switch (name[0]) {
@@ -320,14 +379,14 @@ fn getSpecialParameter(
                 // $? - Exit status of last command
                 const result = try allocator.alloc(ExpandedPart, 1);
                 const str = try std.fmt.allocPrint(allocator, "{d}", .{shell.last_status.toExitCode()});
-                result[0] = .{ .content = str, .complete = false };
+                result[0] = .{ .content = str, .kind = kind };
                 return result;
             },
             '#' => {
                 // $# - Number of positional parameters
                 const result = try allocator.alloc(ExpandedPart, 1);
                 const str = try std.fmt.allocPrint(allocator, "{d}", .{shell.positional_params.items.len});
-                result[0] = .{ .content = str, .complete = false };
+                result[0] = .{ .content = str, .kind = kind };
                 return result;
             },
             '@' => {
@@ -339,9 +398,10 @@ fn getSpecialParameter(
                     // shall generate zero fields"
                     return try allocator.alloc(ExpandedPart, 0);
                 }
+                // $@ always uses .positional kind to mark word boundaries
                 const parts = try allocator.alloc(ExpandedPart, params.len);
                 for (params, 0..) |p, i| {
-                    parts[i] = .{ .content = p, .complete = true };
+                    parts[i] = .{ .content = p, .kind = .positional };
                 }
                 return parts;
             },
@@ -353,7 +413,7 @@ fn getSpecialParameter(
                     if (quoted) {
                         // "$*" with no params -> single empty field
                         const result = try allocator.alloc(ExpandedPart, 1);
-                        result[0] = .{ .content = "", .complete = false };
+                        result[0] = .{ .content = "", .kind = .quoted };
                         return result;
                     } else {
                         // $* with no params -> zero fields
@@ -363,21 +423,21 @@ fn getSpecialParameter(
                 // TODO: use first char of IFS instead of space
                 const joined = try std.mem.join(allocator, " ", params);
                 const result = try allocator.alloc(ExpandedPart, 1);
-                result[0] = .{ .content = joined, .complete = false };
+                result[0] = .{ .content = joined, .kind = kind };
                 return result;
             },
             '$' => {
                 // $$ - PID of shell (cached at startup)
                 const result = try allocator.alloc(ExpandedPart, 1);
                 const str = try std.fmt.allocPrint(allocator, "{d}", .{shell.pid});
-                result[0] = .{ .content = str, .complete = false };
+                result[0] = .{ .content = str, .kind = kind };
                 return result;
             },
             '!' => {
                 // $! - PID of last background command
                 // TODO: implement when job control is added
                 const result = try allocator.alloc(ExpandedPart, 1);
-                result[0] = .{ .content = "", .complete = false };
+                result[0] = .{ .content = "", .kind = kind };
                 return result;
             },
             '-' => {
@@ -393,7 +453,7 @@ fn getSpecialParameter(
                 // 'f' - noglob, 'C' - noclobber, 'a' - allexport
                 const str = try allocator.dupe(u8, flags[0..len]);
                 const result = try allocator.alloc(ExpandedPart, 1);
-                result[0] = .{ .content = str, .complete = false };
+                result[0] = .{ .content = str, .kind = kind };
                 return result;
             },
             else => {},
@@ -404,13 +464,13 @@ fn getSpecialParameter(
     if (std.fmt.parseInt(usize, name, 10)) |idx| {
         const result = try allocator.alloc(ExpandedPart, 1);
         if (idx == 0) {
-            result[0] = .{ .content = shell.shell_name, .complete = false };
+            result[0] = .{ .content = shell.shell_name, .kind = kind };
         } else {
             const params = shell.positional_params.items;
             if (idx <= params.len) {
-                result[0] = .{ .content = params[idx - 1], .complete = false };
+                result[0] = .{ .content = params[idx - 1], .kind = kind };
             } else {
-                result[0] = .{ .content = "", .complete = false };
+                result[0] = .{ .content = "", .kind = kind };
             }
         }
         return result;
@@ -427,13 +487,13 @@ fn expandModifierWord(
     allocator: Allocator,
     shell: *const ShellState,
     word_parts: ?[]const parser.WordPart,
-) Allocator.Error![]const u8 {
-    const parts = word_parts orelse return "";
+) Allocator.Error![]ExpandedPart {
+    const parts = word_parts orelse return try allocator.alloc(ExpandedPart, 0);
 
     var builder = WordBuilder.init(allocator);
     _ = try expandInnerParts(&builder, parts, shell);
 
-    return builder.join(" ");
+    return builder.toParts();
 }
 
 /// Evaluate a parameter expansion and return the expanded parts.
@@ -460,10 +520,11 @@ fn evaluateParameterExpansion(
     const is_set = raw_value != null;
     const value = raw_value orelse "";
     const is_null_or_unset = !is_set or value.len == 0;
+    const kind: ExpandedPart.Kind = if (quoted) .quoted else .normal;
 
     // No modifier - just return the value
     if (param.modifier == null) {
-        return makeSinglePart(allocator, value);
+        return makeSinglePart(allocator, value, kind);
     }
 
     const mod = param.modifier.?;
@@ -477,31 +538,30 @@ fn evaluateParameterExpansion(
             // Invalid UTF-8 sequences fall back to byte count.
             const char_count = std.unicode.utf8CountCodepoints(value) catch value.len;
             const len_str = try std.fmt.allocPrint(allocator, "{d}", .{char_count});
-            return makeSinglePart(allocator, len_str);
+            // Length is always a number, kind doesn't affect field splitting
+            return makeSinglePart(allocator, len_str, kind);
         },
         .UseDefault => {
             // ${parameter:-word} - If parameter is unset or null, use word
             // ${parameter-word} - If parameter is unset (only), use word
             const use_default = if (mod.check_null) is_null_or_unset else !is_set;
             if (use_default) {
-                const word_value = try expandModifierWord(allocator, shell, mod.word);
-                return makeSinglePart(allocator, word_value);
+                return try expandModifierWord(allocator, shell, mod.word);
             }
-            return makeSinglePart(allocator, value);
+            return makeSinglePart(allocator, value, kind);
         },
         .UseAlternative => {
             // ${parameter:+word} - If parameter is set and non-null, use word
             // ${parameter+word} - If parameter is set (only), use word
             const use_alt = if (mod.check_null) !is_null_or_unset else is_set;
             if (use_alt) {
-                const word_value = try expandModifierWord(allocator, shell, mod.word);
-                return makeSinglePart(allocator, word_value);
+                return try expandModifierWord(allocator, shell, mod.word);
             }
-            return makeSinglePart(allocator, "");
+            return makeSinglePart(allocator, "", kind);
         },
         else => {
             // Other modifiers not yet implemented (AssignDefault, ErrorIfUnset, pattern removal)
-            return makeSinglePart(allocator, value);
+            return makeSinglePart(allocator, value, kind);
         },
     }
 }
@@ -526,7 +586,7 @@ fn expandWord(
     shell: *const ShellState,
 ) Allocator.Error!void {
     // Reset word-scoped state for each new Word
-    builder.seen_complete = false;
+    builder.last_was_positional = false;
 
     // Tilde expansion (POSIX 2.6.1)
     const parts = try applyTildeExpansion(builder.allocator, word.parts, shell.home);
@@ -995,6 +1055,39 @@ test "expandWord: prefix$@suffix produces correct words" {
     try std.testing.expectEqualStrings("bsuffix", builder.buffers.items[1].items);
 }
 
+test "expandWord: $@ space $@ produces correct word boundaries" {
+    // POSIX: "$@ $@" should join the last param of first $@ with the space
+    // and first param of second $@. The space interrupts the positional sequence.
+    // With params ["a", "b"]: "$@ $@" -> ["a", "b a", "b"]
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b" });
+
+    const inner_parts = [_]WordPart{
+        .{ .parameter = .{ .name = "@", .modifier = null } },
+        .{ .literal = " " },
+        .{ .parameter = .{ .name = "@", .modifier = null } },
+    };
+    const word = Word{
+        .parts = &[_]WordPart{.{ .double_quoted = &inner_parts }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    var builder = WordBuilder.init(arena.allocator());
+    try expandWord(&builder, word, &shell);
+
+    // Expected: ["a", "b a", "b"] - the space joins "b" and "a"
+    try std.testing.expectEqual(@as(usize, 3), builder.wordCount());
+    try std.testing.expectEqualStrings("a", builder.buffers.items[0].items);
+    try std.testing.expectEqualStrings("b a", builder.buffers.items[1].items);
+    try std.testing.expectEqualStrings("b", builder.buffers.items[2].items);
+}
+
 // --- Word Expansion Integration Tests ---
 
 test "expandWordJoined: single literal" {
@@ -1235,14 +1328,14 @@ test "WordBuilder: startWord creates new word" {
     try std.testing.expectEqual(@as(usize, 2), builder.wordCount());
 }
 
-test "WordBuilder: appendParts handles complete flag" {
+test "WordBuilder: appendParts handles positional kind" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
     var builder = WordBuilder.init(arena.allocator());
     const parts = [_]ExpandedPart{
-        .{ .content = "a", .complete = true },
-        .{ .content = "b", .complete = true },
+        .{ .content = "a", .kind = .positional },
+        .{ .content = "b", .kind = .positional },
     };
     _ = try builder.appendParts(&parts);
     try std.testing.expectEqual(@as(usize, 2), builder.wordCount());
@@ -1272,7 +1365,7 @@ test "WordBuilder: removeTrailingEmpty" {
     try std.testing.expectEqual(@as(usize, 0), builder.wordCount());
 }
 
-test "expandArgv: multiple $@ expansions do not leak seen_complete state" {
+test "expandArgv: multiple $@ expansions do not leak last_was_positional state" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1704,4 +1797,211 @@ test "modifier: ${VAR+alt} with unset VAR returns empty (no colon)" {
 
     const result = try expandWordJoined(arena.allocator(), word, &shell);
     try std.testing.expectEqualStrings("", result);
+}
+
+// --- Word Boundary Preservation in Modifier Words ---
+
+test "modifier: ${VAR:-$@} with unset VAR expands to multiple words" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b" });
+    // VAR is not set
+
+    const default_word = [_]WordPart{.{ .parameter = .{ .name = "@", .modifier = null } }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    // Use expandArgv to test word splitting behavior
+    const argv = try expandArgv(arena.allocator(), &[_]Word{word}, &shell);
+    var argc: usize = 0;
+    while (argv[argc] != null) : (argc += 1) {}
+
+    try std.testing.expectEqual(@as(usize, 2), argc);
+    try std.testing.expectEqualStrings("a", std.mem.span(argv[0].?));
+    try std.testing.expectEqualStrings("b", std.mem.span(argv[1].?));
+}
+
+test "modifier: ${VAR:-$@} with single positional param" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{"x"});
+    // VAR is not set
+
+    const default_word = [_]WordPart{.{ .parameter = .{ .name = "@", .modifier = null } }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const argv = try expandArgv(arena.allocator(), &[_]Word{word}, &shell);
+    var argc: usize = 0;
+    while (argv[argc] != null) : (argc += 1) {}
+
+    try std.testing.expectEqual(@as(usize, 1), argc);
+    try std.testing.expectEqualStrings("x", std.mem.span(argv[0].?));
+}
+
+test "modifier: ${VAR:-$@} with no positional params" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // No positional params, VAR is not set
+
+    const default_word = [_]WordPart{.{ .parameter = .{ .name = "@", .modifier = null } }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const argv = try expandArgv(arena.allocator(), &[_]Word{word}, &shell);
+    var argc: usize = 0;
+    while (argv[argc] != null) : (argc += 1) {}
+
+    // With no positional params, $@ produces zero fields
+    try std.testing.expectEqual(@as(usize, 0), argc);
+}
+
+test "modifier: ${VAR:-prefix$@suffix} attaches prefix and suffix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b" });
+    // VAR is not set
+
+    const default_word = [_]WordPart{
+        .{ .literal = "prefix" },
+        .{ .parameter = .{ .name = "@", .modifier = null } },
+        .{ .literal = "suffix" },
+    };
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const argv = try expandArgv(arena.allocator(), &[_]Word{word}, &shell);
+    var argc: usize = 0;
+    while (argv[argc] != null) : (argc += 1) {}
+
+    try std.testing.expectEqual(@as(usize, 2), argc);
+    try std.testing.expectEqualStrings("prefixa", std.mem.span(argv[0].?));
+    try std.testing.expectEqualStrings("bsuffix", std.mem.span(argv[1].?));
+}
+
+test "modifier: ${VAR:+$@} with set VAR expands to multiple words" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b" });
+    try shell.setVariable("VAR", "value");
+
+    const alt_word = [_]WordPart{.{ .parameter = .{ .name = "@", .modifier = null } }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseAlternative, .check_null = true, .word = &alt_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const argv = try expandArgv(arena.allocator(), &[_]Word{word}, &shell);
+    var argc: usize = 0;
+    while (argv[argc] != null) : (argc += 1) {}
+
+    try std.testing.expectEqual(@as(usize, 2), argc);
+    try std.testing.expectEqualStrings("a", std.mem.span(argv[0].?));
+    try std.testing.expectEqualStrings("b", std.mem.span(argv[1].?));
+}
+
+test "modifier: ${VAR:-$OTHER} returns single word (regression)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("OTHER", "value");
+    // VAR is not set
+
+    const default_word = [_]WordPart{.{ .parameter = .{ .name = "OTHER", .modifier = null } }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const argv = try expandArgv(arena.allocator(), &[_]Word{word}, &shell);
+    var argc: usize = 0;
+    while (argv[argc] != null) : (argc += 1) {}
+
+    // Regular variable should produce single word, not split
+    try std.testing.expectEqual(@as(usize, 1), argc);
+    try std.testing.expectEqualStrings("value", std.mem.span(argv[0].?));
+}
+
+test "modifier: ${VAR:-$@} with set VAR returns VAR value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b" });
+    try shell.setVariable("VAR", "myvalue");
+
+    const default_word = [_]WordPart{.{ .parameter = .{ .name = "@", .modifier = null } }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const argv = try expandArgv(arena.allocator(), &[_]Word{word}, &shell);
+    var argc: usize = 0;
+    while (argv[argc] != null) : (argc += 1) {}
+
+    // VAR is set, so its value is used, not $@
+    try std.testing.expectEqual(@as(usize, 1), argc);
+    try std.testing.expectEqualStrings("myvalue", std.mem.span(argv[0].?));
 }
