@@ -256,7 +256,15 @@ pub const Executor = struct {
             // Apply assignments to shell variables
             // POSIX Reference: Section 2.9.1 - variable assignments without command
             for (cmd.assignments) |assignment| {
-                const value = try expand.expandWordJoined(self.allocator, assignment.value, self.shell_state);
+                const value = expand.expandWordJoined(self.allocator, assignment.value, self.shell_state) catch |err| {
+                    switch (err) {
+                        // Error message already printed by expansion
+                        error.ParameterUnsetOrNull, error.ParameterAssignmentInvalid => {},
+                        else => self.setError("failed to expand assignment value", @errorName(err)),
+                    }
+                    self.shell_state.last_status = .{ .exited = 1 };
+                    return self.shell_state.last_status;
+                };
                 try self.shell_state.setVariable(assignment.name, value);
             }
 
@@ -268,8 +276,11 @@ pub const Executor = struct {
                         self.shell_state.last_status = .{ .exited = 0 };
                     },
                     .err => |msg| {
-                        printError("{s}\n", .{msg});
-                        self.setError(msg, null);
+                        // Empty message means error was already printed (e.g., ParameterUnsetOrNull)
+                        if (msg.len > 0) {
+                            printError("{s}\n", .{msg});
+                            self.setError(msg, null);
+                        }
                         self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
                     },
                 }
@@ -282,7 +293,11 @@ pub const Executor = struct {
 
         // Expand argv
         const argv = expand.expandArgv(self.allocator, cmd.argv, self.shell_state) catch |err| {
-            self.setError("failed to expand arguments", @errorName(err));
+            switch (err) {
+                // Error message already printed by expansion
+                error.ParameterUnsetOrNull, error.ParameterAssignmentInvalid => {},
+                else => self.setError("failed to expand arguments", @errorName(err)),
+            }
             self.shell_state.last_status = .{ .exited = 1 };
             return self.shell_state.last_status;
         };
@@ -299,7 +314,15 @@ pub const Executor = struct {
             // For special builtins, variable assignments are persistent
             // POSIX Reference: Section 2.14 - Special Built-In Utilities
             for (cmd.assignments) |assignment| {
-                const value = try expand.expandWordJoined(self.allocator, assignment.value, self.shell_state);
+                const value = expand.expandWordJoined(self.allocator, assignment.value, self.shell_state) catch |err| {
+                    switch (err) {
+                        // Error message already printed by expansion
+                        error.ParameterUnsetOrNull, error.ParameterAssignmentInvalid => {},
+                        else => self.setError("failed to expand assignment value", @errorName(err)),
+                    }
+                    self.shell_state.last_status = .{ .exited = 1 };
+                    return self.shell_state.last_status;
+                };
                 try self.shell_state.setVariable(assignment.name, value);
             }
 
@@ -327,8 +350,11 @@ pub const Executor = struct {
                 switch (applyRedirections(self.allocator, cmd.redirections, false, self.shell_state)) {
                     .ok => {},
                     .err => |msg| {
-                        printError("{s}\n", .{msg});
-                        self.setError(msg, null);
+                        // Empty message means error was already printed (e.g., ParameterUnsetOrNull)
+                        if (msg.len > 0) {
+                            printError("{s}\n", .{msg});
+                            self.setError(msg, null);
+                        }
                         self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
                         return self.shell_state.last_status;
                     },
@@ -396,8 +422,12 @@ pub const Executor = struct {
             const is_last = (i == cmds.len - 1);
 
             // Expand argv in parent (needed to check for builtins in pipeline stages)
-            const argv = expand.expandArgv(self.allocator, cmd.argv, self.shell_state) catch {
-                printError("failed to expand arguments\n", .{});
+            const argv = expand.expandArgv(self.allocator, cmd.argv, self.shell_state) catch |err| {
+                switch (err) {
+                    // Error message already printed by expansion
+                    error.ParameterUnsetOrNull, error.ParameterAssignmentInvalid => {},
+                    else => printError("failed to expand arguments: {s}\n", .{@errorName(err)}),
+                }
                 self.cleanupPipeline(pids.items, read_fd);
                 self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
                 return self.shell_state.last_status;
@@ -546,7 +576,10 @@ pub const Executor = struct {
         switch (applyRedirections(self.allocator, cmd.redirections, false, self.shell_state)) {
             .ok => {},
             .err => |msg| {
-                printError("{s}\n", .{msg});
+                // Empty message means error was already printed (e.g., ParameterUnsetOrNull)
+                if (msg.len > 0) {
+                    printError("{s}\n", .{msg});
+                }
                 posix.exit(ExitStatus.GENERAL_ERROR);
             },
         }
@@ -577,8 +610,12 @@ pub const Executor = struct {
         }
 
         // 5. Build env map (moved from parent - only needed for external commands)
-        var env_map = self.buildChildEnvMap(cmd.assignments) catch {
-            printError("failed to build environment\n", .{});
+        var env_map = self.buildChildEnvMap(cmd.assignments) catch |err| {
+            switch (err) {
+                // Error message already printed by expansion
+                error.ParameterUnsetOrNull, error.ParameterAssignmentInvalid => {},
+                else => printError("failed to build environment: {s}\n", .{@errorName(err)}),
+            }
             posix.exit(ExitStatus.GENERAL_ERROR);
         };
 
@@ -617,7 +654,7 @@ pub const Executor = struct {
     ///
     /// Command assignments (e.g., `FOO=bar cmd`) are added to a copy of the shell's
     /// environment for the child process only - they don't modify the shell's env.
-    fn buildChildEnvMap(self: *Executor, assignments: []const Assignment) !process.EnvMap {
+    fn buildChildEnvMap(self: *Executor, assignments: []const Assignment) expand.ExpansionError!process.EnvMap {
         // Copy the shell's environment
         var env_map = process.EnvMap.init(self.allocator);
 
@@ -728,6 +765,9 @@ fn findExecutable(allocator: Allocator, cmd: [*:0]const u8, env_map: *const proc
 /// On success, returns .ok.
 /// On failure, returns .err with an error message. The caller is responsible
 /// for printing the error and determining the appropriate exit status.
+/// Note: An empty error message indicates the error was already printed (e.g.,
+/// by ExpansionError.ParameterUnsetOrNull or ParameterAssignmentInvalid) and
+/// should not be printed again.
 fn applyRedirections(allocator: Allocator, redirections: []const ParsedRedirection, files_only: bool, shell: *ShellState) RedirectionResult {
     for (redirections) |redir| {
         const source_fd: posix.fd_t = @intCast(redir.source_fd orelse defaultSourceFd(redir.op));
@@ -736,8 +776,14 @@ fn applyRedirections(allocator: Allocator, redirections: []const ParsedRedirecti
             .file => |word| {
                 // POSIX 2.7 (Redirection): Following dash behavior, field splitting and
                 // pathname expansion are not performed on redirection targets.
-                const path_slice = expand.expandWordJoined(allocator, word, shell) catch {
-                    return .{ .err = "failed to expand redirection target" };
+                const path_slice = expand.expandWordJoined(allocator, word, shell) catch |err| {
+                    return .{
+                        .err = switch (err) {
+                            // Error message already printed by expansion
+                            error.ParameterUnsetOrNull, error.ParameterAssignmentInvalid => "",
+                            else => "failed to expand redirection target",
+                        },
+                    };
                 };
                 const path = allocator.dupeZ(u8, path_slice) catch {
                     return .{ .err = "failed to allocate redirection path" };

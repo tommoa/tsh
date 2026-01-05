@@ -45,8 +45,8 @@
 //! | `${VAR+word}`    | Use alternative if set                   | Implemented |
 //! | `${VAR:=word}`   | Assign default if unset or null          | Implemented |
 //! | `${VAR=word}`    | Assign default if unset                  | Implemented |
-//! | `${VAR:?word}`   | Error if unset or null                   | Parsed only |
-//! | `${VAR?word}`    | Error if unset                           | Parsed only |
+//! | `${VAR:?word}`   | Error if unset or null                   | Implemented |
+//! | `${VAR?word}`    | Error if unset                           | Implemented |
 //! | `${VAR#pattern}` | Remove smallest prefix matching pattern  | Parsed only |
 //! | `${VAR##pattern}`| Remove largest prefix matching pattern   | Parsed only |
 //! | `${VAR%pattern}` | Remove smallest suffix matching pattern  | Parsed only |
@@ -90,6 +90,37 @@ const state = @import("state.zig");
 const Word = parser.Word;
 const WordPart = parser.WordPart;
 const ShellState = state.ShellState;
+const printError = state.printError;
+
+// ============================================================================
+// Expansion Errors
+// ============================================================================
+
+/// Errors that can occur during word expansion.
+///
+/// These errors indicate expansion-time failures that should cause the
+/// current command to fail with a non-zero exit status. The error message
+/// has already been printed to stderr when these are returned.
+///
+/// POSIX Reference: Section 2.8.1 - Consequences of Shell Errors
+/// "If a non-interactive shell encounters an expansion error, the shell
+/// shall write a diagnostic message to standard error and exit with a
+/// non-zero status."
+pub const ExpansionError = error{
+    /// ${parameter:?word} failed because parameter is unset or null.
+    /// POSIX 2.6.2: "If parameter is unset or null, the expansion of word
+    /// (or a message indicating it is unset if word is omitted) shall be
+    /// written to standard error and [...] the shell shall exit."
+    /// The error message has already been printed to stderr.
+    ParameterUnsetOrNull,
+    /// ${parameter:=word} failed because parameter cannot be assigned.
+    /// POSIX 2.6.2: "Attempting to assign a value in this way to a readonly
+    /// variable or a positional parameter [...] shall cause an expansion error."
+    /// This occurs for positional parameters ($1, $2, ...) and special
+    /// parameters ($@, $*, $#, $?, etc.).
+    /// The error message has already been printed to stderr.
+    ParameterAssignmentInvalid,
+} || Allocator.Error;
 
 // ============================================================================
 // Public API
@@ -101,7 +132,10 @@ const ShellState = state.ShellState;
 /// multiple entries when there are multiple positional parameters).
 ///
 /// This is the primary entry point for command argument expansion.
-pub fn expandArgv(allocator: Allocator, words: []const Word, shell: *ShellState) Allocator.Error![:null]const ?[*:0]const u8 {
+///
+/// Returns ExpansionError.ParameterUnsetOrNull if a ${parameter:?word}
+/// expansion fails. The error message is printed to stderr before returning.
+pub fn expandArgv(allocator: Allocator, words: []const Word, shell: *ShellState) ExpansionError![:null]const ?[*:0]const u8 {
     var builder = WordBuilder.init(allocator);
     for (words) |word| {
         try expandWord(&builder, word, shell);
@@ -116,7 +150,10 @@ pub fn expandArgv(allocator: Allocator, words: []const Word, shell: *ShellState)
 /// removal - but NOT field splitting or pathname expansion.
 ///
 /// POSIX 2.7 (Redirection): Redirection targets undergo similar expansion.
-pub fn expandWordJoined(allocator: Allocator, word: Word, shell: *ShellState) Allocator.Error![]const u8 {
+///
+/// Returns ExpansionError.ParameterUnsetOrNull if a ${parameter:?word}
+/// expansion fails. The error message is printed to stderr before returning.
+pub fn expandWordJoined(allocator: Allocator, word: Word, shell: *ShellState) ExpansionError![]const u8 {
     var builder = WordBuilder.init(allocator);
     try expandWord(&builder, word, shell);
     return builder.join(" ");
@@ -507,12 +544,12 @@ fn getSpecialParameter(
 /// Expand the "word" part of a modifier (e.g., `default` in `${VAR:-default}`).
 ///
 /// The word can contain nested expansions which must be recursively expanded.
-/// Returns the expanded string value.
+/// Returns the expanded parts.
 fn expandModifierWord(
     allocator: Allocator,
     shell: *ShellState,
     word_parts: ?[]const parser.WordPart,
-) Allocator.Error![]ExpandedPart {
+) ExpansionError![]ExpandedPart {
     const parts = word_parts orelse return try allocator.alloc(ExpandedPart, 0);
 
     var builder = WordBuilder.init(allocator);
@@ -525,12 +562,15 @@ fn expandModifierWord(
 ///
 /// Handles both regular variables ($VAR, ${VAR}) and special parameters.
 /// The `quoted` parameter affects behavior of $@ and $*.
+///
+/// Returns ExpansionError.ParameterUnsetOrNull if a ${parameter:?word}
+/// expansion fails. The error message is printed to stderr before returning.
 fn evaluateParameterExpansion(
     allocator: Allocator,
     shell: *ShellState,
     param: parser.ParameterExpansion,
     quoted: bool,
-) Allocator.Error![]ExpandedPart {
+) ExpansionError![]ExpandedPart {
     // Check for special parameters first
     if (try getSpecialParameter(allocator, shell, param.name, quoted)) |parts| {
         // TODO: Apply modifiers to special parameters
@@ -589,6 +629,16 @@ fn evaluateParameterExpansion(
             // ${parameter=word} - If parameter is unset (only), assign word and substitute
             const should_assign = if (mod.check_null) is_null_or_unset else !is_set;
             if (should_assign) {
+                // POSIX 2.6.2: Cannot assign to special or positional parameters.
+                // "Attempting to assign a value in this way to a readonly variable or a
+                // positional parameter shall cause an expansion error."
+                if (isSpecialOrPositional(param.name)) {
+                    printError("{s}: cannot assign in this way\n", .{param.name});
+                    return ExpansionError.ParameterAssignmentInvalid;
+                }
+
+                // TODO(tommoa): Look into this later to see if we can optimise some of
+                // the `WordBuilder` usage here.
                 // Expand the modifier word and join with space (POSIX: like $* in assignment context)
                 const word_value = if (mod.word) |parts| blk: {
                     var builder = WordBuilder.init(allocator);
@@ -596,25 +646,39 @@ fn evaluateParameterExpansion(
                     break :blk try builder.join(" ");
                 } else "";
 
-                // Cannot assign to special or positional parameters.
-                // Note: Currently this check only catches variable names that look like
-                // positional parameters but aren't handled by getSpecialParameter (e.g.,
-                // if someone manually constructs a ParameterExpansion with name="10").
-                // In practice, getSpecialParameter handles all positional parameters and
-                // returns early, so this code path is rarely taken. This guard will become
-                // more useful when modifier support is added to special parameters.
-                if (!isSpecialOrPositional(param.name)) {
-                    try shell.setVariable(param.name, word_value);
-                }
-                // For special/positional: POSIX says this is an error, but for now
-                // just return the value without assigning (proper error handling
-                // will be added with ErrorIfUnset modifier)
+                try shell.setVariable(param.name, word_value);
                 return makeSinglePart(allocator, word_value, kind);
             }
             return makeSinglePart(allocator, value, kind);
         },
+        .ErrorIfUnset => {
+            // ${parameter:?word} - If parameter is unset or null, print error and fail
+            // ${parameter?word} - If parameter is unset (only), print error and fail
+            // POSIX 2.6.2: "the expansion of word (or a message indicating it is unset
+            // if word is omitted) shall be written to standard error"
+            const should_error = if (mod.check_null) is_null_or_unset else !is_set;
+            if (should_error) {
+                // TODO(tommoa): Look into this later to see if we can optimise some of
+                // the `WordBuilder` usage here.
+                // Expand the error message and join with space
+                const msg = if (mod.word) |parts| blk: {
+                    var builder = WordBuilder.init(allocator);
+                    _ = try expandInnerParts(&builder, parts, shell);
+                    break :blk try builder.join(" ");
+                } else "";
+
+                // Use default message if word is empty
+                const display_msg = if (msg.len > 0) msg else "parameter null or not set";
+
+                // Print error to stderr
+                printError("{s}: {s}\n", .{ param.name, display_msg });
+
+                return ExpansionError.ParameterUnsetOrNull;
+            }
+            return makeSinglePart(allocator, value, kind);
+        },
         else => {
-            // Other modifiers not yet implemented (ErrorIfUnset, pattern removal)
+            // Other modifiers not yet implemented (pattern removal)
             return makeSinglePart(allocator, value, kind);
         },
     }
@@ -638,7 +702,7 @@ fn expandWord(
     builder: *WordBuilder,
     word: Word,
     shell: *ShellState,
-) Allocator.Error!void {
+) ExpansionError!void {
     // Reset word-scoped state for each new Word
     builder.last_was_positional = false;
 
@@ -693,7 +757,7 @@ fn expandInnerParts(
     builder: *WordBuilder,
     inner: []const WordPart,
     shell: *ShellState,
-) Allocator.Error!bool {
+) ExpansionError!bool {
     var content_added = false;
 
     for (inner) |part| {
@@ -1684,8 +1748,238 @@ test "modifier: ${VAR-default} with empty VAR returns empty (no colon)" {
     };
 
     const result = try expandWordJoined(arena.allocator(), word, &shell);
-    // Without colon, only checks if unset, not if null
+    // The modifier is ignored, so empty is returned (no positional param set)
     try std.testing.expectEqualStrings("", result);
+}
+
+// --- ErrorIfUnset modifier tests: ${VAR:?word} and ${VAR?word} ---
+
+test "modifier: ${VAR:?} returns error with default message when unset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // VAR is not set
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .ErrorIfUnset, .check_null = true, .word = null },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectError(ExpansionError.ParameterUnsetOrNull, result);
+}
+
+test "modifier: ${VAR:?custom message} returns error with custom message when unset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // VAR is not set
+
+    const msg_word = [_]WordPart{.{ .literal = "custom message" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .ErrorIfUnset, .check_null = true, .word = &msg_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectError(ExpansionError.ParameterUnsetOrNull, result);
+}
+
+test "modifier: ${VAR:?} returns error when empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "");
+
+    const msg_word = [_]WordPart{.{ .literal = "error" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .ErrorIfUnset, .check_null = true, .word = &msg_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectError(ExpansionError.ParameterUnsetOrNull, result);
+}
+
+test "modifier: ${VAR?} does not error when empty (no colon)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "");
+
+    const msg_word = [_]WordPart{.{ .literal = "error" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .ErrorIfUnset, .check_null = false, .word = &msg_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    // Without colon, only checks if unset, not if null/empty
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "modifier: ${VAR:?} returns value when set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "value");
+
+    const msg_word = [_]WordPart{.{ .literal = "error" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .ErrorIfUnset, .check_null = true, .word = &msg_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("value", result);
+}
+
+test "modifier: ${VAR:?${MSG}} expands error message" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("MSG", "expanded error");
+    // VAR is not set
+
+    const msg_word = [_]WordPart{.{ .parameter = .{ .name = "MSG", .modifier = null } }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .ErrorIfUnset, .check_null = true, .word = &msg_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectError(ExpansionError.ParameterUnsetOrNull, result);
+}
+
+test "modifier: ${VAR?} errors when unset (no colon)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // VAR is not set
+
+    const msg_word = [_]WordPart{.{ .literal = "error" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .ErrorIfUnset, .check_null = false, .word = &msg_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectError(ExpansionError.ParameterUnsetOrNull, result);
+}
+
+test "modifier: expansion error prevents subsequent expansions in argv" {
+    // When ${VAR:?} fails, the rest of the command should not be expanded
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // VAR is not set
+
+    // First word has the failing expansion
+    const word1 = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .ErrorIfUnset, .check_null = true, .word = null },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    // Second word should not be expanded
+    const word2 = Word{
+        .parts = &[_]WordPart{.{ .literal = "should not appear" }},
+        .position = 10,
+        .line = 1,
+        .column = 11,
+    };
+
+    const words = [_]Word{ word1, word2 };
+    const result = expandArgv(arena.allocator(), &words, &shell);
+    try std.testing.expectError(ExpansionError.ParameterUnsetOrNull, result);
+}
+
+// --- Tests for ErrorIfUnset with nested error expansion ---
+
+test "modifier: ${A:?${B:?nested}} nested error expansion evaluates inner first" {
+    // POSIX: The word operand is expanded before use. If the nested expansion
+    // also fails with :?, its error is printed first and propagates.
+    // This matches dash and bash behavior.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // Neither A nor B is set
+
+    const inner_msg = [_]WordPart{.{ .literal = "inner error" }};
+    const nested_word = [_]WordPart{.{ .parameter = .{
+        .name = "B",
+        .modifier = .{ .op = .ErrorIfUnset, .check_null = true, .word = &inner_msg },
+    } }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "A",
+            .modifier = .{ .op = .ErrorIfUnset, .check_null = true, .word = &nested_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    // The nested ${B:?inner error} is evaluated first and fails
+    const result = expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectError(ExpansionError.ParameterUnsetOrNull, result);
 }
 
 test "modifier: ${VAR-default} with unset VAR returns default (no colon)" {
