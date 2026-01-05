@@ -36,19 +36,19 @@
 //!
 //! ## Parameter Expansion Modifiers (Section 2.6.2)
 //!
-//! The following modifiers are parsed but not yet fully implemented:
-//!
-//! | Syntax           | Description                              |
-//! |------------------|------------------------------------------|
-//! | `${VAR:-word}`   | Use default if unset or null             |
-//! | `${VAR:=word}`   | Assign default if unset or null          |
-//! | `${VAR:?word}`   | Error if unset or null                   |
-//! | `${VAR:+word}`   | Use alternative if set and non-null      |
-//! | `${#VAR}`        | Length of value                          |
-//! | `${VAR#pattern}` | Remove smallest prefix matching pattern  |
-//! | `${VAR##pattern}`| Remove largest prefix matching pattern   |
-//! | `${VAR%pattern}` | Remove smallest suffix matching pattern  |
-//! | `${VAR%%pattern}`| Remove largest suffix matching pattern   |
+//! | Syntax           | Description                              | Status      |
+//! |------------------|------------------------------------------|-------------|
+//! | `${#VAR}`        | Length of value (in characters)          | Implemented |
+//! | `${VAR:-word}`   | Use default if unset or null             | Implemented |
+//! | `${VAR-word}`    | Use default if unset                     | Implemented |
+//! | `${VAR:+word}`   | Use alternative if set and non-null      | Implemented |
+//! | `${VAR+word}`    | Use alternative if set                   | Implemented |
+//! | `${VAR:=word}`   | Assign default if unset or null          | Parsed only |
+//! | `${VAR:?word}`   | Error if unset or null                   | Parsed only |
+//! | `${VAR#pattern}` | Remove smallest prefix matching pattern  | Parsed only |
+//! | `${VAR##pattern}`| Remove largest prefix matching pattern   | Parsed only |
+//! | `${VAR%pattern}` | Remove smallest suffix matching pattern  | Parsed only |
+//! | `${VAR%%pattern}`| Remove largest suffix matching pattern   | Parsed only |
 //!
 //! ## Quoting Effects on Expansion
 //!
@@ -419,12 +419,27 @@ fn getSpecialParameter(
     return null; // Not a special parameter
 }
 
+/// Expand the "word" part of a modifier (e.g., `default` in `${VAR:-default}`).
+///
+/// The word can contain nested expansions which must be recursively expanded.
+/// Returns the expanded string value.
+fn expandModifierWord(
+    allocator: Allocator,
+    shell: *const ShellState,
+    word_parts: ?[]const parser.WordPart,
+) Allocator.Error![]const u8 {
+    const parts = word_parts orelse return "";
+
+    var builder = WordBuilder.init(allocator);
+    _ = try expandInnerParts(&builder, parts, shell);
+
+    return builder.join(" ");
+}
+
 /// Evaluate a parameter expansion and return the expanded parts.
 ///
 /// Handles both regular variables ($VAR, ${VAR}) and special parameters.
 /// The `quoted` parameter affects behavior of $@ and $*.
-///
-/// TODO: Implement modifier evaluation (:-, :=, :?, :+, #, ##, %, %%)
 fn evaluateParameterExpansion(
     allocator: Allocator,
     shell: *const ShellState,
@@ -433,19 +448,62 @@ fn evaluateParameterExpansion(
 ) Allocator.Error![]ExpandedPart {
     // Check for special parameters first
     if (try getSpecialParameter(allocator, shell, param.name, quoted)) |parts| {
-        // TODO: Apply modifiers to special parameters (POSIX 2.6.2 allows this)
+        // TODO: Apply modifiers to special parameters (commit 6)
         if (param.modifier != null) {
-            // Currently silently ignored
+            // Silently ignored for now
         }
         return parts;
     }
 
     // Regular variable lookup
-    const value = shell.getVariable(param.name) orelse "";
+    const raw_value = shell.getVariable(param.name);
+    const is_set = raw_value != null;
+    const value = raw_value orelse "";
+    const is_null_or_unset = !is_set or value.len == 0;
 
-    // TODO: Apply modifiers (UseDefault, AssignDefault, ErrorIfUnset, UseAlternative,
-    // Length, RemoveSmallestPrefix, RemoveLargestPrefix, RemoveSmallestSuffix, RemoveLargestSuffix)
-    return makeSinglePart(allocator, value);
+    // No modifier - just return the value
+    if (param.modifier == null) {
+        return makeSinglePart(allocator, value);
+    }
+
+    const mod = param.modifier.?;
+
+    switch (mod.op) {
+        .Length => {
+            // POSIX 2.6.2: "${#parameter} - String Length. The length in characters
+            // of the value of parameter shall be substituted."
+            //
+            // We count Unicode codepoints (not bytes) per POSIX "characters" definition.
+            // Invalid UTF-8 sequences fall back to byte count.
+            const char_count = std.unicode.utf8CountCodepoints(value) catch value.len;
+            const len_str = try std.fmt.allocPrint(allocator, "{d}", .{char_count});
+            return makeSinglePart(allocator, len_str);
+        },
+        .UseDefault => {
+            // ${parameter:-word} - If parameter is unset or null, use word
+            // ${parameter-word} - If parameter is unset (only), use word
+            const use_default = if (mod.check_null) is_null_or_unset else !is_set;
+            if (use_default) {
+                const word_value = try expandModifierWord(allocator, shell, mod.word);
+                return makeSinglePart(allocator, word_value);
+            }
+            return makeSinglePart(allocator, value);
+        },
+        .UseAlternative => {
+            // ${parameter:+word} - If parameter is set and non-null, use word
+            // ${parameter+word} - If parameter is set (only), use word
+            const use_alt = if (mod.check_null) !is_null_or_unset else is_set;
+            if (use_alt) {
+                const word_value = try expandModifierWord(allocator, shell, mod.word);
+                return makeSinglePart(allocator, word_value);
+            }
+            return makeSinglePart(allocator, "");
+        },
+        else => {
+            // Other modifiers not yet implemented (AssignDefault, ErrorIfUnset, pattern removal)
+            return makeSinglePart(allocator, value);
+        },
+    }
 }
 
 // ============================================================================
@@ -1269,4 +1327,381 @@ test "expandArgv: multiple $@ expansions do not leak seen_complete state" {
     try std.testing.expectEqualStrings("x", std.mem.span(argv[1].?));
     try std.testing.expectEqualStrings("bar", std.mem.span(argv[2].?));
     try std.testing.expectEqualStrings("x", std.mem.span(argv[3].?));
+}
+
+// --- Parameter Expansion Modifier Tests (POSIX 2.6.2) ---
+
+// Length modifier tests: ${#VAR}
+
+test "modifier: ${#VAR} returns length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "hello");
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .Length, .check_null = false, .word = null },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("5", result);
+}
+
+test "modifier: ${#VAR} with empty string returns 0" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "");
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .Length, .check_null = false, .word = null },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("0", result);
+}
+
+test "modifier: ${#VAR} with unset variable returns 0" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // VAR is not set
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .Length, .check_null = false, .word = null },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("0", result);
+}
+
+test "modifier: ${#VAR} counts UTF-8 codepoints not bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // "日本" is 2 characters but 6 bytes in UTF-8
+    try shell.setVariable("VAR", "日本");
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .Length, .check_null = false, .word = null },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    // POSIX requires character count, not byte count
+    try std.testing.expectEqualStrings("2", result);
+}
+
+test "modifier: ${#VAR} with mixed ASCII and UTF-8" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // "Hello, 世界!" is 10 characters (7 ASCII + 2 CJK + 1 ASCII)
+    try shell.setVariable("VAR", "Hello, 世界!");
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .Length, .check_null = false, .word = null },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("10", result);
+}
+
+// UseDefault modifier tests: ${VAR:-word} and ${VAR-word}
+
+test "modifier: ${VAR:-default} with unset VAR returns default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // VAR is not set
+
+    const default_word = [_]WordPart{.{ .literal = "default" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("default", result);
+}
+
+test "modifier: ${VAR:-default} with empty VAR returns default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "");
+
+    const default_word = [_]WordPart{.{ .literal = "default" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("default", result);
+}
+
+test "modifier: ${VAR:-default} with set VAR returns value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "value");
+
+    const default_word = [_]WordPart{.{ .literal = "default" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("value", result);
+}
+
+test "modifier: ${VAR-default} with empty VAR returns empty (no colon)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "");
+
+    const default_word = [_]WordPart{.{ .literal = "default" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseDefault, .check_null = false, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    // Without colon, only checks if unset, not if null
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "modifier: ${VAR-default} with unset VAR returns default (no colon)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // VAR is not set
+
+    const default_word = [_]WordPart{.{ .literal = "default" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseDefault, .check_null = false, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("default", result);
+}
+
+test "modifier: ${VAR:-${OTHER}} nested expansion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("OTHER", "fallback");
+    // VAR is not set
+
+    const default_word = [_]WordPart{.{ .parameter = .{ .name = "OTHER", .modifier = null } }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("fallback", result);
+}
+
+// UseAlternative modifier tests: ${VAR:+word} and ${VAR+word}
+
+test "modifier: ${VAR:+alt} with unset VAR returns empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // VAR is not set
+
+    const alt_word = [_]WordPart{.{ .literal = "alt" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseAlternative, .check_null = true, .word = &alt_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "modifier: ${VAR:+alt} with empty VAR returns empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "");
+
+    const alt_word = [_]WordPart{.{ .literal = "alt" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseAlternative, .check_null = true, .word = &alt_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "modifier: ${VAR:+alt} with set VAR returns alt" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "value");
+
+    const alt_word = [_]WordPart{.{ .literal = "alt" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseAlternative, .check_null = true, .word = &alt_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("alt", result);
+}
+
+test "modifier: ${VAR+alt} with empty VAR returns alt (no colon)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "");
+
+    const alt_word = [_]WordPart{.{ .literal = "alt" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseAlternative, .check_null = false, .word = &alt_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    // Without colon, only checks if set (not if null)
+    try std.testing.expectEqualStrings("alt", result);
+}
+
+test "modifier: ${VAR+alt} with unset VAR returns empty (no colon)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // VAR is not set
+
+    const alt_word = [_]WordPart{.{ .literal = "alt" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .UseAlternative, .check_null = false, .word = &alt_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("", result);
 }
