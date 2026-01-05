@@ -36,21 +36,21 @@
 //!
 //! ## Parameter Expansion Modifiers (Section 2.6.2)
 //!
-//! | Syntax           | Description                              | Status      |
-//! |------------------|------------------------------------------|-------------|
-//! | `${#VAR}`        | Length of value (in characters)          | Implemented |
-//! | `${VAR:-word}`   | Use default if unset or null             | Implemented |
-//! | `${VAR-word}`    | Use default if unset                     | Implemented |
-//! | `${VAR:+word}`   | Use alternative if set and non-null      | Implemented |
-//! | `${VAR+word}`    | Use alternative if set                   | Implemented |
-//! | `${VAR:=word}`   | Assign default if unset or null          | Implemented |
-//! | `${VAR=word}`    | Assign default if unset                  | Implemented |
-//! | `${VAR:?word}`   | Error if unset or null                   | Implemented |
-//! | `${VAR?word}`    | Error if unset                           | Implemented |
-//! | `${VAR#pattern}` | Remove smallest prefix matching pattern  | Parsed only |
-//! | `${VAR##pattern}`| Remove largest prefix matching pattern   | Parsed only |
-//! | `${VAR%pattern}` | Remove smallest suffix matching pattern  | Parsed only |
-//! | `${VAR%%pattern}`| Remove largest suffix matching pattern   | Parsed only |
+//! | Syntax            | Description                              |
+//! |-------------------|------------------------------------------|
+//! | `${#VAR}`         | Length of value (in characters)          |
+//! | `${VAR:-word}`    | Use default if unset or null             |
+//! | `${VAR-word}`     | Use default if unset                     |
+//! | `${VAR:+word}`    | Use alternative if set and non-null      |
+//! | `${VAR+word}`     | Use alternative if set                   |
+//! | `${VAR:=word}`    | Assign default if unset or null          |
+//! | `${VAR=word}`     | Assign default if unset                  |
+//! | `${VAR:?word}`    | Error if unset or null                   |
+//! | `${VAR?word}`     | Error if unset                           |
+//! | `${VAR#pattern}`  | Remove smallest prefix matching pattern  |
+//! | `${VAR##pattern}` | Remove largest prefix matching pattern   |
+//! | `${VAR%pattern}`  | Remove smallest suffix matching pattern  |
+//! | `${VAR%%pattern}` | Remove largest suffix matching pattern   |
 //!
 //! ## Quoting Effects on Expansion
 //!
@@ -85,6 +85,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const parser = @import("parser.zig");
+const pattern = @import("pattern.zig");
 const state = @import("state.zig");
 
 const Word = parser.Word;
@@ -558,6 +559,34 @@ fn expandModifierWord(
     return builder.toParts();
 }
 
+/// Expand the pattern word for pattern removal modifiers (# ## % %%).
+///
+/// Similar to expandModifierWord, but returns a single joined string suitable
+/// for pattern matching. Pattern characters (*, ?, [, ]) retain their special
+/// meaning; only parameter expansions within the pattern are expanded.
+fn expandPatternWord(
+    allocator: Allocator,
+    shell: *ShellState,
+    word_parts: []const parser.WordPart,
+) ExpansionError![]const u8 {
+    var builder = WordBuilder.init(allocator);
+    _ = try expandInnerParts(&builder, word_parts, shell);
+
+    // Join all parts into a single pattern string
+    return builder.join("");
+}
+
+/// Step backward to the previous codepoint boundary.
+/// Returns the byte position of the previous codepoint start.
+fn prevCodepointPos(bytes: []const u8, pos: usize) usize {
+    if (pos == 0) return 0;
+    var i = pos - 1;
+    // UTF-8 continuation bytes have the form 10xxxxxx (0x80-0xBF)
+    // Walk back until we find a non-continuation byte
+    while (i > 0 and (bytes[i] & 0xC0) == 0x80) : (i -= 1) {}
+    return i;
+}
+
 /// Evaluate a parameter expansion and return the expanded parts.
 ///
 /// Handles both regular variables ($VAR, ${VAR}) and special parameters.
@@ -677,8 +706,84 @@ fn evaluateParameterExpansion(
             }
             return makeSinglePart(allocator, value, kind);
         },
-        else => {
-            // Other modifiers not yet implemented (pattern removal)
+        .RemoveSmallestPrefix => {
+            // ${parameter#word} - Remove smallest matching prefix
+            // POSIX 2.6.2: "The word shall be expanded to produce a pattern.
+            // The parameter expansion shall then result in parameter, with the
+            // smallest portion of the prefix matched by the pattern deleted."
+            //
+            // We iterate lazily by codepoint boundaries to match POSIX "character"
+            // semantics and be consistent with ${#VAR} length counting.
+            //
+            // TODO: This is O(n²×m) worst case - see pattern.zig for optimization ideas.
+            const word_parts = mod.word orelse return makeSinglePart(allocator, value, kind);
+            const pat = try expandPatternWord(allocator, shell, word_parts);
+            // Find shortest prefix that matches (iterate forward from start)
+            var pos: usize = 0;
+            while (pos <= value.len) {
+                if (pattern.match(pat, value[0..pos])) {
+                    return makeSinglePart(allocator, value[pos..], kind);
+                }
+                if (pos >= value.len) break;
+                pos += pattern.codepointLen(value, pos);
+            }
+            // No match - return original
+            return makeSinglePart(allocator, value, kind);
+        },
+        .RemoveLargestPrefix => {
+            // ${parameter##word} - Remove largest matching prefix
+            // POSIX 2.6.2: "Same as #, but the largest portion matched is deleted."
+            // TODO: This is O(n²×m) worst case - see pattern.zig for optimization ideas.
+            const word_parts = mod.word orelse return makeSinglePart(allocator, value, kind);
+            const pat = try expandPatternWord(allocator, shell, word_parts);
+            // Find longest prefix that matches (iterate backward from end)
+            var pos: usize = value.len;
+            while (true) {
+                if (pattern.match(pat, value[0..pos])) {
+                    return makeSinglePart(allocator, value[pos..], kind);
+                }
+                if (pos == 0) break;
+                pos = prevCodepointPos(value, pos);
+            }
+            // No match - return original
+            return makeSinglePart(allocator, value, kind);
+        },
+        .RemoveSmallestSuffix => {
+            // ${parameter%word} - Remove smallest matching suffix
+            // POSIX 2.6.2: "The word shall be expanded to produce a pattern.
+            // The parameter expansion shall then result in parameter, with the
+            // smallest portion of the suffix matched by the pattern deleted."
+            // TODO: This is O(n²×m) worst case - see pattern.zig for optimization ideas.
+            const word_parts = mod.word orelse return makeSinglePart(allocator, value, kind);
+            const pat = try expandPatternWord(allocator, shell, word_parts);
+            // Find shortest suffix that matches (iterate backward from end)
+            var pos: usize = value.len;
+            while (true) {
+                if (pattern.match(pat, value[pos..])) {
+                    return makeSinglePart(allocator, value[0..pos], kind);
+                }
+                if (pos == 0) break;
+                pos = prevCodepointPos(value, pos);
+            }
+            // No match - return original
+            return makeSinglePart(allocator, value, kind);
+        },
+        .RemoveLargestSuffix => {
+            // ${parameter%%word} - Remove largest matching suffix
+            // POSIX 2.6.2: "Same as %, but the largest portion matched is deleted."
+            // TODO: This is O(n²×m) worst case - see pattern.zig for optimization ideas.
+            const word_parts = mod.word orelse return makeSinglePart(allocator, value, kind);
+            const pat = try expandPatternWord(allocator, shell, word_parts);
+            // Find longest suffix that matches (iterate forward from start)
+            var pos: usize = 0;
+            while (pos <= value.len) {
+                if (pattern.match(pat, value[pos..])) {
+                    return makeSinglePart(allocator, value[0..pos], kind);
+                }
+                if (pos >= value.len) break;
+                pos += pattern.codepointLen(value, pos);
+            }
+            // No match - return original
             return makeSinglePart(allocator, value, kind);
         },
     }
@@ -2700,4 +2805,546 @@ test "modifier: ${10:=default} with unset multi-digit positional returns empty (
     const result = try expandWordJoined(arena.allocator(), word, &shell);
     // The modifier is ignored, so empty is returned (no positional param set)
     try std.testing.expectEqualStrings("", result);
+}
+
+// --- Pattern Removal Modifier Tests (POSIX 2.6.2) ---
+
+test "modifier: ${VAR#pattern} removes smallest prefix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "/home/user/file.txt");
+
+    // ${VAR#*/} -> home/user/file.txt (remove smallest prefix matching */)
+    const pattern_word = [_]WordPart{.{ .literal = "*/" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveSmallestPrefix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("home/user/file.txt", result);
+}
+
+test "modifier: ${VAR##pattern} removes largest prefix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "/home/user/file.txt");
+
+    // ${VAR##*/} -> file.txt (remove largest prefix matching */)
+    const pattern_word = [_]WordPart{.{ .literal = "*/" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveLargestPrefix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("file.txt", result);
+}
+
+test "modifier: ${VAR%pattern} removes smallest suffix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "/home/user/file.txt");
+
+    // ${VAR%/*} -> /home/user (remove smallest suffix matching /*)
+    const pattern_word = [_]WordPart{.{ .literal = "/*" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveSmallestSuffix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("/home/user", result);
+}
+
+test "modifier: ${VAR%%pattern} removes largest suffix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "/home/user/file.txt");
+
+    // ${VAR%%/*} -> "" (remove largest suffix matching /*)
+    const pattern_word = [_]WordPart{.{ .literal = "/*" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveLargestSuffix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "modifier: ${VAR#pattern} with no match returns unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "hello");
+
+    // ${VAR#x*} -> hello (no match, unchanged)
+    const pattern_word = [_]WordPart{.{ .literal = "x*" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveSmallestPrefix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("hello", result);
+}
+
+test "modifier: ${VAR%.*} removes extension" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "file.tar.gz");
+
+    // ${VAR%.*} -> file.tar (remove smallest suffix matching .*)
+    const pattern_word = [_]WordPart{.{ .literal = ".*" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveSmallestSuffix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("file.tar", result);
+}
+
+test "modifier: ${VAR%%.*} removes all extensions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "file.tar.gz");
+
+    // ${VAR%%.*} -> file (remove largest suffix matching .*)
+    const pattern_word = [_]WordPart{.{ .literal = ".*" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveLargestSuffix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("file", result);
+}
+
+test "modifier: ${VAR##*.} extracts extension" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "file.tar.gz");
+
+    // ${VAR##*.} -> gz (remove largest prefix matching *.)
+    const pattern_word = [_]WordPart{.{ .literal = "*." }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveLargestPrefix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("gz", result);
+}
+
+test "modifier: ${VAR#pattern} with bracket expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "abc123");
+
+    // ${VAR#[a-z]} -> bc123 (remove one lowercase letter)
+    const pattern_word = [_]WordPart{.{ .literal = "[a-z]" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveSmallestPrefix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("bc123", result);
+}
+
+test "modifier: ${VAR#[a-z]*} removes all matching pattern" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "abc123");
+
+    // ${VAR#[a-z]*} -> "" (a followed by zero-or-more matches the shortest, which is just "a")
+    // Actually: [a-z]* matches "a" (one letter + zero more), so result should be "bc123"
+    const pattern_word = [_]WordPart{.{ .literal = "[a-z]*" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveSmallestPrefix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    // [a-z]* will match "a" (the smallest match starting at position 0)
+    try std.testing.expectEqualStrings("bc123", result);
+}
+
+test "modifier: ${VAR##[a-z]*} removes largest matching pattern" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "abc123");
+
+    // ${VAR##[a-z]*} -> "" (largest prefix matching [a-z]* is entire string)
+    const pattern_word = [_]WordPart{.{ .literal = "[a-z]*" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveLargestPrefix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    // [a-z]* matches the entire "abc123" as the largest match
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "modifier: ${VAR#} with no pattern returns unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "hello");
+
+    // ${VAR#} with null pattern word -> unchanged
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveSmallestPrefix, .check_null = false, .word = null },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("hello", result);
+}
+
+test "modifier: ${VAR#pattern} with nested expansion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "/home/user/file.txt");
+    try shell.setVariable("SEP", "/");
+
+    // ${VAR#*$SEP} -> home/user/file.txt (pattern is "*" + value of SEP)
+    const pattern_word = [_]WordPart{
+        .{ .literal = "*" },
+        .{ .parameter = .{ .name = "SEP", .modifier = null } },
+    };
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveSmallestPrefix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("home/user/file.txt", result);
+}
+
+test "modifier: ${VAR#https://} strips URL prefix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("URL", "https://example.com/path");
+
+    // ${URL#https://} -> example.com/path
+    const pattern_word = [_]WordPart{.{ .literal = "https://" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "URL",
+            .modifier = .{ .op = .RemoveSmallestPrefix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("example.com/path", result);
+}
+
+test "modifier: ${VAR%pattern} with empty value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "");
+
+    // ${VAR%*} -> "" (empty value stays empty)
+    const pattern_word = [_]WordPart{.{ .literal = "*" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveSmallestSuffix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "modifier: ${VAR%?} removes last character" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "hello");
+
+    // ${VAR%?} -> hell (remove last character)
+    const pattern_word = [_]WordPart{.{ .literal = "?" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveSmallestSuffix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("hell", result);
+}
+
+test "modifier: ${VAR#?} removes first character" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "hello");
+
+    // ${VAR#?} -> ello (remove first character)
+    const pattern_word = [_]WordPart{.{ .literal = "?" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveSmallestPrefix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("ello", result);
+}
+
+// --- UTF-8 Pattern Matching Tests ---
+// These tests verify that pattern removal operates on Unicode codepoints,
+// not bytes, matching bash/zsh behavior and POSIX "character" semantics.
+
+test "modifier: ${VAR#?} with UTF-8 removes first codepoint" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // "日本語" is 3 codepoints, 9 bytes (3 bytes each)
+    try shell.setVariable("VAR", "日本語");
+
+    // ${VAR#?} -> "本語" (remove first codepoint, not first byte)
+    const pattern_word = [_]WordPart{.{ .literal = "?" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveSmallestPrefix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("本語", result);
+}
+
+test "modifier: ${VAR%?} with UTF-8 removes last codepoint" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "日本語");
+
+    // ${VAR%?} -> "日本" (remove last codepoint)
+    const pattern_word = [_]WordPart{.{ .literal = "?" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveSmallestSuffix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("日本", result);
+}
+
+test "modifier: ${VAR##???} with UTF-8 removes three codepoints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "日本語abc");
+
+    // ${VAR##???} -> "abc" (remove largest prefix matching 3 chars)
+    const pattern_word = [_]WordPart{.{ .literal = "???" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveLargestPrefix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("abc", result);
+}
+
+test "modifier: ${VAR%%???} with UTF-8 removes three codepoints from end" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setVariable("VAR", "abc日本語");
+
+    // ${VAR%%???} -> "abc" (remove largest suffix matching 3 chars)
+    const pattern_word = [_]WordPart{.{ .literal = "???" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveLargestSuffix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("abc", result);
+}
+
+test "modifier: ${VAR#*} with UTF-8 handles mixed content" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // Mix of ASCII and multi-byte: "hello世界" (5 ASCII + 2 CJK = 7 codepoints)
+    try shell.setVariable("VAR", "hello世界");
+
+    // ${VAR#?????} -> "世界" (remove 5 characters)
+    const pattern_word = [_]WordPart{.{ .literal = "?????" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "VAR",
+            .modifier = .{ .op = .RemoveSmallestPrefix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("世界", result);
 }
