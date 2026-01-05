@@ -46,7 +46,7 @@ pub fn main() !u8 {
     var command_string: ?[]const u8 = null;
     var force_interactive = false;
     var show_help = false;
-    var positional_params: std.ArrayListUnmanaged([]const u8) = .{};
+    var positional_params: std.ArrayListUnmanaged([]const u8) = .empty;
     defer positional_params.deinit(allocator);
 
     while (args.next()) |arg| {

@@ -160,7 +160,7 @@ pub const ShellState = struct {
     /// Positional parameters ($1, $2, ...).
     /// Set from script arguments or the `set` builtin.
     /// POSIX Reference: Section 2.5.1 - Positional Parameters
-    positional_params: std.ArrayListUnmanaged([]const u8) = .{},
+    positional_params: std.ArrayListUnmanaged([]const u8) = .empty,
 
     /// Shell/script name ($0).
     /// Set from the script path or shell invocation name.

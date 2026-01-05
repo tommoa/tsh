@@ -491,7 +491,7 @@ const ParserContext = union(enum) {
         return .{ .pipeline = .{
             .state = .start,
             .negated = false,
-            .commands = .{},
+            .commands = .empty,
             .command_count_before_pipe = null,
         } };
     }
@@ -503,9 +503,9 @@ const ParserContext = union(enum) {
             .seen_command = false,
             .pending_redir = null,
             .word_collector = WordCollector.init(allocator),
-            .assignments = .{},
-            .argv = .{},
-            .redirections = .{},
+            .assignments = .empty,
+            .argv = .empty,
+            .redirections = .empty,
         } };
     }
 
@@ -566,7 +566,7 @@ const WordCollector = struct {
 
         /// Initialize a double_quote context.
         fn initDoubleQuote() QuoteContext {
-            return .{ .double_quote = .{ .parts = .{} } };
+            return .{ .double_quote = .{ .parts = .empty } };
         }
 
         /// Initialize a brace_expansion context.
@@ -575,7 +575,7 @@ const WordCollector = struct {
                 .name = null,
                 .modifier_op = null,
                 .modifier_check_null = false,
-                .word_parts = .{},
+                .word_parts = .empty,
                 .seen_modifier = false,
             } };
         }
@@ -591,7 +591,7 @@ const WordCollector = struct {
     fn init(allocator: Allocator) WordCollector {
         return WordCollector{
             .allocator = allocator,
-            .parts = .{},
+            .parts = .empty,
             .quote_stack = undefined,
             .quote_depth = 0,
             .start_position = 0,
@@ -626,7 +626,7 @@ const WordCollector = struct {
 
     /// Start collecting a new word.
     fn startWord(self: *WordCollector, tok: lexer.Token) void {
-        self.parts = .{};
+        self.parts = .empty;
         self.start_position = tok.position;
         self.start_line = tok.line;
         self.start_column = tok.column;
@@ -1312,7 +1312,7 @@ pub const Parser = struct {
                                     // Valid source fd - use it for the redirection
                                     simple_command.setPendingRedir(redir, tok);
                                     _ = try self.consumeToken();
-                                    simple_command.word_collector.parts = .{};
+                                    simple_command.word_collector.parts = .empty;
                                     simple_command.pending_redir.?.source_fd = source_fd;
                                     continue :simple_command .need_redir_target;
                                 } else {
@@ -1578,7 +1578,7 @@ pub const Parser = struct {
                 const value_start = lit[eq_pos + 1 ..];
 
                 // Build the value Word
-                var value_parts: std.ArrayListUnmanaged(WordPart) = .{};
+                var value_parts: std.ArrayListUnmanaged(WordPart) = .empty;
 
                 // Add the part after `=` from the first literal (if non-empty)
                 if (value_start.len > 0) {
@@ -2606,7 +2606,7 @@ fn parseWithSmallBuffer(allocator: Allocator, input: []const u8, buf_size: usize
 
 /// Concatenate word parts into a single string for comparison.
 fn wordToString(allocator: Allocator, word: Word) ![]const u8 {
-    var result: std.ArrayListUnmanaged(u8) = .{};
+    var result: std.ArrayListUnmanaged(u8) = .empty;
     for (word.parts) |part| {
         try appendWordPartText(allocator, &result, part);
     }

@@ -160,6 +160,34 @@ const SavedFds = struct {
     }
 };
 
+/// Configuration for child process execution.
+/// Used for pipe wiring and execution mode flags.
+const ExecConfig = struct {
+    /// fd to wire to stdin (null = inherit).
+    stdin_fd: ?posix.fd_t = null,
+    /// fd to wire to stdout (null = inherit).
+    stdout_fd: ?posix.fd_t = null,
+    /// Additional fds to close before exec.
+    /// TODO: Used for here-docs and process substitution where children need
+    /// to close fds they shouldn't inherit (e.g., write ends of here-doc pipes).
+    close_fds: []const posix.fd_t = &.{},
+
+    /// Apply pipe fd wiring. Call at start of child process.
+    fn applyPipes(self: ExecConfig) void {
+        if (self.stdin_fd) |fd| {
+            posix.dup2(fd, posix.STDIN_FILENO) catch posix.exit(ExitStatus.GENERAL_ERROR);
+            posix.close(fd);
+        }
+        if (self.stdout_fd) |fd| {
+            posix.dup2(fd, posix.STDOUT_FILENO) catch posix.exit(ExitStatus.GENERAL_ERROR);
+            posix.close(fd);
+        }
+        for (self.close_fds) |fd| {
+            posix.close(fd);
+        }
+    }
+};
+
 /// Result of searching for an executable command.
 ///
 /// Different failure modes map to different POSIX exit codes:
@@ -320,14 +348,6 @@ pub const Executor = struct {
 
         // Not a builtin - fork and exec external command
 
-        // Build child environment map (copy shell env, add command assignments)
-        var env_map = self.buildChildEnvMap(cmd.assignments) catch |err| {
-            self.setError("failed to build environment", @errorName(err));
-            self.shell_state.last_status = .{ .exited = 1 };
-            return self.shell_state.last_status;
-        };
-        defer env_map.deinit();
-
         // Fork
         const pid = posix.fork() catch |err| {
             self.setError("fork failed", @errorName(err));
@@ -337,13 +357,118 @@ pub const Executor = struct {
 
         if (pid == 0) {
             // Child process - executeChild is noreturn (it execs or exits)
-            self.executeChild(cmd, argv, &env_map);
+            self.executeChild(cmd, argv, .{});
         }
 
         // Parent process
         const result = posix.waitpid(pid, 0);
         self.shell_state.last_status = statusFromWaitResult(result.status);
         return self.shell_state.last_status;
+    }
+
+    /// Clean up after pipeline failure.
+    /// Kills already-forked children and closes pipe fd.
+    fn cleanupPipeline(self: *Executor, pids: []const posix.pid_t, read_fd: ?posix.fd_t) void {
+        _ = self;
+        if (read_fd) |fd| posix.close(fd);
+        for (pids) |pid| {
+            posix.kill(pid, posix.SIG.KILL) catch {};
+            _ = posix.waitpid(pid, 0);
+        }
+    }
+
+    /// Execute a multi-command pipeline.
+    /// Each command runs in a subshell. Returns exit status of last command.
+    ///
+    /// Note: This function should only be called for pipelines with 2+ commands.
+    /// Single-command "pipelines" are executed directly via execute() to ensure
+    /// builtins like cd, export, exit affect the current shell environment.
+    fn executePipeline(self: *Executor, pipeline: parser.Pipeline) ExecuteError!ExitStatus {
+        const cmds = pipeline.commands;
+        std.debug.assert(cmds.len >= 2);
+
+        var pids: std.ArrayListUnmanaged(posix.pid_t) = .empty;
+        defer pids.deinit(self.allocator);
+        var read_fd: ?posix.fd_t = null;
+
+        for (cmds, 0..) |cmd, i| {
+            const is_last = (i == cmds.len - 1);
+
+            // Expand argv in parent (needed to check for builtins in pipeline stages)
+            const argv = expandArgv(self.allocator, cmd.argv, self.shell_state) catch {
+                printError("failed to expand arguments\n", .{});
+                self.cleanupPipeline(pids.items, read_fd);
+                self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
+                return self.shell_state.last_status;
+            };
+
+            // Create pipe for non-last commands
+            const pipe_fds: ?[2]posix.fd_t = if (!is_last)
+                posix.pipe() catch {
+                    printError("pipe failed\n", .{});
+                    self.cleanupPipeline(pids.items, read_fd);
+                    self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
+                    return self.shell_state.last_status;
+                }
+            else
+                null;
+
+            const pid = posix.fork() catch {
+                printError("fork failed\n", .{});
+                if (pipe_fds) |fds| {
+                    posix.close(fds[0]);
+                    posix.close(fds[1]);
+                }
+                self.cleanupPipeline(pids.items, read_fd);
+                self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
+                return self.shell_state.last_status;
+            };
+
+            if (pid == 0) {
+                // Child: close read end of new pipe (parent saves it for next stage)
+                if (pipe_fds) |fds| posix.close(fds[0]);
+
+                self.executeChild(cmd, argv, .{
+                    .stdin_fd = read_fd,
+                    .stdout_fd = if (pipe_fds) |fds| fds[1] else null,
+                });
+            }
+
+            // Parent: close fds we're done with
+            if (read_fd) |fd| posix.close(fd);
+            if (pipe_fds) |fds| {
+                posix.close(fds[1]); // Close write end
+                read_fd = fds[0]; // Save read end for next stage
+            } else {
+                read_fd = null; // Last command, no more pipes
+            }
+
+            pids.append(self.allocator, pid) catch {
+                printError("failed to track child process\n", .{});
+                self.cleanupPipeline(pids.items, read_fd);
+                self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
+                return self.shell_state.last_status;
+            };
+        }
+
+        // Close final read fd
+        if (read_fd) |fd| posix.close(fd);
+
+        // Wait for all children, capture exit status of last.
+        //
+        // Note on SIGPIPE: When a downstream command exits early (e.g., `yes | head -1`),
+        // upstream commands may receive SIGPIPE when writing to the closed pipe. This is
+        // normal pipeline behavior - the signaled status is captured by waitpid but doesn't
+        // affect the pipeline's exit status, which is always from the last command.
+        // This matches standard shell behavior (bash, dash, zsh).
+        var last_status: ExitStatus = .{ .exited = 0 };
+        for (pids.items) |pid| {
+            const result = posix.waitpid(pid, 0);
+            last_status = statusFromWaitResult(result.status);
+        }
+
+        self.shell_state.last_status = last_status;
+        return last_status;
     }
 
     /// Execute a command (simple or compound).
@@ -363,37 +488,60 @@ pub const Executor = struct {
             .pipeline => |pipeline| {
                 if (pipeline.commands.len == 0) {
                     // Empty pipeline - return success or failure based on negation
-                    return ExitStatus{ .exited = if (pipeline.negated) 1 else 0 };
+                    const status = ExitStatus{ .exited = 0 };
+                    if (pipeline.negated) {
+                        self.shell_state.last_status = .{ .exited = 1 };
+                        return self.shell_state.last_status;
+                    }
+                    self.shell_state.last_status = status;
+                    return status;
                 }
-                if (pipeline.commands.len > 1) {
-                    // Multi-command pipelines not yet implemented
-                    return ExecuteError.NotImplemented;
+                if (pipeline.commands.len == 1) {
+                    // Single-command "pipeline" - execute in current environment.
+                    // This ensures builtins like cd, export, exit work correctly.
+                    const status = try self.execute(pipeline.commands[0]);
+                    // Section 2.9.2: "If the pipeline begins with the reserved word
+                    // !, the exit status shall be the logical NOT of the exit status
+                    // of the last command."
+                    if (pipeline.negated) {
+                        const negated = switch (status) {
+                            .exited => |code| ExitStatus{ .exited = if (code == 0) 1 else 0 },
+                            .signaled => ExitStatus{ .exited = 0 }, // Non-zero exit negated to 0
+                        };
+                        self.shell_state.last_status = negated;
+                        return negated;
+                    }
+                    return status;
                 }
-                // Single command pipeline - execute it
-                const status = try self.execute(pipeline.commands[0]);
-                // Section 2.9.2: "If the pipeline begins with the reserved word
-                // !, the exit status shall be the logical NOT of the exit status
-                // of the last command."
+                // Multi-command pipeline - all stages run in subshells
+                const status = try self.executePipeline(pipeline);
+                // Handle negation (! prefix)
                 if (pipeline.negated) {
-                    return switch (status) {
+                    const negated = switch (status) {
                         .exited => |code| ExitStatus{ .exited = if (code == 0) 1 else 0 },
-                        .signaled => ExitStatus{ .exited = 0 }, // Non-zero exit negated to 0
+                        .signaled => ExitStatus{ .exited = 0 },
                     };
+                    self.shell_state.last_status = negated;
+                    return negated;
                 }
                 return status;
             },
         }
     }
 
-    /// Execute in the child process (after fork).
+    /// Execute a simple command in the child process.
+    /// Handles pipe wiring, redirections, builtins, and external commands.
     /// This function never returns - it either execs or exits.
     fn executeChild(
         self: *Executor,
         cmd: SimpleCommand,
         argv: [*:null]const ?[*:0]const u8,
-        env_map: *const process.EnvMap,
+        config: ExecConfig,
     ) noreturn {
-        // Set up redirections (files_only=false: actually redirect fds for the child)
+        // 1. Apply pipe wiring (before redirections)
+        config.applyPipes();
+
+        // 2. Apply command redirections
         switch (applyRedirections(self.allocator, cmd.redirections, false, self.shell_state)) {
             .ok => {},
             .err => |msg| {
@@ -402,13 +550,39 @@ pub const Executor = struct {
             },
         }
 
+        // 3. Handle empty argv (assignment-only command in pipeline)
         const cmd_name = argv[0] orelse {
-            printError("empty command\n", .{});
-            posix.exit(ExitStatus.NOT_FOUND);
+            // Assignment-only command in pipeline subshell.
+            // Pipe wiring and redirections already applied above.
+            // Assignments only affect shell variables in this subshell,
+            // which exits immediately, so we skip applying them.
+            // Matches bash/dash behavior.
+            posix.exit(0);
         };
 
-        // Find the executable path using the child's environment
-        const exe_path = switch (findExecutable(self.allocator, cmd_name, env_map)) {
+        // 4. Check for builtin (for pipeline stages)
+        if (builtins.Builtin.fromName(std.mem.span(cmd_name))) |builtin| {
+            var argc: usize = 0;
+            while (argv[argc] != null) : (argc += 1) {}
+            const args = self.allocator.alloc([]const u8, argc) catch {
+                printError("failed to allocate arguments\n", .{});
+                posix.exit(ExitStatus.GENERAL_ERROR);
+            };
+            for (0..argc) |i| {
+                args[i] = std.mem.span(argv[i].?);
+            }
+            const result = builtin.run(args, self.shell_state);
+            posix.exit(result.exit_code);
+        }
+
+        // 5. Build env map (moved from parent - only needed for external commands)
+        var env_map = self.buildChildEnvMap(cmd.assignments) catch {
+            printError("failed to build environment\n", .{});
+            posix.exit(ExitStatus.GENERAL_ERROR);
+        };
+
+        // 6. Find executable
+        const exe_path = switch (findExecutable(self.allocator, cmd_name, &env_map)) {
             .found => |path| path,
             .not_found => {
                 printError("{s}: command not found\n", .{cmd_name});
@@ -420,13 +594,11 @@ pub const Executor = struct {
             },
         };
 
-        // Convert env_map to null-delimited format for execve
-        const envp = process.createNullDelimitedEnvMap(self.allocator, env_map) catch {
+        // 7. Execute
+        const envp = process.createNullDelimitedEnvMap(self.allocator, &env_map) catch {
             printError("{s}: failed to create environment\n", .{cmd_name});
             posix.exit(ExitStatus.GENERAL_ERROR);
         };
-
-        // Execute the command
         const envp_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(envp.ptr);
         const err = posix.execveZ(exe_path, argv, envp_ptr);
 
@@ -2250,4 +2422,204 @@ test "expandArgv: echo with $@ produces correct argv" {
     try std.testing.expectEqualStrings("a", std.mem.span(argv[1].?));
     try std.testing.expectEqualStrings("b", std.mem.span(argv[2].?));
     try std.testing.expectEqualStrings("c", std.mem.span(argv[3].?));
+}
+
+// --- Pipeline tests ---
+
+test "executor: simple pipeline" {
+    // echo hello | cat -> outputs "hello"
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_simple_pipeline";
+    std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    // Use redirection to capture output: echo hello | cat > file
+    const cmd = try parseCommand(arena.allocator(), "echo hello | cat > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+    const status = try exec.executeCommand(cmd);
+
+    try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
+
+    // Verify output
+    const contents = try std.fs.cwd().readFileAlloc(std.testing.allocator, tmp_path, 1024);
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings("hello\n", contents);
+
+    std.fs.deleteFileAbsolute(tmp_path) catch {};
+}
+
+test "executor: pipeline exit status from last command" {
+    // true | false -> exit 1
+    // false | true -> exit 0
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+
+    // true | false -> exit 1
+    const cmd1 = try parseCommand(arena.allocator(), "true | false\n") orelse return error.NoCommand;
+    const status1 = try exec.executeCommand(cmd1);
+    try std.testing.expectEqual(ExitStatus{ .exited = 1 }, status1);
+
+    // false | true -> exit 0
+    const cmd2 = try parseCommand(arena.allocator(), "false | true\n") orelse return error.NoCommand;
+    const status2 = try exec.executeCommand(cmd2);
+    try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status2);
+}
+
+test "executor: negated simple command" {
+    // ! true -> exit 1
+    // ! false -> exit 0
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+
+    // ! true -> exit 1
+    const cmd1 = try parseCommand(arena.allocator(), "! true\n") orelse return error.NoCommand;
+    const status1 = try exec.executeCommand(cmd1);
+    try std.testing.expectEqual(ExitStatus{ .exited = 1 }, status1);
+
+    // ! false -> exit 0
+    const cmd2 = try parseCommand(arena.allocator(), "! false\n") orelse return error.NoCommand;
+    const status2 = try exec.executeCommand(cmd2);
+    try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status2);
+}
+
+test "executor: negated pipeline" {
+    // ! true | false -> exit 0 (last is false=1, negated=0)
+    // ! false | true -> exit 1 (last is true=0, negated=1)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+
+    // ! true | false -> last command is false (exit 1), negated = 0
+    const cmd1 = try parseCommand(arena.allocator(), "! true | false\n") orelse return error.NoCommand;
+    const status1 = try exec.executeCommand(cmd1);
+    try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status1);
+
+    // ! false | true -> last command is true (exit 0), negated = 1
+    const cmd2 = try parseCommand(arena.allocator(), "! false | true\n") orelse return error.NoCommand;
+    const status2 = try exec.executeCommand(cmd2);
+    try std.testing.expectEqual(ExitStatus{ .exited = 1 }, status2);
+}
+
+test "executor: three-stage pipeline" {
+    // echo hello | cat | cat -> outputs "hello"
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_three_stage_pipeline";
+    std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    const cmd = try parseCommand(arena.allocator(), "echo hello | cat | cat > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+    const status = try exec.executeCommand(cmd);
+
+    try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
+
+    // Verify output
+    const contents = try std.fs.cwd().readFileAlloc(std.testing.allocator, tmp_path, 1024);
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings("hello\n", contents);
+
+    std.fs.deleteFileAbsolute(tmp_path) catch {};
+}
+
+test "executor: builtin in pipeline" {
+    // pwd | cat -> outputs current directory
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_builtin_pipeline";
+    std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    const cmd = try parseCommand(arena.allocator(), "pwd | cat > " ++ tmp_path ++ "\n") orelse return error.NoCommand;
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+    const status = try exec.executeCommand(cmd);
+
+    try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
+
+    // Verify output contains the cwd
+    const contents = try std.fs.cwd().readFileAlloc(std.testing.allocator, tmp_path, 4096);
+    defer std.testing.allocator.free(contents);
+
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}\n", .{shell_state.cwd});
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, contents);
+
+    std.fs.deleteFileAbsolute(tmp_path) catch {};
+}
+
+test "executor: builtin in single-command pipeline affects current env" {
+    // Verify that `cd /tmp` (which is parsed as a single-command pipeline)
+    // actually changes the current directory
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+
+    // Save original cwd
+    const original_cwd = shell_state.cwd;
+
+    // Execute cd /tmp
+    const cmd = try parseCommand(arena.allocator(), "cd /tmp\n") orelse return error.NoCommand;
+    const status = try exec.executeCommand(cmd);
+
+    try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
+
+    // Verify cwd changed
+    try std.testing.expectEqualStrings("/tmp", shell_state.cwd);
+    try std.testing.expect(!std.mem.eql(u8, original_cwd, shell_state.cwd) or std.mem.eql(u8, original_cwd, "/tmp"));
+}
+
+test "executor: builtin in multi-command pipeline does not affect current env" {
+    // Verify that `echo x | cd /tmp` does NOT change the current directory
+    // (cd runs in a subshell)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+
+    // Save original cwd
+    const original_cwd = try arena.allocator().dupe(u8, shell_state.cwd);
+
+    // Execute echo x | cd /
+    // Note: cd in a pipeline runs in a subshell and doesn't affect parent
+    const cmd = try parseCommand(arena.allocator(), "echo x | cd /\n") orelse return error.NoCommand;
+    _ = try exec.executeCommand(cmd);
+
+    // Verify cwd did NOT change
+    try std.testing.expectEqualStrings(original_cwd, shell_state.cwd);
+}
+
+test "executor: assignment-only command in pipeline" {
+    // X=test | cat -> exits 0, X not set in parent
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+
+    // Ensure X is not set
+    try std.testing.expect(shell_state.getVariable("X") == null);
+
+    // Execute X=test | cat
+    const cmd = try parseCommand(arena.allocator(), "X=test | cat\n") orelse return error.NoCommand;
+    const status = try exec.executeCommand(cmd);
+
+    try std.testing.expectEqual(ExitStatus{ .exited = 0 }, status);
+
+    // X should still not be set in parent (assignment was in subshell)
+    try std.testing.expect(shell_state.getVariable("X") == null);
 }
