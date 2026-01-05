@@ -728,7 +728,7 @@ fn findExecutable(allocator: Allocator, cmd: [*:0]const u8, env_map: *const proc
 /// On success, returns .ok.
 /// On failure, returns .err with an error message. The caller is responsible
 /// for printing the error and determining the appropriate exit status.
-fn applyRedirections(allocator: Allocator, redirections: []const ParsedRedirection, files_only: bool, shell: *const ShellState) RedirectionResult {
+fn applyRedirections(allocator: Allocator, redirections: []const ParsedRedirection, files_only: bool, shell: *ShellState) RedirectionResult {
     for (redirections) |redir| {
         const source_fd: posix.fd_t = @intCast(redir.source_fd orelse defaultSourceFd(redir.op));
 
