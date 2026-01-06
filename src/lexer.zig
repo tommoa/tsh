@@ -1203,6 +1203,24 @@ pub const Lexer = struct {
                 const first = try self.peekByte() orelse break :state null;
 
                 switch (first) {
+                    '#' => {
+                        // Comment - ignore everything up to the next newline.
+                        // See POSIX 2.3 Token Recognition, point 9.
+                        // It is safe to continue reading, as any buffer
+                        // boundaries will be part of the comment (which we
+                        // don't hand back to the parser).
+                        while (true) {
+                            const result = try self.readUntil("\n") orelse break;
+                            if (result.complete) break;
+                        }
+                        // Only consume the newline if we found one (not EOF)
+                        if (try self.peekByte()) |c| {
+                            if (c == '\n') _ = try self.consumeOne();
+                        }
+                        self.needs_continuation = false;
+                        // Get the next non-comment token.
+                        continue :state .none;
+                    },
                     '\n' => {
                         // Handle newline - command separator (POSIX <newline>)
                         _ = try self.consumeOne();
@@ -3567,4 +3585,98 @@ test "nextToken: ${:} is InvalidModifier error" {
     var lexer = Lexer.init(&reader);
     try expectBraceExpansionBegin(try lexer.nextToken());
     try std.testing.expectError(LexerError.InvalidModifier, lexer.nextToken());
+}
+
+// --- Comment tests ---
+
+test "nextToken: comment at start of line" {
+    var reader = std.io.Reader.fixed("# this is a comment\necho hello");
+    var lexer = Lexer.init(&reader);
+    // Comment is consumed, newline is consumed, then echo is returned
+    try expectLiteral(try lexer.nextToken(), "echo");
+    try expectLiteral(try lexer.nextToken(), "hello");
+    try expectContinuation(try lexer.nextToken(), "", true);
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: comment only" {
+    var reader = std.io.Reader.fixed("# just a comment");
+    var lexer = Lexer.init(&reader);
+    // Comment extends to EOF, nothing returned
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: comment at EOF without newline" {
+    // Comment at EOF without trailing newline should be handled gracefully
+    var reader = std.io.Reader.fixed("echo hello\n# comment at EOF");
+    var lexer = Lexer.init(&reader);
+    try expectLiteral(try lexer.nextToken(), "echo");
+    try expectLiteral(try lexer.nextToken(), "hello");
+    try expectSeparator(try lexer.nextToken()); // newline
+    // Comment consumed to EOF
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: empty comment" {
+    var reader = std.io.Reader.fixed("#\necho hello");
+    var lexer = Lexer.init(&reader);
+    // Empty comment is still a comment
+    try expectLiteral(try lexer.nextToken(), "echo");
+    try expectLiteral(try lexer.nextToken(), "hello");
+    try expectContinuation(try lexer.nextToken(), "", true);
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: comment with special characters" {
+    var reader = std.io.Reader.fixed("# $VAR 'quoted' \"double\" > < | &\necho done");
+    var lexer = Lexer.init(&reader);
+    // All special chars are ignored in comment
+    try expectLiteral(try lexer.nextToken(), "echo");
+    try expectLiteral(try lexer.nextToken(), "done");
+    try expectContinuation(try lexer.nextToken(), "", true);
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: multiple comments" {
+    var reader = std.io.Reader.fixed("# comment 1\n# comment 2\necho test");
+    var lexer = Lexer.init(&reader);
+    try expectLiteral(try lexer.nextToken(), "echo");
+    try expectLiteral(try lexer.nextToken(), "test");
+    try expectContinuation(try lexer.nextToken(), "", true);
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: hash in middle of word is not comment" {
+    var reader = std.io.Reader.fixed("foo#bar");
+    var lexer = Lexer.init(&reader);
+    // Hash is not at word boundary, so it's part of the literal
+    try expectLiteral(try lexer.nextToken(), "foo#bar");
+    try expectContinuation(try lexer.nextToken(), "", true);
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: hash after space is comment" {
+    var reader = std.io.Reader.fixed("echo hello # this is ignored");
+    var lexer = Lexer.init(&reader);
+    try expectLiteral(try lexer.nextToken(), "echo");
+    try expectLiteral(try lexer.nextToken(), "hello");
+    // Comment consumed to EOF
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: hash in single quotes is literal" {
+    var reader = std.io.Reader.fixed("'# not a comment'");
+    var lexer = Lexer.init(&reader);
+    try expectSingleQuoted(try lexer.nextToken(), "# not a comment");
+    try expectContinuation(try lexer.nextToken(), "", true);
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: hash in double quotes is literal" {
+    var reader = std.io.Reader.fixed("\"# not a comment\"");
+    var lexer = Lexer.init(&reader);
+    try expectDoubleQuoteBegin(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "# not a comment");
+    try expectDoubleQuoteEnd(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
 }
