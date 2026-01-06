@@ -423,6 +423,90 @@ fn makeSinglePart(allocator: Allocator, content: []const u8, kind: ExpandedPart.
     return result;
 }
 
+/// Intermediate result from getting a parameter's base value.
+///
+/// POSIX 2.6.2 (Parameter Expansion) defines modifiers that can be applied to
+/// any parameter. This struct abstracts the difference between special parameters
+/// (POSIX 2.5.2) and regular variables, allowing modifiers to be applied uniformly.
+const BaseValue = struct {
+    /// The expanded parts representing the parameter's value.
+    ///
+    /// For $@, these are multiple parts with .positional kind (preserving word boundaries).
+    /// For $*, this is a single pre-joined part. For regular variables, a single part.
+    /// The parts already have the correct Kind set by getSpecialParameter or init,
+    /// so callers can return them directly without additional processing.
+    parts: []ExpandedPart,
+    /// False for unset variables and non-existent positional parameters.
+    ///
+    /// Note: Special parameters $@, $*, $#, $?, $$, $!, $0 are always considered
+    /// "set" per POSIX 2.5.2, even when they expand to empty (e.g., $@ with zero
+    /// positional params). This means ${@-default} returns empty (because $@ is
+    /// "set"), while ${@:-default} returns "default" (because $@ is empty).
+    ///
+    /// Shell divergence for $@/$* with zero positional parameters:
+    ///   - bash: treats as "unset" (no arguments = nothing is set)
+    ///       ${@-def} → "def", ${@+alt} → ""
+    ///   - dash/zsh: treats as "set but empty" (per POSIX 2.5.2, special params are always defined)
+    ///       ${@-def} → "", ${@+alt} → "alt"
+    /// We follow dash/zsh behavior. Both agree when colon is used: ${@:-def} → "def".
+    is_set: bool,
+
+    /// Initialize a BaseValue by looking up a parameter (special or regular).
+    ///
+    /// This abstracts the difference between special parameters and regular
+    /// variables, allowing modifiers to be applied uniformly.
+    pub fn init(
+        allocator: Allocator,
+        shell: *const ShellState,
+        name: []const u8,
+        quoted: bool,
+    ) Allocator.Error!BaseValue {
+        const kind: ExpandedPart.Kind = if (quoted) .quoted else .normal;
+
+        // Try special parameter first.
+        // getSpecialParameter returns null for non-existent positional parameters
+        // (e.g., $1 when no args provided), which correctly falls through to the
+        // regular variable path where is_set will be false.
+        if (try getSpecialParameter(allocator, shell, name, quoted)) |parts| {
+            return .{ .parts = parts, .is_set = true };
+        }
+
+        // Regular variable
+        const raw_value = shell.getVariable(name);
+        return .{
+            .parts = try makeSinglePart(allocator, raw_value orelse "", kind),
+            .is_set = raw_value != null,
+        };
+    }
+
+    /// Get the scalar string value (joins parts with space if multi-value).
+    pub fn getValue(self: *const BaseValue, allocator: Allocator) Allocator.Error![]const u8 {
+        if (self.parts.len == 0) return "";
+        if (self.parts.len == 1) return self.parts[0].content;
+        return joinExpandedParts(allocator, self.parts, " ");
+    }
+
+    /// POSIX 2.6.2: "In the parameter expansion forms that use the colon,
+    /// the test includes checking whether the parameter is unset or null;
+    /// omitting the colon results in a test only for a parameter that is unset."
+    ///
+    /// When check_null is true (colon present), checks if unset OR empty.
+    /// When check_null is false (no colon), only checks if unset.
+    pub fn shouldUseDefault(self: *const BaseValue, check_null: bool) bool {
+        if (!self.is_set) return true;
+        if (!check_null) return false;
+
+        // Check if value is empty (null). For multi-value params like $@,
+        // empty means no parts or all parts have zero-length content.
+        if (self.parts.len == 0) return true;
+        if (self.parts.len == 1) return self.parts[0].content.len == 0;
+        for (self.parts) |p| {
+            if (p.content.len > 0) return false;
+        }
+        return true;
+    }
+};
+
 /// Get the value of a special parameter (POSIX 2.5.2).
 ///
 /// Returns null if the name is not a special parameter, allowing the caller
@@ -524,19 +608,28 @@ fn getSpecialParameter(
     }
 
     // Positional parameters: $0, $1-$9, ${10}, ${11}, etc.
+    //
+    // POSIX 2.5.2 (Special Parameters) and 2.6.2 (Parameter Expansion):
+    // Positional parameters that were never provided are "unset", not "set but null".
+    // $0 is always set (the shell name). We return null for non-existent positional
+    // parameters so modifiers like ${1:-default} correctly treat them as unset.
     if (std.fmt.parseInt(usize, name, 10)) |idx| {
-        const result = try allocator.alloc(ExpandedPart, 1);
         if (idx == 0) {
+            const result = try allocator.alloc(ExpandedPart, 1);
             result[0] = .{ .content = shell.shell_name, .kind = kind };
+            return result;
         } else {
             const params = shell.positional_params.items;
             if (idx <= params.len) {
+                const result = try allocator.alloc(ExpandedPart, 1);
                 result[0] = .{ .content = params[idx - 1], .kind = kind };
+                return result;
             } else {
-                result[0] = .{ .content = "", .kind = kind };
+                // Positional parameter doesn't exist - return null so it's
+                // treated as unset (not as "set but null")
+                return null;
             }
         }
-        return result;
     } else |_| {}
 
     return null; // Not a special parameter
@@ -576,6 +669,207 @@ fn expandPatternWord(
     return builder.join("");
 }
 
+/// Join ExpandedPart array into a single string.
+///
+/// This is distinct from WordBuilder.join() which operates on word buffers.
+/// Used when modifiers need to operate on the joined value of $@ or $*.
+fn joinExpandedParts(allocator: Allocator, parts: []const ExpandedPart, sep: []const u8) Allocator.Error![]const u8 {
+    if (parts.len == 0) return "";
+    if (parts.len == 1) return parts[0].content;
+
+    var total_len: usize = 0;
+    for (parts) |p| total_len += p.content.len;
+    total_len += sep.len * (parts.len - 1);
+
+    if (total_len == 0) return "";
+
+    const result = try allocator.alloc(u8, total_len);
+    var offset: usize = 0;
+    for (parts, 0..) |p, i| {
+        @memcpy(result[offset..][0..p.content.len], p.content);
+        offset += p.content.len;
+        if (i < parts.len - 1) {
+            @memcpy(result[offset..][0..sep.len], sep);
+            offset += sep.len;
+        }
+    }
+    return result;
+}
+
+/// Apply a modifier to a parameter value.
+///
+/// This is the unified modifier application function that handles both single-value
+/// parameters (regular variables, $?, $#, $1, etc.) and multi-value parameters ($@, $*).
+///
+/// The `base` parameter provides the value and metadata, `param_name` is used for
+/// error messages and assignment validation.
+///
+/// The `quoted` parameter determines the Kind for newly-created parts (e.g., length
+/// strings, pattern removal results, assigned values). When returning the original
+/// value unchanged, we return `base.parts` directly since it already has the correct
+/// Kind set by BaseValue.init().
+fn applyModifier(
+    allocator: Allocator,
+    shell: *ShellState,
+    base: *const BaseValue,
+    mod: parser.ParameterExpansion.Modifier,
+    param_name: []const u8,
+    quoted: bool,
+) ExpansionError![]ExpandedPart {
+    const kind: ExpandedPart.Kind = if (quoted) .quoted else .normal;
+
+    switch (mod.op) {
+        .Length => {
+            // POSIX 2.6.2: ${#parameter} - String length.
+            // Returns the length in characters (Unicode codepoints).
+            // Note: ${#@} and ${#*} are handled specially in evaluateParameterExpansion
+            // to return the count of positional parameters instead.
+            const value = try base.getValue(allocator);
+            const char_count = std.unicode.utf8CountCodepoints(value) catch value.len;
+            const len_str = try std.fmt.allocPrint(allocator, "{d}", .{char_count});
+            return makeSinglePart(allocator, len_str, kind);
+        },
+        .UseDefault => {
+            // POSIX 2.6.2: ${parameter:-word} - Use default value.
+            // Substitutes word if parameter is unset or null (with colon) or just unset (without).
+            if (base.shouldUseDefault(mod.check_null)) {
+                return try expandModifierWord(allocator, shell, mod.word);
+            }
+            return base.parts;
+        },
+        .UseAlternative => {
+            // POSIX 2.6.2: ${parameter:+word} - Use alternative value.
+            // Substitutes word if parameter is set and non-null (with colon) or just set (without).
+            const use_alt = !base.shouldUseDefault(mod.check_null);
+            if (use_alt) {
+                return try expandModifierWord(allocator, shell, mod.word);
+            }
+            return makeSinglePart(allocator, "", kind);
+        },
+        .AssignDefault => {
+            // POSIX 2.6.2: ${parameter:=word} - Assign default value.
+            // Assigns word to parameter and substitutes if unset or null (with colon) or just unset (without).
+            if (base.shouldUseDefault(mod.check_null)) {
+                // POSIX 2.6.2: Cannot assign to special or positional parameters
+                if (isSpecialOrPositional(param_name)) {
+                    printError("{s}: cannot assign in this way\n", .{param_name});
+                    return ExpansionError.ParameterAssignmentInvalid;
+                }
+
+                // Expand the modifier word and join with space
+                const word_value = if (mod.word) |parts| blk: {
+                    var builder = WordBuilder.init(allocator);
+                    _ = try expandInnerParts(&builder, parts, shell);
+                    break :blk try builder.join(" ");
+                } else "";
+
+                try shell.setVariable(param_name, word_value);
+                return makeSinglePart(allocator, word_value, kind);
+            }
+            return base.parts;
+        },
+        .ErrorIfUnset => {
+            // POSIX 2.6.2: ${parameter:?word} - Error if null or unset.
+            // Displays error and exits if parameter is unset or null (with colon) or just unset (without).
+            if (base.shouldUseDefault(mod.check_null)) {
+                const msg = if (mod.word) |word_parts| blk: {
+                    var builder = WordBuilder.init(allocator);
+                    _ = try expandInnerParts(&builder, word_parts, shell);
+                    break :blk try builder.join(" ");
+                } else "";
+
+                const display_msg = if (msg.len > 0) msg else "parameter null or not set";
+                printError("{s}: {s}\n", .{ param_name, display_msg });
+                return ExpansionError.ParameterUnsetOrNull;
+            }
+            return base.parts;
+        },
+        .RemoveSmallestPrefix, .RemoveLargestPrefix, .RemoveSmallestSuffix, .RemoveLargestSuffix => {
+            // Pattern removal operates on the joined value.
+            //
+            // POSIX 2.6.2 note: The behavior of ${@#pattern}, ${*#pattern}, etc.
+            // is unspecified. Implementations vary:
+            //   - bash: applies pattern to each positional parameter separately
+            //   - dash: ignores the pattern modifier entirely
+            //   - tsh: joins with space, applies pattern once to the result
+            //
+            // TODO: Consider matching bash behavior (apply to each element)
+            // for better script compatibility.
+            const value = try base.getValue(allocator);
+            return applyPatternModifier(allocator, shell, value, mod, kind);
+        },
+    }
+}
+
+/// POSIX 2.6.2: Apply pattern removal modifiers to a single value.
+///   ${parameter#word}  - Remove smallest prefix matching word
+///   ${parameter##word} - Remove largest prefix matching word
+///   ${parameter%word}  - Remove smallest suffix matching word
+///   ${parameter%%word} - Remove largest suffix matching word
+fn applyPatternModifier(
+    allocator: Allocator,
+    shell: *ShellState,
+    value: []const u8,
+    mod: parser.ParameterExpansion.Modifier,
+    kind: ExpandedPart.Kind,
+) ExpansionError![]ExpandedPart {
+    switch (mod.op) {
+        .RemoveSmallestPrefix => {
+            const word_parts = mod.word orelse return makeSinglePart(allocator, value, kind);
+            const pat = try expandPatternWord(allocator, shell, word_parts);
+            var pos: usize = 0;
+            while (pos <= value.len) {
+                if (pattern.match(pat, value[0..pos])) {
+                    return makeSinglePart(allocator, value[pos..], kind);
+                }
+                if (pos >= value.len) break;
+                pos += pattern.codepointLen(value, pos);
+            }
+            return makeSinglePart(allocator, value, kind);
+        },
+        .RemoveLargestPrefix => {
+            const word_parts = mod.word orelse return makeSinglePart(allocator, value, kind);
+            const pat = try expandPatternWord(allocator, shell, word_parts);
+            var pos: usize = value.len;
+            while (true) {
+                if (pattern.match(pat, value[0..pos])) {
+                    return makeSinglePart(allocator, value[pos..], kind);
+                }
+                if (pos == 0) break;
+                pos = prevCodepointPos(value, pos);
+            }
+            return makeSinglePart(allocator, value, kind);
+        },
+        .RemoveSmallestSuffix => {
+            const word_parts = mod.word orelse return makeSinglePart(allocator, value, kind);
+            const pat = try expandPatternWord(allocator, shell, word_parts);
+            var pos: usize = value.len;
+            while (true) {
+                if (pattern.match(pat, value[pos..])) {
+                    return makeSinglePart(allocator, value[0..pos], kind);
+                }
+                if (pos == 0) break;
+                pos = prevCodepointPos(value, pos);
+            }
+            return makeSinglePart(allocator, value, kind);
+        },
+        .RemoveLargestSuffix => {
+            const word_parts = mod.word orelse return makeSinglePart(allocator, value, kind);
+            const pat = try expandPatternWord(allocator, shell, word_parts);
+            var pos: usize = 0;
+            while (pos <= value.len) {
+                if (pattern.match(pat, value[pos..])) {
+                    return makeSinglePart(allocator, value[0..pos], kind);
+                }
+                if (pos >= value.len) break;
+                pos += pattern.codepointLen(value, pos);
+            }
+            return makeSinglePart(allocator, value, kind);
+        },
+        else => unreachable, // Non-pattern modifiers are handled by applyModifier
+    }
+}
+
 /// Step backward to the previous codepoint boundary.
 /// Returns the byte position of the previous codepoint start.
 fn prevCodepointPos(bytes: []const u8, pos: usize) usize {
@@ -589,8 +883,17 @@ fn prevCodepointPos(bytes: []const u8, pos: usize) usize {
 
 /// Evaluate a parameter expansion and return the expanded parts.
 ///
-/// Handles both regular variables ($VAR, ${VAR}) and special parameters.
-/// The `quoted` parameter affects behavior of $@ and $*.
+/// Handles both regular variables ($VAR, ${VAR}) and special parameters ($@, $*, $?, $#, etc.).
+/// Modifiers (:-default, :+alt, :=assign, :?error, #pattern, %pattern) are applied to all
+/// parameter types per POSIX 2.6.2.
+///
+/// The `quoted` parameter affects behavior of $@ and $*:
+/// - Quoted "$@" produces separate words for each positional parameter
+/// - Quoted "$*" joins all parameters with IFS[0] (currently space)
+///
+/// Special cases:
+/// - ${#@} and ${#*} return the count of positional parameters (equivalent to $#)
+/// - Assignment modifiers (:=) error on special/positional parameters per POSIX
 ///
 /// Returns ExpansionError.ParameterUnsetOrNull if a ${parameter:?word}
 /// expansion fails. The error message is printed to stderr before returning.
@@ -600,193 +903,38 @@ fn evaluateParameterExpansion(
     param: parser.ParameterExpansion,
     quoted: bool,
 ) ExpansionError![]ExpandedPart {
-    // Check for special parameters first
-    if (try getSpecialParameter(allocator, shell, param.name, quoted)) |parts| {
-        // TODO: Apply modifiers to special parameters
-        if (param.modifier != null) {
-            // Silently ignored for now
-        }
-        return parts;
-    }
-
-    // Regular variable lookup
-    const raw_value = shell.getVariable(param.name);
-    const is_set = raw_value != null;
-    const value = raw_value orelse "";
-    const is_null_or_unset = !is_set or value.len == 0;
     const kind: ExpandedPart.Kind = if (quoted) .quoted else .normal;
 
-    // No modifier - just return the value
+    // Handle ${#@} and ${#*} specially - returns count of positional parameters.
+    //
+    // POSIX 2.6.2 (Parameter Expansion) states:
+    //   "${#parameter} - String Length. [...] If parameter is '*' or '@',
+    //    the result of the expansion is unspecified."
+    //
+    // We follow bash/zsh behavior (return count), while dash returns the
+    // length of the joined string. Example with `set -- abc def`:
+    //   - bash/zsh: ${#@} → 2 (count of parameters)
+    //   - dash:     ${#@} → 7 (length of "abc def")
+    if (param.modifier) |mod| {
+        if (mod.op == .Length) {
+            if (std.mem.eql(u8, param.name, "@") or std.mem.eql(u8, param.name, "*")) {
+                const count = shell.positional_params.items.len;
+                const count_str = try std.fmt.allocPrint(allocator, "{d}", .{count});
+                return makeSinglePart(allocator, count_str, kind);
+            }
+        }
+    }
+
+    // Get base value - works for both special and regular parameters
+    const base = try BaseValue.init(allocator, shell, param.name, quoted);
+
+    // No modifier - just return the base value
     if (param.modifier == null) {
-        return makeSinglePart(allocator, value, kind);
+        return base.parts;
     }
 
-    const mod = param.modifier.?;
-
-    switch (mod.op) {
-        .Length => {
-            // POSIX 2.6.2: "${#parameter} - String Length. The length in characters
-            // of the value of parameter shall be substituted."
-            //
-            // We count Unicode codepoints (not bytes) per POSIX "characters" definition.
-            // Invalid UTF-8 sequences fall back to byte count.
-            const char_count = std.unicode.utf8CountCodepoints(value) catch value.len;
-            const len_str = try std.fmt.allocPrint(allocator, "{d}", .{char_count});
-            // Length is always a number, kind doesn't affect field splitting
-            return makeSinglePart(allocator, len_str, kind);
-        },
-        .UseDefault => {
-            // ${parameter:-word} - If parameter is unset or null, use word
-            // ${parameter-word} - If parameter is unset (only), use word
-            const use_default = if (mod.check_null) is_null_or_unset else !is_set;
-            if (use_default) {
-                return try expandModifierWord(allocator, shell, mod.word);
-            }
-            return makeSinglePart(allocator, value, kind);
-        },
-        .UseAlternative => {
-            // ${parameter:+word} - If parameter is set and non-null, use word
-            // ${parameter+word} - If parameter is set (only), use word
-            const use_alt = if (mod.check_null) !is_null_or_unset else is_set;
-            if (use_alt) {
-                return try expandModifierWord(allocator, shell, mod.word);
-            }
-            return makeSinglePart(allocator, "", kind);
-        },
-        .AssignDefault => {
-            // ${parameter:=word} - If parameter is unset or null, assign word and substitute
-            // ${parameter=word} - If parameter is unset (only), assign word and substitute
-            const should_assign = if (mod.check_null) is_null_or_unset else !is_set;
-            if (should_assign) {
-                // POSIX 2.6.2: Cannot assign to special or positional parameters.
-                // "Attempting to assign a value in this way to a readonly variable or a
-                // positional parameter shall cause an expansion error."
-                if (isSpecialOrPositional(param.name)) {
-                    printError("{s}: cannot assign in this way\n", .{param.name});
-                    return ExpansionError.ParameterAssignmentInvalid;
-                }
-
-                // TODO(tommoa): Look into this later to see if we can optimise some of
-                // the `WordBuilder` usage here.
-                // Expand the modifier word and join with space (POSIX: like $* in assignment context)
-                const word_value = if (mod.word) |parts| blk: {
-                    var builder = WordBuilder.init(allocator);
-                    _ = try expandInnerParts(&builder, parts, shell);
-                    break :blk try builder.join(" ");
-                } else "";
-
-                try shell.setVariable(param.name, word_value);
-                return makeSinglePart(allocator, word_value, kind);
-            }
-            return makeSinglePart(allocator, value, kind);
-        },
-        .ErrorIfUnset => {
-            // ${parameter:?word} - If parameter is unset or null, print error and fail
-            // ${parameter?word} - If parameter is unset (only), print error and fail
-            // POSIX 2.6.2: "the expansion of word (or a message indicating it is unset
-            // if word is omitted) shall be written to standard error"
-            const should_error = if (mod.check_null) is_null_or_unset else !is_set;
-            if (should_error) {
-                // TODO(tommoa): Look into this later to see if we can optimise some of
-                // the `WordBuilder` usage here.
-                // Expand the error message and join with space
-                const msg = if (mod.word) |parts| blk: {
-                    var builder = WordBuilder.init(allocator);
-                    _ = try expandInnerParts(&builder, parts, shell);
-                    break :blk try builder.join(" ");
-                } else "";
-
-                // Use default message if word is empty
-                const display_msg = if (msg.len > 0) msg else "parameter null or not set";
-
-                // Print error to stderr
-                printError("{s}: {s}\n", .{ param.name, display_msg });
-
-                return ExpansionError.ParameterUnsetOrNull;
-            }
-            return makeSinglePart(allocator, value, kind);
-        },
-        .RemoveSmallestPrefix => {
-            // ${parameter#word} - Remove smallest matching prefix
-            // POSIX 2.6.2: "The word shall be expanded to produce a pattern.
-            // The parameter expansion shall then result in parameter, with the
-            // smallest portion of the prefix matched by the pattern deleted."
-            //
-            // We iterate lazily by codepoint boundaries to match POSIX "character"
-            // semantics and be consistent with ${#VAR} length counting.
-            //
-            // TODO: This is O(n²×m) worst case - see pattern.zig for optimization ideas.
-            const word_parts = mod.word orelse return makeSinglePart(allocator, value, kind);
-            const pat = try expandPatternWord(allocator, shell, word_parts);
-            // Find shortest prefix that matches (iterate forward from start)
-            var pos: usize = 0;
-            while (pos <= value.len) {
-                if (pattern.match(pat, value[0..pos])) {
-                    return makeSinglePart(allocator, value[pos..], kind);
-                }
-                if (pos >= value.len) break;
-                pos += pattern.codepointLen(value, pos);
-            }
-            // No match - return original
-            return makeSinglePart(allocator, value, kind);
-        },
-        .RemoveLargestPrefix => {
-            // ${parameter##word} - Remove largest matching prefix
-            // POSIX 2.6.2: "Same as #, but the largest portion matched is deleted."
-            // TODO: This is O(n²×m) worst case - see pattern.zig for optimization ideas.
-            const word_parts = mod.word orelse return makeSinglePart(allocator, value, kind);
-            const pat = try expandPatternWord(allocator, shell, word_parts);
-            // Find longest prefix that matches (iterate backward from end)
-            var pos: usize = value.len;
-            while (true) {
-                if (pattern.match(pat, value[0..pos])) {
-                    return makeSinglePart(allocator, value[pos..], kind);
-                }
-                if (pos == 0) break;
-                pos = prevCodepointPos(value, pos);
-            }
-            // No match - return original
-            return makeSinglePart(allocator, value, kind);
-        },
-        .RemoveSmallestSuffix => {
-            // ${parameter%word} - Remove smallest matching suffix
-            // POSIX 2.6.2: "The word shall be expanded to produce a pattern.
-            // The parameter expansion shall then result in parameter, with the
-            // smallest portion of the suffix matched by the pattern deleted."
-            // TODO: This is O(n²×m) worst case - see pattern.zig for optimization ideas.
-            const word_parts = mod.word orelse return makeSinglePart(allocator, value, kind);
-            const pat = try expandPatternWord(allocator, shell, word_parts);
-            // Find shortest suffix that matches (iterate backward from end)
-            var pos: usize = value.len;
-            while (true) {
-                if (pattern.match(pat, value[pos..])) {
-                    return makeSinglePart(allocator, value[0..pos], kind);
-                }
-                if (pos == 0) break;
-                pos = prevCodepointPos(value, pos);
-            }
-            // No match - return original
-            return makeSinglePart(allocator, value, kind);
-        },
-        .RemoveLargestSuffix => {
-            // ${parameter%%word} - Remove largest matching suffix
-            // POSIX 2.6.2: "Same as %, but the largest portion matched is deleted."
-            // TODO: This is O(n²×m) worst case - see pattern.zig for optimization ideas.
-            const word_parts = mod.word orelse return makeSinglePart(allocator, value, kind);
-            const pat = try expandPatternWord(allocator, shell, word_parts);
-            // Find longest suffix that matches (iterate forward from start)
-            var pos: usize = 0;
-            while (pos <= value.len) {
-                if (pattern.match(pat, value[pos..])) {
-                    return makeSinglePart(allocator, value[0..pos], kind);
-                }
-                if (pos >= value.len) break;
-                pos += pattern.codepointLen(value, pos);
-            }
-            // No match - return original
-            return makeSinglePart(allocator, value, kind);
-        },
-    }
+    // Apply the modifier using the unified modifier handling
+    return applyModifier(allocator, shell, &base, param.modifier.?, param.name, quoted);
 }
 
 // ============================================================================
@@ -1853,7 +2001,7 @@ test "modifier: ${VAR-default} with empty VAR returns empty (no colon)" {
     };
 
     const result = try expandWordJoined(arena.allocator(), word, &shell);
-    // The modifier is ignored, so empty is returned (no positional param set)
+    // Without colon, only unset triggers default. VAR is set (to empty), so empty is returned.
     try std.testing.expectEqualStrings("", result);
 }
 
@@ -2699,10 +2847,9 @@ test "isSpecialOrPositional: empty string returns false" {
 
 // --- Tests for AssignDefault with special/positional parameters ---
 
-test "modifier: ${1:=default} with single-digit positional returns current value (modifier ignored)" {
-    // Single-digit positional parameters are handled by getSpecialParameter,
-    // which returns early before the modifier is processed. The modifier is
-    // silently ignored and the current value is returned.
+test "modifier: ${1:=default} with set positional returns current value" {
+    // When $1 is already set, the :=default modifier doesn't trigger assignment
+    // (the parameter is neither unset nor null). The current value is returned.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -2722,13 +2869,14 @@ test "modifier: ${1:=default} with single-digit positional returns current value
     };
 
     const result = try expandWordJoined(arena.allocator(), word, &shell);
-    // The modifier is ignored, so the current value of $1 is returned
+    // $1 is set, so the current value is returned without attempting assignment
     try std.testing.expectEqualStrings("first_arg", result);
 }
 
-test "modifier: ${1:=default} with unset positional returns empty (modifier ignored)" {
-    // When $1 is not set, getSpecialParameter returns empty string.
-    // The modifier is silently ignored.
+test "modifier: ${1:=default} with unset positional returns error" {
+    // POSIX 2.6.2: Cannot assign to positional parameters.
+    // "Attempting to assign a value in this way to a readonly variable or a
+    // positional parameter shall cause an expansion error."
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -2747,15 +2895,14 @@ test "modifier: ${1:=default} with unset positional returns empty (modifier igno
         .column = 1,
     };
 
-    const result = try expandWordJoined(arena.allocator(), word, &shell);
-    // The modifier is ignored, so empty is returned (no positional param set)
-    try std.testing.expectEqualStrings("", result);
+    // Should error because you cannot assign to positional parameters
+    const result = expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectError(ExpansionError.ParameterAssignmentInvalid, result);
 }
 
-test "modifier: ${10:=default} with multi-digit positional returns current value (modifier ignored)" {
-    // Multi-digit positional parameters are also handled by getSpecialParameter,
-    // which returns early before the modifier is processed. The modifier is
-    // silently ignored and the current value is returned.
+test "modifier: ${10:=default} with set multi-digit positional returns current value" {
+    // When ${10} is already set, the :=default modifier doesn't trigger assignment
+    // (the parameter is neither unset nor null). The current value is returned.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -2776,13 +2923,14 @@ test "modifier: ${10:=default} with multi-digit positional returns current value
     };
 
     const result = try expandWordJoined(arena.allocator(), word, &shell);
-    // The modifier is ignored, so the current value of $10 is returned
+    // $10 is set, so the current value is returned without attempting assignment
     try std.testing.expectEqualStrings("tenth", result);
 }
 
-test "modifier: ${10:=default} with unset multi-digit positional returns empty (modifier ignored)" {
-    // When ${10} is not set, getSpecialParameter returns empty string.
-    // The modifier is silently ignored (same behavior as single-digit positionals).
+test "modifier: ${10:=default} with unset multi-digit positional returns error" {
+    // POSIX 2.6.2: Cannot assign to positional parameters.
+    // "Attempting to assign a value in this way to a readonly variable or a
+    // positional parameter shall cause an expansion error."
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -2802,9 +2950,9 @@ test "modifier: ${10:=default} with unset multi-digit positional returns empty (
         .column = 1,
     };
 
-    const result = try expandWordJoined(arena.allocator(), word, &shell);
-    // The modifier is ignored, so empty is returned (no positional param set)
-    try std.testing.expectEqualStrings("", result);
+    // Should error because you cannot assign to positional parameters
+    const result = expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectError(ExpansionError.ParameterAssignmentInvalid, result);
 }
 
 // --- Pattern Removal Modifier Tests (POSIX 2.6.2) ---
@@ -3347,4 +3495,501 @@ test "modifier: ${VAR#*} with UTF-8 handles mixed content" {
 
     const result = try expandWordJoined(arena.allocator(), word, &shell);
     try std.testing.expectEqualStrings("世界", result);
+}
+
+// --- Special Parameter Modifier Tests (POSIX 2.6.2 applied to 2.5.2) ---
+
+test "modifier: ${#@} returns positional parameter count" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b", "c" });
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "@",
+            .modifier = .{ .op = .Length, .check_null = false, .word = null },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("3", result);
+}
+
+test "modifier: ${#@} with no positional params returns 0" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // No positional params set
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "@",
+            .modifier = .{ .op = .Length, .check_null = false, .word = null },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("0", result);
+}
+
+test "modifier: ${#*} returns positional parameter count" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "one", "two", "three", "four", "five" });
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "*",
+            .modifier = .{ .op = .Length, .check_null = false, .word = null },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("5", result);
+}
+
+test "modifier: ${1:-default} with no positional params returns default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // No positional params set - $1 is empty
+
+    const default_word = [_]WordPart{.{ .literal = "default" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "1",
+            .modifier = .{ .op = .UseDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("default", result);
+}
+
+test "modifier: ${1:-default} with positional params returns first param" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{"value"});
+
+    const default_word = [_]WordPart{.{ .literal = "default" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "1",
+            .modifier = .{ .op = .UseDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("value", result);
+}
+
+test "modifier: ${@:+has args} with no positional params returns empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // No positional params set
+
+    const alt_word = [_]WordPart{.{ .literal = "has args" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "@",
+            .modifier = .{ .op = .UseAlternative, .check_null = true, .word = &alt_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "modifier: ${@:+has args} with positional params returns 'has args'" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b" });
+
+    const alt_word = [_]WordPart{.{ .literal = "has args" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "@",
+            .modifier = .{ .op = .UseAlternative, .check_null = true, .word = &alt_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("has args", result);
+}
+
+test "modifier: ${#?} returns length of exit status" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    shell.last_status = .{ .exited = 0 };
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "?",
+            .modifier = .{ .op = .Length, .check_null = false, .word = null },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    // Exit status 0 -> "0" -> length 1
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("1", result);
+}
+
+test "modifier: ${#?} returns length of three digit exit status" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    shell.last_status = .{ .exited = 127 };
+
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "?",
+            .modifier = .{ .op = .Length, .check_null = false, .word = null },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    // Exit status 127 -> "127" -> length 3
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("3", result);
+}
+
+test "modifier: ${@:-default} with no positional params returns default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // No positional params
+
+    const default_word = [_]WordPart{.{ .literal = "fallback" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "@",
+            .modifier = .{ .op = .UseDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("fallback", result);
+}
+
+test "modifier: ${@:-default} with positional params returns params" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "one", "two" });
+
+    const default_word = [_]WordPart{.{ .literal = "fallback" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "@",
+            .modifier = .{ .op = .UseDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("one two", result);
+}
+
+test "expandArgv: quoted ${@:-default} preserves separate words" {
+    // Verifies POSIX 2.5.2: "$@" produces separate fields even with modifiers.
+    // This is a regression test - previously modifiers on $@ incorrectly joined
+    // the positional parameters into a single word.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b", "c" });
+
+    const word1 = Word{
+        .parts = &[_]WordPart{.{ .literal = "echo" }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const default_word = [_]WordPart{.{ .literal = "fallback" }};
+    const inner_parts = [_]WordPart{
+        .{ .parameter = .{ .name = "@", .modifier = .{
+            .op = .UseDefault,
+            .check_null = true,
+            .word = &default_word,
+        } } },
+    };
+    const word2 = Word{
+        .parts = &[_]WordPart{.{ .double_quoted = &inner_parts }},
+        .position = 5,
+        .line = 1,
+        .column = 6,
+    };
+
+    const words = [_]Word{ word1, word2 };
+    const argv = try expandArgv(arena.allocator(), &words, &shell);
+
+    var argc: usize = 0;
+    while (argv[argc] != null) : (argc += 1) {}
+
+    // Should produce 4 words: echo, a, b, c (not: echo, "a b c")
+    try std.testing.expectEqual(@as(usize, 4), argc);
+    try std.testing.expectEqualStrings("echo", std.mem.span(argv[0].?));
+    try std.testing.expectEqualStrings("a", std.mem.span(argv[1].?));
+    try std.testing.expectEqualStrings("b", std.mem.span(argv[2].?));
+    try std.testing.expectEqualStrings("c", std.mem.span(argv[3].?));
+}
+
+test "modifier: ${@#pattern} removes prefix from joined args" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "one", "two", "three" });
+
+    // Pattern to remove "one " from "one two three"
+    const pattern_word = [_]WordPart{.{ .literal = "one " }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "@",
+            .modifier = .{ .op = .RemoveSmallestPrefix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("two three", result);
+}
+
+test "modifier: ${*%pattern} removes suffix from joined args" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "one", "two", "three" });
+
+    // Pattern to remove " three" from "one two three"
+    const pattern_word = [_]WordPart{.{ .literal = " three" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "*",
+            .modifier = .{ .op = .RemoveSmallestSuffix, .check_null = false, .word = &pattern_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("one two", result);
+}
+
+test "modifier: ${1:=default} errors on positional parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // No positional params - trying to assign to $1 should fail
+
+    const default_word = [_]WordPart{.{ .literal = "value" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "1",
+            .modifier = .{ .op = .AssignDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    // Should error because you cannot assign to positional parameters
+    const result = expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectError(ExpansionError.ParameterAssignmentInvalid, result);
+}
+
+test "modifier: ${?:-0} returns exit status (never uses default)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    shell.last_status = .{ .exited = 42 };
+
+    const default_word = [_]WordPart{.{ .literal = "0" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "?",
+            .modifier = .{ .op = .UseDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    // $? is never unset and always has a value, so it uses the actual value
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("42", result);
+}
+
+test "modifier: ${#:+alt} returns alternative when positional params exist" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b", "c" });
+
+    // $# is "3" which is non-empty, so :+ should use the alternative
+    const alt_word = [_]WordPart{.{ .literal = "has count" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "#",
+            .modifier = .{ .op = .UseAlternative, .check_null = true, .word = &alt_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("has count", result);
+}
+
+test "modifier: ${@:-default} with empty first param returns params (not default)" {
+    // When positional params include an empty string, the overall value is
+    // not empty because other params have content.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "", "b", "c" });
+
+    const default_word = [_]WordPart{.{ .literal = "default" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "@",
+            .modifier = .{ .op = .UseDefault, .check_null = true, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    // First param is empty but others have content, so not "empty" overall
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings(" b c", result);
+}
+
+test "modifier: ${@-default} with no params returns empty (dash/zsh behavior)" {
+    // Shell divergence: bash treats $@ with zero params as "unset", returning "default".
+    // dash/zsh treat it as "set but empty", returning empty. We follow dash/zsh.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // No positional params
+
+    const default_word = [_]WordPart{.{ .literal = "default" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "@",
+            .modifier = .{ .op = .UseDefault, .check_null = false, .word = &default_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    // Without colon, only checks if "set" - $@ is always set, returns empty
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "modifier: ${@+alt} with no params returns alt (dash/zsh behavior)" {
+    // Shell divergence: bash treats $@ with zero params as "unset", returning empty.
+    // dash/zsh treat it as "set but empty", returning "alt". We follow dash/zsh.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    // No positional params
+
+    const alt_word = [_]WordPart{.{ .literal = "alt" }};
+    const word = Word{
+        .parts = &[_]WordPart{.{ .parameter = .{
+            .name = "@",
+            .modifier = .{ .op = .UseAlternative, .check_null = false, .word = &alt_word },
+        } }},
+        .position = 0,
+        .line = 1,
+        .column = 1,
+    };
+
+    // Without colon, only checks if "set" - $@ is always set, returns alternative
+    const result = try expandWordJoined(arena.allocator(), word, &shell);
+    try std.testing.expectEqualStrings("alt", result);
 }
