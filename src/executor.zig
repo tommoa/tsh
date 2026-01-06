@@ -522,8 +522,10 @@ pub const Executor = struct {
         const and_or = cmd.and_or;
 
         // For now, only single-pipeline commands are supported.
-        // The parser errors on && and || tokens, so items.len > 1 shouldn't happen yet.
-        std.debug.assert(and_or.items.len == 1);
+        // AND/OR list execution (short-circuit evaluation) is not yet implemented.
+        if (and_or.items.len != 1) {
+            return ExecuteError.NotImplemented;
+        }
 
         const pipeline = and_or.items[0].pipeline;
 

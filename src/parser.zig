@@ -490,8 +490,9 @@ const ParserContext = union(enum) {
             /// Finished making the pipeline.
             done,
         },
-        /// Whether this pipeline should have its exit status negated.
-        negated: bool,
+        /// Negation state: null = no `!` seen, false = even count, true = odd count.
+        /// Used during parsing to track whether content exists; converted to bool for AST.
+        negated: ?bool,
         /// The commands that have been parsed as part of this pipeline.
         commands: std.ArrayListUnmanaged(Command),
         /// Track the command count before parsing after a pipe.
@@ -543,14 +544,36 @@ const ParserContext = union(enum) {
             };
         }
     },
+    /// Parsing an AND/OR list (POSIX 2.9.3)
+    /// Handles: pipeline (('&&' | '||') linebreak pipeline)*
+    and_or_list: struct {
+        state: enum {
+            /// Initial state - need to parse first pipeline.
+            start,
+            /// Collecting pipelines - check for && or || operators.
+            collecting_pipelines,
+            /// Finished parsing the AND/OR list.
+            done,
+        },
+        /// Accumulated items (pipeline + trailing operator)
+        items: std.ArrayListUnmanaged(AndOrItem),
+    },
 
     /// Initialize a pipeline context.
     fn initPipeline() ParserContext {
         return .{ .pipeline = .{
             .state = .start,
-            .negated = false,
+            .negated = null,
             .commands = .empty,
             .command_count_before_pipe = null,
+        } };
+    }
+
+    /// Initialize an and_or_list context.
+    fn initAndOrList() ParserContext {
+        return .{ .and_or_list = .{
+            .state = .start,
+            .items = .empty,
         } };
     }
 
@@ -577,6 +600,9 @@ const ParserContext = union(enum) {
                 sc.assignments.deinit(allocator);
                 sc.argv.deinit(allocator);
                 sc.redirections.deinit(allocator);
+            },
+            .and_or_list => |*aol| {
+                aol.items.deinit(allocator);
             },
         }
     }
@@ -1024,6 +1050,98 @@ pub const Parser = struct {
     /// Returns an error if the input is malformed.
     pub fn parseCommand(self: *Parser) ParseError!?ParsedCommand {
         state: switch (self.reset()) {
+            .and_or_list => |and_or_val| {
+                var and_or = and_or_val;
+                and_or: switch (and_or.state) {
+                    .start => {
+                        // Need to parse first pipeline
+                        and_or.state = .collecting_pipelines;
+                        self.pushContext(.{ .and_or_list = and_or });
+                        continue :state ParserContext.initPipeline();
+                    },
+                    .collecting_pipelines => {
+                        // Check if last item has trailing_op set - means we consumed
+                        // an operator but nothing was added after it.
+                        if (and_or.items.items.len > 0) {
+                            const last = and_or.items.items[and_or.items.items.len - 1];
+                            if (last.trailing_op != null) {
+                                // Consumed operator but no pipeline added after - error
+                                const tok = self.peekToken() catch |err| {
+                                    self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
+                                    return err;
+                                } orelse {
+                                    self.setError("syntax error: unexpected end of file", self.lex.position, self.lex.line, self.lex.column);
+                                    return ParseError.UnexpectedEndOfInput;
+                                };
+                                self.setError("syntax error near unexpected token", tok.position, tok.line, tok.column);
+                                return ParseError.UnsupportedSyntax;
+                            }
+                        }
+
+                        // A pipeline just completed. Check for && or ||
+                        const tok = self.peekToken() catch |err| {
+                            self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
+                            return err;
+                        } orelse {
+                            // EOF - finish the and_or list
+                            continue :and_or .done;
+                        };
+
+                        switch (tok.type) {
+                            .DoubleAmpersand, .DoublePipe => {
+                                // Validate: pipeline before operator must have commands.
+                                // An empty pipeline (even with `!`) cannot precede an operator.
+                                if (and_or.items.items.len == 0) {
+                                    self.setError("syntax error near unexpected token", tok.position, tok.line, tok.column);
+                                    return ParseError.UnsupportedSyntax;
+                                }
+                                const last_pipeline = and_or.items.items[and_or.items.items.len - 1].pipeline;
+                                if (last_pipeline.commands.len == 0) {
+                                    self.setError("syntax error near unexpected token", tok.position, tok.line, tok.column);
+                                    return ParseError.UnsupportedSyntax;
+                                }
+
+                                _ = try self.consumeToken();
+                                // Set trailing_op on the last item
+                                and_or.items.items[and_or.items.items.len - 1].trailing_op = if (tok.type == .DoubleAmpersand) .And else .Or;
+                                // Skip newlines after operator (line continuation per POSIX 2.10.2)
+                                while (true) {
+                                    const nl_tok = self.peekToken() catch |err| {
+                                        self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
+                                        return err;
+                                    } orelse break;
+                                    if (nl_tok.type != .Newline) break;
+                                    _ = try self.consumeToken();
+                                }
+                                self.pushContext(.{ .and_or_list = and_or });
+                                continue :state ParserContext.initPipeline();
+                            },
+                            .Semicolon, .Newline, .Ampersand => {
+                                // End of and_or list
+                                continue :and_or .done;
+                            },
+                            else => {
+                                // Unexpected token - finish the list
+                                continue :and_or .done;
+                            },
+                        }
+                    },
+                    .done => {
+                        // Finished parsing the AND/OR list.
+                        // If no items, return null (empty input)
+                        if (and_or.items.items.len == 0) {
+                            and_or.items.deinit(self.allocator);
+                            return null;
+                        }
+
+                        return ParsedCommand{
+                            .and_or = AndOrList{
+                                .items = try and_or.items.toOwnedSlice(self.allocator),
+                            },
+                        };
+                    },
+                }
+            },
             .pipeline => |pipeline_val| {
                 var pipeline = pipeline_val;
                 pipeline: switch (pipeline.state) {
@@ -1047,7 +1165,7 @@ pub const Parser = struct {
                                     _ = try self.consumeToken();
                                     if (tok.complete) {
                                         // `!` as standalone first word - pipeline negation
-                                        pipeline.negated = !pipeline.negated;
+                                        pipeline.negated = !(pipeline.negated orelse false);
                                         continue :pipeline .start;
                                     } else {
                                         // Incomplete `!` - need to peek next token to decide
@@ -1079,7 +1197,7 @@ pub const Parser = struct {
                             return err;
                         } orelse {
                             // EOF - `!` was negation of empty pipeline
-                            pipeline.negated = !pipeline.negated;
+                            pipeline.negated = !(pipeline.negated orelse false);
                             pipeline.state = .done;
                             continue :pipeline .done;
                         };
@@ -1090,7 +1208,7 @@ pub const Parser = struct {
                                 if (cont.len == 0) {
                                     // Empty continuation - word boundary confirmed
                                     // `!` was negation
-                                    pipeline.negated = !pipeline.negated;
+                                    pipeline.negated = !(pipeline.negated orelse false);
                                     continue :pipeline .start;
                                 } else {
                                     // Non-empty continuation - `!` is part of longer word like `!foo`
@@ -1181,6 +1299,17 @@ pub const Parser = struct {
 
                         switch (tok.type) {
                             .Pipe => {
+                                // Check for pipe at start (no commands yet)
+                                if (pipeline.commands.items.len == 0) {
+                                    self.setError(
+                                        "syntax error near unexpected token `|'",
+                                        tok.position,
+                                        tok.line,
+                                        tok.column,
+                                    );
+                                    return ParseError.UnsupportedSyntax;
+                                }
+
                                 // We got a pipeline token. This means that we
                                 // continue to build the pipeline by looking at
                                 // the next command.
@@ -1215,36 +1344,36 @@ pub const Parser = struct {
                         }
                     },
                     .done => {
-                        // We've finished making a pipeline. If no commands were
-                        // parsed and pipeline is not negated (empty input), return null.
-                        if (pipeline.commands.items.len == 0 and !pipeline.negated) {
-                            return null;
-                        }
-                        const new_pipeline = Pipeline{
-                            .negated = pipeline.negated,
-                            .commands = try pipeline.commands.toOwnedSlice(self.allocator),
-                        };
+                        // We've finished making a pipeline.
+                        // Only add to and_or_list if there's content:
+                        // - commands.len > 0: has actual commands
+                        // - negated != null: saw at least one `!` token
+                        const has_content = pipeline.commands.items.len > 0 or pipeline.negated != null;
 
-                        // Wrap in AndOrList and ParsedCommand
-                        // For now, we create a single-item list with no trailing operator
-                        const items = try self.allocator.alloc(AndOrItem, 1);
-                        items[0] = .{
-                            .pipeline = new_pipeline,
-                            .trailing_op = null, // No AND/OR support yet
-                        };
-                        const parsed = ParsedCommand{
-                            .and_or = AndOrList{
-                                .items = items,
-                            },
-                        };
-
-                        const next_context = self.popContext() orelse {
-                            // Stack empty - we're at root level. Return the
-                            // command that we've built.
-                            return parsed;
+                        // Pop back to the and_or_list context
+                        var next_context = self.popContext() orelse {
+                            // Stack empty at root - this shouldn't happen with and_or_list
+                            unreachable;
                         };
 
                         switch (next_context) {
+                            .and_or_list => |*and_or_ctx| {
+                                if (has_content) {
+                                    const new_pipeline = Pipeline{
+                                        .negated = pipeline.negated orelse false,
+                                        .commands = try pipeline.commands.toOwnedSlice(self.allocator),
+                                    };
+                                    try and_or_ctx.items.append(self.allocator, .{
+                                        .pipeline = new_pipeline,
+                                        .trailing_op = null,
+                                    });
+                                } else {
+                                    // No content - just free the commands list
+                                    pipeline.commands.deinit(self.allocator);
+                                }
+                                // Continue processing and_or_list
+                                continue :state next_context;
+                            },
                             .simple_command, .pipeline => {
                                 // You can't put a pipeline inside a simple
                                 // command or inside itself, it must be nested
@@ -1533,8 +1662,9 @@ pub const Parser = struct {
                         };
 
                         switch (next_context) {
-                            .simple_command => {
-                                // You can't stack simple commands.
+                            .simple_command, .and_or_list => {
+                                // You can't stack simple commands, and simple_command
+                                // should not pop to and_or_list directly.
                                 unreachable;
                             },
                             .pipeline => |*pipeline| {
@@ -1581,7 +1711,7 @@ pub const Parser = struct {
 
     /// Reset parser state for a new command.
     ///
-    /// Returns the initial pipeline context to start parsing with.
+    /// Returns the initial and_or_list context to start parsing with.
     /// The stack is cleared; contexts are only pushed when nesting.
     fn reset(self: *Parser) ParserContext {
         self.error_info = null;
@@ -1590,7 +1720,7 @@ pub const Parser = struct {
             var mutable_ctx = ctx.*;
             mutable_ctx.deinit(self.allocator);
         }
-        return ParserContext.initPipeline();
+        return ParserContext.initAndOrList();
     }
 
     /// Try to build an assignment from a word.
@@ -3729,7 +3859,7 @@ test "parseCommand: bang with newline is negated empty pipeline" {
     try std.testing.expectEqual(@as(usize, 0), pipeline.commands.len);
 }
 
-test "parseCommand: double bang is double negation (returns null)" {
+test "parseCommand: double bang is double negation (valid command)" {
     var reader = std.io.Reader.fixed("! !");
     var lex = lexer.Lexer.init(&reader);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3737,8 +3867,12 @@ test "parseCommand: double bang is double negation (returns null)" {
     var parser_inst = Parser.init(arena.allocator(), &lex);
 
     const result = try parser_inst.parseCommand();
-    // Double negation cancels out, empty pipeline with negated=false returns null
-    try std.testing.expectEqual(null, result);
+    // Double negation cancels out - still a valid command (empty pipeline, negated=false)
+    // This is valid because `!` tokens were seen, so it's not "truly empty"
+    try std.testing.expect(result != null);
+    const pipeline = getPipeline(result.?);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.commands.len);
+    try std.testing.expect(!pipeline.negated); // Double negation = false
 }
 
 test "parseCommand: bang followed by quote is command name" {
@@ -3793,28 +3927,226 @@ test "parseCommand: bang followed by expansion is command name" {
     try std.testing.expect(simple.argv[0].parts[1] == .parameter);
 }
 
-test "parseCommand: && produces error (not yet implemented)" {
+test "parseCommand: simple && produces AndOrList with And" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var reader = std.io.Reader.fixed("foo && bar");
+    var reader = std.io.Reader.fixed("foo && bar\n");
     var lex = lexer.Lexer.init(&reader);
-    var parser = Parser.init(arena.allocator(), &lex);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
 
-    const result = parser.parseCommand();
-    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
-    try std.testing.expectEqualStrings("AND lists (&&) are not yet implemented", parser.error_info.?.message);
+    const result = (try parser_inst.parseCommand()).?;
+    try std.testing.expectEqual(@as(usize, 2), result.and_or.items.len);
+    try std.testing.expectEqual(AndOrOp.And, result.and_or.items[0].trailing_op.?);
+    try std.testing.expectEqual(@as(?AndOrOp, null), result.and_or.items[1].trailing_op);
 }
 
-test "parseCommand: & produces error (not yet implemented)" {
+test "parseCommand: simple || produces AndOrList with Or" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("foo || bar\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = (try parser_inst.parseCommand()).?;
+    try std.testing.expectEqual(@as(usize, 2), result.and_or.items.len);
+    try std.testing.expectEqual(AndOrOp.Or, result.and_or.items[0].trailing_op.?);
+    try std.testing.expectEqual(@as(?AndOrOp, null), result.and_or.items[1].trailing_op);
+}
+
+test "parseCommand: chained && operators" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("a && b && c\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = (try parser_inst.parseCommand()).?;
+    try std.testing.expectEqual(@as(usize, 3), result.and_or.items.len);
+    try std.testing.expectEqual(AndOrOp.And, result.and_or.items[0].trailing_op.?);
+    try std.testing.expectEqual(AndOrOp.And, result.and_or.items[1].trailing_op.?);
+    try std.testing.expectEqual(@as(?AndOrOp, null), result.and_or.items[2].trailing_op);
+}
+
+test "parseCommand: mixed && and ||" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("a && b || c && d\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = (try parser_inst.parseCommand()).?;
+    try std.testing.expectEqual(@as(usize, 4), result.and_or.items.len);
+    try std.testing.expectEqual(AndOrOp.And, result.and_or.items[0].trailing_op.?);
+    try std.testing.expectEqual(AndOrOp.Or, result.and_or.items[1].trailing_op.?);
+    try std.testing.expectEqual(AndOrOp.And, result.and_or.items[2].trailing_op.?);
+    try std.testing.expectEqual(@as(?AndOrOp, null), result.and_or.items[3].trailing_op);
+}
+
+test "parseCommand: pipeline then &&" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("a | b && c\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = (try parser_inst.parseCommand()).?;
+    try std.testing.expectEqual(@as(usize, 2), result.and_or.items.len);
+    // First pipeline has 2 commands
+    try std.testing.expectEqual(@as(usize, 2), result.and_or.items[0].pipeline.commands.len);
+    try std.testing.expectEqual(AndOrOp.And, result.and_or.items[0].trailing_op.?);
+    // Second pipeline has 1 command
+    try std.testing.expectEqual(@as(usize, 1), result.and_or.items[1].pipeline.commands.len);
+}
+
+test "parseCommand: && at start is syntax error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("&& foo\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    try std.testing.expectError(ParseError.UnsupportedSyntax, parser_inst.parseCommand());
+}
+
+test "parseCommand: || at start is syntax error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("|| foo\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    try std.testing.expectError(ParseError.UnsupportedSyntax, parser_inst.parseCommand());
+}
+
+test "parseCommand: && at end (EOF) is syntax error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("foo &&");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    try std.testing.expectError(ParseError.UnexpectedEndOfInput, parser_inst.parseCommand());
+}
+
+test "parseCommand: && followed by ; is syntax error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("foo && ;\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    try std.testing.expectError(ParseError.UnsupportedSyntax, parser_inst.parseCommand());
+}
+
+test "parseCommand: && followed by && is syntax error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("foo && && bar\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    try std.testing.expectError(ParseError.UnsupportedSyntax, parser_inst.parseCommand());
+}
+
+test "parseCommand: newline continuation after &&" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("foo &&\nbar\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = (try parser_inst.parseCommand()).?;
+    try std.testing.expectEqual(@as(usize, 2), result.and_or.items.len);
+}
+
+test "parseCommand: ! || cmd is syntax error (empty pipeline before operator)" {
+    // `!` alone is valid as a complete command, but an empty pipeline
+    // (no commands) cannot precede an operator.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("! || echo yes\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    try std.testing.expectError(ParseError.UnsupportedSyntax, parser_inst.parseCommand());
+}
+
+test "parseCommand: cmd && ! is valid (negated empty pipeline at end)" {
+    // `!` alone is valid, so `cmd && !` should be valid too.
+    // The `!` at the end doesn't precede an operator, so it's allowed.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("true && !\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = (try parser_inst.parseCommand()).?;
+    try std.testing.expectEqual(@as(usize, 2), result.and_or.items.len);
+    // Second pipeline: ! (negated, empty)
+    try std.testing.expect(result.and_or.items[1].pipeline.negated);
+    try std.testing.expectEqual(@as(usize, 0), result.and_or.items[1].pipeline.commands.len);
+}
+
+test "parseCommand: cmd && ! ! is valid (double negation at end)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("true && ! !\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = (try parser_inst.parseCommand()).?;
+    try std.testing.expectEqual(@as(usize, 2), result.and_or.items.len);
+    // Second pipeline: ! ! (double negation = not negated, empty)
+    try std.testing.expect(!result.and_or.items[1].pipeline.negated);
+    try std.testing.expectEqual(@as(usize, 0), result.and_or.items[1].pipeline.commands.len);
+}
+
+test "parseCommand: & terminates and_or list (background not yet executed)" {
+    // Background execution (&) is not yet implemented in executor,
+    // but parser should accept it as a list terminator.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
     var reader = std.io.Reader.fixed("foo &");
     var lex = lexer.Lexer.init(&reader);
-    var parser = Parser.init(arena.allocator(), &lex);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
 
-    const result = parser.parseCommand();
-    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
-    try std.testing.expectEqualStrings("background execution (&) is not yet implemented", parser.error_info.?.message);
+    // Should parse successfully - & terminates the and_or list
+    const result = (try parser_inst.parseCommand()).?;
+    try std.testing.expectEqual(@as(usize, 1), result.and_or.items.len);
+}
+
+test "parseCommand: semicolon terminates and_or list" {
+    // "a && b; c" should parse as two separate commands
+    // First parseCommand: a && b
+    // Second parseCommand: c
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("a && b; c\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    // First command: a && b
+    const result1 = (try parser_inst.parseCommand()).?;
+    try std.testing.expectEqual(@as(usize, 2), result1.and_or.items.len);
+    try std.testing.expectEqual(AndOrOp.And, result1.and_or.items[0].trailing_op.?);
+
+    // Second command: c
+    const result2 = (try parser_inst.parseCommand()).?;
+    try std.testing.expectEqual(@as(usize, 1), result2.and_or.items.len);
 }
