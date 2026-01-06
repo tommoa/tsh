@@ -1272,91 +1272,8 @@ pub const Parser = struct {
                         };
 
                         switch (tok.type) {
-                            .Newline, .Semicolon, .DoubleSemicolon => {
-                                // If we get these, we're at the end of our simple
-                                // command. We should yield back up to the context
-                                // above.
-                                // TODO do NOT consume the separator here when we
-                                // have other states.
-                                _ = try self.consumeToken();
-                                continue :simple_command .done;
-                            },
-                            .Redirection => |redir| {
-                                simple_command.setPendingRedir(redir, tok);
-                                _ = try self.consumeToken();
-                                continue :simple_command .need_redir_target;
-                            },
-                            .LeftParen => {
-                                // TODO: Implement subshells.
-                                //
-                                // These are specified in the following subsections:
-                                //  - 2.6.3 (Command substituation).
-                                //  - 2.9.4 (Compound commands).
-                                self.setError(
-                                    "subshells are not yet implemented",
-                                    tok.position,
-                                    tok.line,
-                                    tok.column,
-                                );
-                                return ParseError.UnsupportedSyntax;
-                            },
-                            .RightParen => {
-                                self.setError(
-                                    "syntax error near unexpected token `)'",
-                                    tok.position,
-                                    tok.line,
-                                    tok.column,
-                                );
-                                return ParseError.UnsupportedSyntax;
-                            },
-                            .Pipe => {
-                                // If we have content, this pipe belongs to the parent pipeline context.
-                                // Transition to .done to let the pipeline handle it.
-                                if (simple_command.assignments.items.len > 0 or
-                                    simple_command.argv.items.len > 0 or
-                                    simple_command.redirections.items.len > 0)
-                                {
-                                    continue :simple_command .done;
-                                }
-                                // Empty command before pipe - syntax error
-                                self.setError(
-                                    "syntax error near unexpected token `|'",
-                                    tok.position,
-                                    tok.line,
-                                    tok.column,
-                                );
-                                return ParseError.UnsupportedSyntax;
-                            },
-                            .DoublePipe => {
-                                // TODO: Implement and_or lists, as specified in
-                                // POSIX subsection 2.9.3 (Lists).
-                                self.setError(
-                                    "syntax error near unexpected token `||'",
-                                    tok.position,
-                                    tok.line,
-                                    tok.column,
-                                );
-                                return ParseError.UnsupportedSyntax;
-                            },
-                            .Ampersand => {
-                                self.setError(
-                                    "background execution (&) is not yet implemented",
-                                    tok.position,
-                                    tok.line,
-                                    tok.column,
-                                );
-                                return ParseError.UnsupportedSyntax;
-                            },
-                            .DoubleAmpersand => {
-                                self.setError(
-                                    "AND lists (&&) are not yet implemented",
-                                    tok.position,
-                                    tok.line,
-                                    tok.column,
-                                );
-                                return ParseError.UnsupportedSyntax;
-                            },
-                            else => {
+                            // Tokens that can start or continue a word
+                            .Literal, .EscapedLiteral, .SingleQuoted, .DoubleQuoteBegin, .SimpleExpansion, .BraceExpansionBegin, .Continuation => {
                                 // Start the first word of the simple_command.
                                 _ = try self.consumeToken();
                                 simple_command.word_collector.startWord(tok);
@@ -1374,6 +1291,43 @@ pub const Parser = struct {
                                 } else {
                                     continue :simple_command .collecting_word;
                                 }
+                            },
+                            .Redirection => |redir| {
+                                simple_command.setPendingRedir(redir, tok);
+                                _ = try self.consumeToken();
+                                continue :simple_command .need_redir_target;
+                            },
+                            // Tokens that explicitly terminate (and consume)
+                            .Newline, .Semicolon, .DoubleSemicolon => {
+                                // End of simple command - consume separator and yield.
+                                // TODO: Do NOT consume the separator here when we
+                                // have other states (e.g., command lists with `;`).
+                                _ = try self.consumeToken();
+                                continue :simple_command .done;
+                            },
+                            // Tokens not yet implemented - explicit errors
+                            .LeftParen => {
+                                // TODO: Implement subshells (POSIX 2.6.3, 2.9.4).
+                                self.setError(
+                                    "subshells are not yet implemented",
+                                    tok.position,
+                                    tok.line,
+                                    tok.column,
+                                );
+                                return ParseError.UnsupportedSyntax;
+                            },
+                            .RightParen => {
+                                self.setError(
+                                    "syntax error near unexpected token `)'",
+                                    tok.position,
+                                    tok.line,
+                                    tok.column,
+                                );
+                                return ParseError.UnsupportedSyntax;
+                            },
+                            // Unknown/unhandled tokens - yield to parent without consuming
+                            else => {
+                                continue :simple_command .done;
                             },
                         }
                     },
