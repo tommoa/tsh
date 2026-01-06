@@ -512,6 +512,20 @@ pub const Executor = struct {
     /// Returns the exit status of the command, or error.ExitRequested
     /// if the exit builtin was invoked.
     ///
+    /// For AND/OR lists (POSIX Section 2.9.3):
+    /// - `&&` executes the next pipeline only if the previous succeeded (exit 0)
+    /// - `||` executes the next pipeline only if the previous failed (exit non-zero)
+    /// - Evaluation is left-to-right with short-circuit semantics
+    /// - Exit status is the last pipeline that was actually executed
+    ///
+    /// Example: `false && echo a || echo b && echo c`
+    /// items: [(false, And), (a, Or), (b, And), (c, null)]
+    /// - Execute false -> status=1, trailing_op=And, failed so set execute_next=false
+    /// - Item (a, Or): execute_next=false, skip. trailing_op=Or, status=1 (failed), so set execute_next=true
+    /// - Item (b, And): execute_next=true, execute b -> status=0. trailing_op=And, succeeded, so execute_next=true
+    /// - Item (c, null): execute_next=true, execute c -> status=0
+    /// - Final exit status: 0
+    ///
     /// Example usage with parser iterator:
     /// ```
     /// while (try parser.next()) |cmd| {
@@ -520,58 +534,60 @@ pub const Executor = struct {
     /// ```
     pub fn executeCommand(self: *Executor, cmd: ParsedCommand) ExecuteError!ExitStatus {
         const and_or = cmd.and_or;
+        var status: ExitStatus = .{ .exited = 0 };
+        var execute_next = true;
 
-        // For now, only single-pipeline commands are supported.
-        // AND/OR list execution (short-circuit evaluation) is not yet implemented.
-        if (and_or.items.len != 1) {
-            return ExecuteError.NotImplemented;
-        }
-
-        const pipeline = and_or.items[0].pipeline;
-
-        if (pipeline.commands.len == 0) {
-            // Empty pipeline - return success or failure based on negation
-            const status = ExitStatus{ .exited = 0 };
-            if (pipeline.negated) {
-                self.shell_state.last_status = .{ .exited = 1 };
-                return self.shell_state.last_status;
+        for (and_or.items) |item| {
+            if (execute_next) {
+                status = try self.executePipelineWithNegation(item.pipeline);
             }
-            self.shell_state.last_status = status;
-            return status;
+
+            // Decide whether to execute the next item based on trailing_op and current status.
+            // When we skip a pipeline, we still check its trailing_op against the unchanged
+            // status to decide about the pipeline after that.
+            if (item.trailing_op) |op| {
+                const succeeded = (status.toExitCode() == 0);
+                execute_next = switch (op) {
+                    .And => succeeded, // && : execute next only if this succeeded
+                    .Or => !succeeded, // || : execute next only if this failed
+                };
+            }
         }
 
-        if (pipeline.commands.len == 1) {
+        self.shell_state.last_status = status;
+        return status;
+    }
+
+    /// Execute a pipeline and return its exit status, handling negation.
+    ///
+    /// This handles empty pipelines, single commands, multi-command pipelines,
+    /// and pipeline negation (! prefix) per POSIX Section 2.9.2.
+    fn executePipelineWithNegation(self: *Executor, pipeline: parser.Pipeline) ExecuteError!ExitStatus {
+        // Execute the pipeline and get the exit status
+        const status: ExitStatus = if (pipeline.commands.len == 0)
+            // Empty pipeline - return success
+            .{ .exited = 0 }
+        else if (pipeline.commands.len == 1) blk: {
             // Single-command "pipeline" - execute in current environment.
             // This ensures builtins like cd, export, exit work correctly.
             const simple = switch (pipeline.commands[0]) {
                 .simple => |s| s,
             };
-            const status = try self.execute(simple);
-            // Section 2.9.2: "If the pipeline begins with the reserved word
-            // !, the exit status shall be the logical NOT of the exit status
-            // of the last command."
-            if (pipeline.negated) {
-                const negated = switch (status) {
-                    .exited => |code| ExitStatus{ .exited = if (code == 0) 1 else 0 },
-                    .signaled => ExitStatus{ .exited = 0 }, // Non-zero exit negated to 0
-                };
-                self.shell_state.last_status = negated;
-                return negated;
-            }
-            return status;
+            break :blk try self.execute(simple);
+        } else
+            // Multi-command pipeline - all stages run in subshells
+            try self.executePipeline(pipeline);
+
+        // Handle negation (! prefix per POSIX Section 2.9.2):
+        // "If the pipeline begins with the reserved word !, the exit status
+        // shall be the logical NOT of the exit status of the last command."
+        if (pipeline.negated) {
+            return switch (status) {
+                .exited => |code| ExitStatus{ .exited = if (code == 0) 1 else 0 },
+                .signaled => ExitStatus{ .exited = 0 }, // Non-zero exit negated to 0
+            };
         }
 
-        // Multi-command pipeline - all stages run in subshells
-        const status = try self.executePipeline(pipeline);
-        // Handle negation (! prefix)
-        if (pipeline.negated) {
-            const negated = switch (status) {
-                .exited => |code| ExitStatus{ .exited = if (code == 0) 1 else 0 },
-                .signaled => ExitStatus{ .exited = 0 },
-            };
-            self.shell_state.last_status = negated;
-            return negated;
-        }
         return status;
     }
 
@@ -869,6 +885,46 @@ fn parseCommand(allocator: Allocator, input: []const u8) !?ParsedCommand {
     var lex = lexer.Lexer.init(&reader);
     var p = parser.Parser.init(allocator, &lex);
     return p.parseCommand();
+}
+
+/// Run a command and check its exit status.
+fn runCommand(
+    arena: *std.heap.ArenaAllocator,
+    shell_state: *ShellState,
+    command: []const u8,
+) !ExitStatus {
+    const cmd = try parseCommand(arena.allocator(), command) orelse return error.NoCommand;
+    var exec = Executor.init(arena.allocator(), shell_state);
+    return exec.executeCommand(cmd);
+}
+
+/// Run a command and expect a specific exit code.
+fn expectStatus(
+    arena: *std.heap.ArenaAllocator,
+    shell_state: *ShellState,
+    command: []const u8,
+    expected_code: u8,
+) !void {
+    const status = try runCommand(arena, shell_state, command);
+    try std.testing.expectEqual(ExitStatus{ .exited = expected_code }, status);
+}
+
+/// Expect that a file exists and contains the expected content.
+fn expectFileContent(path: []const u8, expected: []const u8) !void {
+    const contents = try std.fs.cwd().readFileAlloc(std.testing.allocator, path, 4096);
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings(expected, contents);
+}
+
+/// Expect that a file does not exist.
+fn expectFileNotFound(path: []const u8) !void {
+    const result = std.fs.cwd().readFileAlloc(std.testing.allocator, path, 1024);
+    try std.testing.expectError(error.FileNotFound, result);
+}
+
+/// Delete a temp file, ignoring errors if it doesn't exist.
+fn cleanupTempFile(path: []const u8) void {
+    std.fs.deleteFileAbsolute(path) catch {};
 }
 
 test "execute: simple echo" {
@@ -1522,4 +1578,294 @@ test "executor: assignment-only command in pipeline" {
 
     // X should still not be set in parent (assignment was in subshell)
     try std.testing.expect(shell_state.getVariable("X") == null);
+}
+
+// --- AND/OR list tests ---
+
+test "executor: && runs second on success" {
+    // true && echo yes -> should print "yes" and exit 0
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_and_success";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "true && echo yes > " ++ tmp_path ++ "\n", 0);
+    try expectFileContent(tmp_path, "yes\n");
+}
+
+test "executor: && skips second on failure" {
+    // false && echo yes -> should NOT print "yes" and exit 1
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_and_failure";
+    cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "false && echo yes > " ++ tmp_path ++ "\n", 1);
+    try expectFileNotFound(tmp_path);
+}
+
+test "executor: || skips second on success" {
+    // true || echo no -> should NOT print "no" and exit 0
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_or_success";
+    cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "true || echo no > " ++ tmp_path ++ "\n", 0);
+    try expectFileNotFound(tmp_path);
+}
+
+test "executor: || runs second on failure" {
+    // false || echo yes -> should print "yes" and exit 0
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_or_failure";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "false || echo yes > " ++ tmp_path ++ "\n", 0);
+    try expectFileContent(tmp_path, "yes\n");
+}
+
+test "executor: && chain all succeed" {
+    // true && true && true -> exit 0
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "true && true && true\n", 0);
+}
+
+test "executor: && chain early failure" {
+    // true && false && echo no -> should NOT print and exit 1
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_and_chain_failure";
+    cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "true && false && echo no > " ++ tmp_path ++ "\n", 1);
+    try expectFileNotFound(tmp_path);
+}
+
+test "executor: || chain early success" {
+    // false || true || echo no -> should NOT print "no" and exit 0
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_or_chain_success";
+    cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "false || true || echo no > " ++ tmp_path ++ "\n", 0);
+    try expectFileNotFound(tmp_path);
+}
+
+test "executor: && then || (false && a || b)" {
+    // false && echo a || echo b -> should print "b" (not "a")
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_a = "/tmp/tsh_test_and_or_a";
+    const tmp_b = "/tmp/tsh_test_and_or_b";
+    cleanupTempFile(tmp_a);
+    cleanupTempFile(tmp_b);
+    defer cleanupTempFile(tmp_b);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "false && echo a > " ++ tmp_a ++ " || echo b > " ++ tmp_b ++ "\n", 0);
+    try expectFileNotFound(tmp_a);
+    try expectFileContent(tmp_b, "b\n");
+}
+
+test "executor: || then && (true || a && b)" {
+    // true || echo a && echo b -> should print "b" (not "a")
+    // This matches POSIX: true succeeds, || skips a, but then we check the trailing And
+    // with status=0 (succeeded), so execute_next=true, execute b
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_a = "/tmp/tsh_test_or_and_a";
+    const tmp_b = "/tmp/tsh_test_or_and_b";
+    cleanupTempFile(tmp_a);
+    cleanupTempFile(tmp_b);
+    defer cleanupTempFile(tmp_b);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "true || echo a > " ++ tmp_a ++ " && echo b > " ++ tmp_b ++ "\n", 0);
+    try expectFileNotFound(tmp_a);
+    try expectFileContent(tmp_b, "b\n");
+}
+
+test "executor: exit status is last executed (&&)" {
+    // false && true -> 1 (true never runs)
+    // true && false -> 1 (false runs)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "false && true\n", 1);
+    try expectStatus(&arena, &shell_state, "true && false\n", 1);
+}
+
+test "executor: exit status is last executed (||)" {
+    // true || false -> 0 (false never runs)
+    // false || true -> 0 (true runs)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "true || false\n", 0);
+    try expectStatus(&arena, &shell_state, "false || true\n", 0);
+}
+
+test "executor: negation with && (! false && echo yes)" {
+    // ! false && echo yes -> prints "yes" (! false = 0, && runs)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_neg_and_yes";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "! false && echo yes > " ++ tmp_path ++ "\n", 0);
+    try expectFileContent(tmp_path, "yes\n");
+}
+
+test "executor: negation with && (! true && echo no)" {
+    // ! true && echo no -> no print (! true = 1, && skips)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_neg_and_no";
+    cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "! true && echo no > " ++ tmp_path ++ "\n", 1);
+    try expectFileNotFound(tmp_path);
+}
+
+test "executor: negation with || (! true || echo yes)" {
+    // ! true || echo yes -> prints "yes" (! true = 1, || runs)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_neg_or_yes";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "! true || echo yes > " ++ tmp_path ++ "\n", 0);
+    try expectFileContent(tmp_path, "yes\n");
+}
+
+test "executor: negation with || (! false || echo no)" {
+    // ! false || echo no -> no print (! false = 0, || skips)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_neg_or_no";
+    cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "! false || echo no > " ++ tmp_path ++ "\n", 0);
+    try expectFileNotFound(tmp_path);
+}
+
+test "executor: pipeline in and_or succeeds" {
+    // echo hello | grep hello && echo found -> prints "hello" and "found"
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_pipeline_and_success";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "echo hello | grep hello && echo found > " ++ tmp_path ++ "\n", 0);
+    try expectFileContent(tmp_path, "found\n");
+}
+
+test "executor: pipeline in and_or fails" {
+    // echo hello | grep bye && echo found -> prints "hello", NOT "found"
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_pipeline_and_failure";
+    cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    // grep returns 1 when no match found
+    try expectStatus(&arena, &shell_state, "echo hello | grep bye && echo found > " ++ tmp_path ++ "\n", 1);
+    try expectFileNotFound(tmp_path);
+}
+
+test "executor: complex short-circuit (false && exit 99 || true)" {
+    // false && exit 99 || true -> should NOT exit, final status 0
+    // This should NOT return ExitRequested because exit 99 is skipped
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "false && exit 99 || true\n", 0);
+}
+
+test "executor: mixed pipelines and and_or" {
+    // echo a | cat && echo b | cat || echo c
+    // -> should print "a" and "b" (both succeed)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_a = "/tmp/tsh_test_mixed_a";
+    const tmp_b = "/tmp/tsh_test_mixed_b";
+    const tmp_c = "/tmp/tsh_test_mixed_c";
+    cleanupTempFile(tmp_a);
+    cleanupTempFile(tmp_b);
+    cleanupTempFile(tmp_c);
+    defer cleanupTempFile(tmp_a);
+    defer cleanupTempFile(tmp_b);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "echo a | cat > " ++ tmp_a ++ " && echo b | cat > " ++ tmp_b ++ " || echo c > " ++ tmp_c ++ "\n", 0);
+    try expectFileContent(tmp_a, "a\n");
+    try expectFileContent(tmp_b, "b\n");
+    try expectFileNotFound(tmp_c);
+}
+
+test "executor: empty negated pipeline in AND/OR list" {
+    // Test that negated assignment-only pipelines work correctly in AND/OR lists.
+    // An assignment-only command (like X=1) has no command to execute, so it's an
+    // "empty" pipeline that returns exit 0. With negation, it returns exit 1.
+    //
+    // ! X=1 && echo yes  -> should NOT print "yes" (! X=1 = 1, && skips)
+    // ! X=1 || echo yes  -> should print "yes" (! X=1 = 1, || runs)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_and = "/tmp/tsh_test_empty_neg_and";
+    const tmp_or = "/tmp/tsh_test_empty_neg_or";
+    cleanupTempFile(tmp_and);
+    cleanupTempFile(tmp_or);
+    defer cleanupTempFile(tmp_or);
+
+    var shell_state = try ShellState.init(arena.allocator());
+
+    // ! X=1 && echo yes -> exit 1 (! negates 0 to 1, && skips echo)
+    try expectStatus(&arena, &shell_state, "! X=1 && echo yes > " ++ tmp_and ++ "\n", 1);
+    try expectFileNotFound(tmp_and);
+
+    // ! Y=2 || echo yes -> exit 0 (! negates 0 to 1, || runs echo)
+    try expectStatus(&arena, &shell_state, "! Y=2 || echo yes > " ++ tmp_or ++ "\n", 0);
+    try expectFileContent(tmp_or, "yes\n");
 }
