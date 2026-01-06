@@ -732,7 +732,7 @@ const WordCollector = struct {
             .Newline, .Semicolon, .DoubleSemicolon => {
                 // Shouldn't happen during word collection - handled by state machine
             },
-            .Pipe, .DoublePipe => {
+            .Pipe, .DoublePipe, .Ampersand, .DoubleAmpersand => {
                 // Shouldn't happen during word collection - handled by state machine
             },
         }
@@ -1269,6 +1269,24 @@ pub const Parser = struct {
                                 );
                                 return ParseError.UnsupportedSyntax;
                             },
+                            .Ampersand => {
+                                self.setError(
+                                    "background execution (&) is not yet implemented",
+                                    tok.position,
+                                    tok.line,
+                                    tok.column,
+                                );
+                                return ParseError.UnsupportedSyntax;
+                            },
+                            .DoubleAmpersand => {
+                                self.setError(
+                                    "AND lists (&&) are not yet implemented",
+                                    tok.position,
+                                    tok.line,
+                                    tok.column,
+                                );
+                                return ParseError.UnsupportedSyntax;
+                            },
                             else => {
                                 // Start the first word of the simple_command.
                                 _ = try self.consumeToken();
@@ -1330,7 +1348,7 @@ pub const Parser = struct {
                                 self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
                                 return ParseError.UnsupportedSyntax;
                             },
-                            .Newline, .Semicolon, .DoubleSemicolon, .Pipe, .DoublePipe => {
+                            .Newline, .Semicolon, .DoubleSemicolon, .Pipe, .DoublePipe, .Ampersand, .DoubleAmpersand => {
                                 // Unreachable: The lexer marks words complete when followed by separators
                                 // or operators. Even on a buffer boundary, the lexer emits a complete empty
                                 // Continuation token before the separator/operator, which transitions us to
@@ -3826,4 +3844,30 @@ test "parseCommand: bang followed by expansion is command name" {
     try std.testing.expect(simple.argv[0].parts[0] == .literal);
     try std.testing.expectEqualStrings("!", simple.argv[0].parts[0].literal);
     try std.testing.expect(simple.argv[0].parts[1] == .parameter);
+}
+
+test "parseCommand: && produces error (not yet implemented)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("foo && bar");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = parser.parseCommand();
+    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
+    try std.testing.expectEqualStrings("AND lists (&&) are not yet implemented", parser.error_info.?.message);
+}
+
+test "parseCommand: & produces error (not yet implemented)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("foo &");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = parser.parseCommand();
+    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
+    try std.testing.expectEqualStrings("background execution (&) is not yet implemented", parser.error_info.?.message);
 }

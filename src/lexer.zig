@@ -101,6 +101,12 @@ pub const TokenType = union(enum) {
     /// Double pipe `||` - OR list operator (Section 2.9.3).
     /// Executes second command only if first fails.
     DoublePipe,
+    /// Single ampersand `&` - background execution operator (Section 2.9.3).
+    /// Runs command in background, shell continues without waiting.
+    Ampersand,
+    /// Double ampersand `&&` - AND list operator (Section 2.9.3).
+    /// Executes second command only if first succeeds (exit status 0).
+    DoubleAmpersand,
     /// Simple parameter expansion: $VAR, $1, $?, etc.
     /// Contains the name/symbol (no $ prefix).
     SimpleExpansion: []const u8,
@@ -163,6 +169,8 @@ pub const Token = struct {
             .DoubleSemicolon => try writer.writeAll("DoubleSemicolon"),
             .Pipe => try writer.writeAll("Pipe"),
             .DoublePipe => try writer.writeAll("DoublePipe"),
+            .Ampersand => try writer.writeAll("Ampersand"),
+            .DoubleAmpersand => try writer.writeAll("DoubleAmpersand"),
             .SimpleExpansion => |name| try writer.print("SimpleExpansion(\"{s}\")", .{name}),
             .BraceExpansionBegin => try writer.writeAll("BraceExpansionBegin"),
             .BraceExpansionEnd => try writer.writeAll("BraceExpansionEnd"),
@@ -1293,6 +1301,16 @@ pub const Lexer = struct {
                         }
                         break :state self.makeToken(.Pipe, true);
                     },
+                    '&' => {
+                        _ = try self.consumeOne();
+                        self.needs_continuation = false;
+                        const next = try self.peekByte();
+                        if (next != null and next.? == '&') {
+                            _ = try self.consumeOne();
+                            break :state self.makeToken(.DoubleAmpersand, true);
+                        }
+                        break :state self.makeToken(.Ampersand, true);
+                    },
                     '$' => {
                         // Parameter expansion - need to determine type
                         _ = try self.consumeOne();
@@ -1641,12 +1659,12 @@ test "nextToken: fd redirection at EOF emits incomplete token" {
 }
 
 test "nextToken: semicolon emits separator" {
-    // `;` emits Semicolon token, `|` emits Pipe, `&` is still consumed without token
+    // `;` emits Semicolon token, `|` emits Pipe, `&` emits Ampersand
     var reader = std.io.Reader.fixed("| ; & cmd");
     var lexer = Lexer.init(&reader);
     try expectPipe(try lexer.nextToken()); // |
     try expectSeparator(try lexer.nextToken()); // ;
-    try std.testing.expectEqual(null, try lexer.nextToken()); // & (unhandled)
+    try expectAmpersand(try lexer.nextToken()); // &
     try expectLiteral(try lexer.nextToken(), "cmd");
     try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
@@ -1654,7 +1672,7 @@ test "nextToken: semicolon emits separator" {
 
 test "nextToken: metacharacter at end of input" {
     // Ensure we don't infinite loop on metachar at end
-    // `|` now emits Pipe token, `&` is still unhandled
+    // `|` emits Pipe token, `&` emits Ampersand token
     var reader = std.io.Reader.fixed("|");
     var lexer = Lexer.init(&reader);
     try expectPipe(try lexer.nextToken());
@@ -1748,6 +1766,22 @@ fn expectDoublePipe(token: ?Token) !void {
     }
 }
 
+fn expectAmpersand(token: ?Token) !void {
+    const t = token orelse return error.ExpectedToken;
+    switch (t.type) {
+        .Ampersand => {},
+        else => return error.ExpectedAmpersand,
+    }
+}
+
+fn expectDoubleAmpersand(token: ?Token) !void {
+    const t = token orelse return error.ExpectedToken;
+    switch (t.type) {
+        .DoubleAmpersand => {},
+        else => return error.ExpectedDoubleAmpersand,
+    }
+}
+
 test "nextToken: double pipe emits DoublePipe token" {
     // || is the OR list operator (Section 2.9.3)
     var reader = std.io.Reader.fixed("a || b");
@@ -1755,6 +1789,82 @@ test "nextToken: double pipe emits DoublePipe token" {
     try expectLiteral(try lexer.nextToken(), "a");
     try expectDoublePipe(try lexer.nextToken());
     try expectLiteral(try lexer.nextToken(), "b");
+    try expectContinuation(try lexer.nextToken(), "", true);
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: && produces DoubleAmpersand token" {
+    var reader = std.io.Reader.fixed("&&");
+    var lexer = Lexer.init(&reader);
+    const tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqual(TokenType.DoubleAmpersand, tok.type);
+    try std.testing.expectEqual(true, tok.complete);
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: & produces Ampersand token" {
+    var reader = std.io.Reader.fixed("&");
+    var lexer = Lexer.init(&reader);
+    const tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqual(TokenType.Ampersand, tok.type);
+    try std.testing.expectEqual(true, tok.complete);
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: && in command context" {
+    var reader = std.io.Reader.fixed("foo && bar");
+    var lexer = Lexer.init(&reader);
+    try expectLiteral(try lexer.nextToken(), "foo");
+    const tok = (try lexer.nextToken()).?;
+    try std.testing.expectEqual(TokenType.DoubleAmpersand, tok.type);
+    try expectLiteral(try lexer.nextToken(), "bar");
+    try expectContinuation(try lexer.nextToken(), "", true);
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: &&& is DoubleAmpersand followed by Ampersand" {
+    var reader = std.io.Reader.fixed("&&&");
+    var lexer = Lexer.init(&reader);
+    const tok1 = (try lexer.nextToken()).?;
+    try std.testing.expectEqual(TokenType.DoubleAmpersand, tok1.type);
+    const tok2 = (try lexer.nextToken()).?;
+    try std.testing.expectEqual(TokenType.Ampersand, tok2.type);
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: mixed && and ||" {
+    var reader = std.io.Reader.fixed("a && b || c");
+    var lexer = Lexer.init(&reader);
+    try expectLiteral(try lexer.nextToken(), "a");
+    try std.testing.expectEqual(TokenType.DoubleAmpersand, (try lexer.nextToken()).?.type);
+    try expectLiteral(try lexer.nextToken(), "b");
+    try expectDoublePipe(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "c");
+    try expectContinuation(try lexer.nextToken(), "", true);
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: && inside single quotes is literal" {
+    var reader = std.io.Reader.fixed("'&&'");
+    var lexer = Lexer.init(&reader);
+    try expectSingleQuoted(try lexer.nextToken(), "&&");
+    try expectContinuation(try lexer.nextToken(), "", true);
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: && inside double quotes is literal" {
+    var reader = std.io.Reader.fixed("\"&&\"");
+    var lexer = Lexer.init(&reader);
+    try expectDoubleQuoteBegin(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "&&");
+    try expectDoubleQuoteEnd(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: & inside single quotes is literal" {
+    var reader = std.io.Reader.fixed("'&'");
+    var lexer = Lexer.init(&reader);
+    try expectSingleQuoted(try lexer.nextToken(), "&");
     try expectContinuation(try lexer.nextToken(), "", true);
     try std.testing.expectEqual(null, try lexer.nextToken());
 }
@@ -3085,6 +3195,8 @@ fn fuzzRandomBytes(_: void, input: []const u8) anyerror!void {
             .DoubleSemicolon => {},
             .Pipe => {},
             .DoublePipe => {},
+            .Ampersand => {},
+            .DoubleAmpersand => {},
             .SimpleExpansion => {},
             .BraceExpansionBegin => {},
             .BraceExpansionEnd => {},
