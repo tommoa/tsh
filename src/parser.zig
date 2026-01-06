@@ -319,7 +319,7 @@ pub const SimpleCommand = struct {
 /// POSIX Reference: Section 2.9.2
 pub const Pipeline = struct {
     negated: bool,
-    commands: []const SimpleCommand,
+    commands: []const Command,
 
     pub fn format(self: Pipeline, writer: *std.io.Writer) std.io.Writer.Error!void {
         if (self.negated) try writer.writeAll("! ");
@@ -330,19 +330,77 @@ pub const Pipeline = struct {
     }
 };
 
-/// A command that can be executed.
-pub const Command = struct {
-    payload: Payload,
+/// Operator connecting pipelines in an AND/OR list (POSIX 2.9.3)
+pub const AndOrOp = enum {
+    /// && - execute next pipeline only if previous succeeded (exit status 0)
+    And,
+    /// || - execute next pipeline only if previous failed (exit status non-zero)
+    Or,
+};
 
-    pub const Payload = union(enum) {
-        pipeline: Pipeline,
-    };
+/// An item in an AND/OR list.
+/// Each item contains a pipeline and an optional trailing operator.
+/// The trailing operator is null for the last item in the list.
+pub const AndOrItem = struct {
+    pipeline: Pipeline,
+    /// Operator that follows this pipeline (null for the last item)
+    trailing_op: ?AndOrOp,
 
-    /// Format the command for human-readable output.
-    pub fn format(self: Command, writer: *std.io.Writer) std.io.Writer.Error!void {
-        switch (self.payload) {
-            .pipeline => |pipeline| try pipeline.format(writer),
+    pub fn format(self: AndOrItem, writer: *std.io.Writer) std.io.Writer.Error!void {
+        try self.pipeline.format(writer);
+        if (self.trailing_op) |op| {
+            switch (op) {
+                .And => try writer.writeAll(" && "),
+                .Or => try writer.writeAll(" || "),
+            }
         }
+    }
+};
+
+/// An AND/OR list of pipelines (POSIX 2.9.3)
+///
+/// This is the primary unit returned by Parser.next(). Even a single
+/// simple command is represented as an AndOrList with one item.
+///
+/// Examples:
+///   "foo"           -> AndOrList{ items: [(pipeline(foo), null)] }
+///   "foo && bar"    -> AndOrList{ items: [(pipeline(foo), And), (pipeline(bar), null)] }
+///   "foo || bar"    -> AndOrList{ items: [(pipeline(foo), Or), (pipeline(bar), null)] }
+///   "a && b || c"   -> AndOrList{ items: [(a, And), (b, Or), (c, null)] }
+pub const AndOrList = struct {
+    items: []const AndOrItem,
+
+    pub fn format(self: AndOrList, writer: *std.io.Writer) std.io.Writer.Error!void {
+        for (self.items) |item| {
+            try item.format(writer);
+        }
+    }
+};
+
+/// A single command in a pipeline (POSIX 2.9.2)
+///
+/// Currently only simple commands are supported. Future additions will include
+/// compound commands (brace groups, subshells, if/while/for/case clauses) and
+/// function definitions per POSIX Section 2.9.5.
+pub const Command = union(enum) {
+    simple: SimpleCommand,
+
+    pub fn format(self: Command, writer: *std.io.Writer) std.io.Writer.Error!void {
+        switch (self) {
+            .simple => |s| try s.format(writer),
+        }
+    }
+};
+
+/// The result of parsing one complete command unit.
+///
+/// This is what Parser.next() returns. It wraps an AndOrList to allow
+/// for future extensions (e.g., source location tracking, async commands).
+pub const ParsedCommand = struct {
+    and_or: AndOrList,
+
+    pub fn format(self: ParsedCommand, writer: *std.io.Writer) std.io.Writer.Error!void {
+        try self.and_or.format(writer);
     }
 };
 
@@ -434,8 +492,8 @@ const ParserContext = union(enum) {
         },
         /// Whether this pipeline should have its exit status negated.
         negated: bool,
-        /// The simple commands that have been parsed as part of this pipeline.
-        commands: std.ArrayListUnmanaged(SimpleCommand),
+        /// The commands that have been parsed as part of this pipeline.
+        commands: std.ArrayListUnmanaged(Command),
         /// Track the command count before parsing after a pipe.
         /// If non-null, we just consumed a pipe and expect the command count to increase.
         command_count_before_pipe: ?usize,
@@ -964,7 +1022,7 @@ pub const Parser = struct {
     ///
     /// Returns the parsed command, or `null` if the input is empty.
     /// Returns an error if the input is malformed.
-    pub fn parseCommand(self: *Parser) ParseError!?Command {
+    pub fn parseCommand(self: *Parser) ParseError!?ParsedCommand {
         state: switch (self.reset()) {
             .pipeline => |pipeline_val| {
                 var pipeline = pipeline_val;
@@ -1166,13 +1224,24 @@ pub const Parser = struct {
                             .negated = pipeline.negated,
                             .commands = try pipeline.commands.toOwnedSlice(self.allocator),
                         };
-                        const command = Command{
-                            .payload = .{ .pipeline = new_pipeline },
+
+                        // Wrap in AndOrList and ParsedCommand
+                        // For now, we create a single-item list with no trailing operator
+                        const items = try self.allocator.alloc(AndOrItem, 1);
+                        items[0] = .{
+                            .pipeline = new_pipeline,
+                            .trailing_op = null, // No AND/OR support yet
                         };
+                        const parsed = ParsedCommand{
+                            .and_or = AndOrList{
+                                .items = items,
+                            },
+                        };
+
                         const next_context = self.popContext() orelse {
                             // Stack empty - we're at root level. Return the
                             // command that we've built.
-                            return command;
+                            return parsed;
                         };
 
                         switch (next_context) {
@@ -1516,7 +1585,7 @@ pub const Parser = struct {
                             },
                             .pipeline => |*pipeline| {
                                 if (new_command) |cmd| {
-                                    try pipeline.commands.append(self.allocator, cmd);
+                                    try pipeline.commands.append(self.allocator, .{ .simple = cmd });
                                 }
                             },
                         }
@@ -1539,7 +1608,7 @@ pub const Parser = struct {
     ///     try executor.execute(cmd);
     /// }
     /// ```
-    pub fn next(self: *Parser) ParseError!?Command {
+    pub fn next(self: *Parser) ParseError!?ParsedCommand {
         // TODO: Change this when we support non-simple commands.
         while (true) {
             const command = try self.parseCommand();
@@ -1825,19 +1894,20 @@ fn expectWord(word: Word, expected_parts: []const WordPart) !void {
 }
 
 fn expectSimpleCommand(
-    cmd: ?Command,
+    cmd: ?ParsedCommand,
     expected_assignments: []const struct { name: []const u8, value: []const WordPart },
     expected_argv: []const []const WordPart,
     expected_redirections: usize,
 ) !void {
     const c = cmd orelse return error.ExpectedCommand;
-    const simple = switch (c.payload) {
-        .pipeline => |p| blk: {
-            // For testing simple commands wrapped in pipelines, use first command
-            // TODO: Add dedicated pipeline testing helper when pipeline execution is implemented
-            try std.testing.expectEqual(@as(usize, 1), p.commands.len);
-            break :blk p.commands[0];
-        },
+    const simple = blk: {
+        const pipeline = c.and_or.items[0].pipeline;
+        // For testing simple commands wrapped in pipelines, use first command
+        // TODO: Add dedicated pipeline testing helper when pipeline execution is implemented
+        try std.testing.expectEqual(@as(usize, 1), pipeline.commands.len);
+        break :blk switch (pipeline.commands[0]) {
+            .simple => |s| s,
+        };
     };
 
     try std.testing.expectEqual(expected_assignments.len, simple.assignments.len);
@@ -1876,6 +1946,19 @@ fn expectCloseTarget(target: RedirectionTarget) !void {
         .file => return error.ExpectedCloseTarget,
         .fd => return error.ExpectedCloseTarget,
     }
+}
+
+/// Helper to extract the first SimpleCommand from a ParsedCommand.
+/// Use this when testing simple commands that are wrapped in the AndOrList/Pipeline structure.
+fn getFirstSimpleCommand(cmd: ParsedCommand) SimpleCommand {
+    return switch (getPipeline(cmd).commands[0]) {
+        .simple => |s| s,
+    };
+}
+
+/// Helper to extract the Pipeline from a ParsedCommand.
+fn getPipeline(cmd: ParsedCommand) Pipeline {
+    return cmd.and_or.items[0].pipeline;
 }
 
 test "parseCommand: empty input returns null" {
@@ -2021,9 +2104,7 @@ test "parseCommand: simple redirection" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = switch (cmd.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd);
 
     try std.testing.expectEqual(@as(usize, 0), simple.assignments.len);
     try std.testing.expectEqual(@as(usize, 0), simple.argv.len);
@@ -2045,9 +2126,7 @@ test "parseCommand: command with redirection" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = switch (cmd.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd);
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     try std.testing.expectEqual(@as(usize, 1), simple.redirections.len);
@@ -2064,9 +2143,7 @@ test "parseCommand: fd redirection 2>&1" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = switch (cmd.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd);
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     try std.testing.expectEqual(@as(usize, 1), simple.redirections.len);
@@ -2087,9 +2164,7 @@ test "parseCommand: multiple redirections" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = switch (cmd.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd);
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     try std.testing.expectEqual(@as(usize, 3), simple.redirections.len);
@@ -2157,9 +2232,7 @@ test "parseCommand: quoted redirection-like string is literal" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = switch (cmd.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd);
 
     // Should have 2 argv items: "cmd" and "2>&1"
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
@@ -2182,9 +2255,7 @@ test "parseCommand: single-quoted redirection-like string is literal" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = switch (cmd.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd);
 
     // Should have 2 argv items: "cmd" and "2>&1"
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
@@ -2206,9 +2277,7 @@ test "parseCommand: command followed by double-quoted expansion" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = switch (cmd.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd);
 
     // Should have exactly 2 argv items: "echo" and "$@" (in double quotes)
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
@@ -2272,9 +2341,7 @@ test "parseCommand: complex command" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = switch (cmd.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd);
 
     try std.testing.expectEqual(@as(usize, 1), simple.assignments.len);
     try std.testing.expectEqualStrings("FOO", simple.assignments[0].name);
@@ -2315,9 +2382,7 @@ test "parseCommand: fd close >&-" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = switch (cmd.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd);
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     try std.testing.expectEqual(@as(usize, 1), simple.redirections.len);
@@ -2338,9 +2403,7 @@ test "parseCommand: fd close 2>&-" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = switch (cmd.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd);
 
     try std.testing.expectEqual(@as(usize, 1), simple.redirections.len);
 
@@ -2412,9 +2475,7 @@ test "parseCommand: fd redirection 2>&1 with buffer boundary" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = switch (cmd.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd);
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     try expectWord(simple.argv[0], &.{.{ .literal = "cmd" }});
@@ -2446,9 +2507,7 @@ test "parseCommand: multi-digit fd 12>&1 with buffer boundary" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = switch (cmd.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd);
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     try std.testing.expectEqual(@as(usize, 1), simple.redirections.len);
@@ -2479,9 +2538,7 @@ test "parseCommand: non-digit word before redirection with buffer boundary" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = switch (cmd.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd);
 
     // "a2" should be argv[0], redirection should be separate
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
@@ -2514,9 +2571,7 @@ test "parseCommand: input fd redirection 0<&3 with buffer boundary" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = switch (cmd.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd);
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     try expectWord(simple.argv[0], &.{.{ .literal = "cmd" }});
@@ -2548,9 +2603,7 @@ test "parseCommand: input redirection 0<file with buffer boundary" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = switch (cmd.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd);
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     try std.testing.expectEqual(@as(usize, 1), simple.redirections.len);
@@ -2564,7 +2617,7 @@ test "parseCommand: input redirection 0<file with buffer boundary" {
 // --- Fuzz test for buffer boundary invariance ---
 
 /// Parse input with a fixed reader (large buffer) and return semantic results.
-fn parseWithFixedReader(allocator: Allocator, input: []const u8) !?Command {
+fn parseWithFixedReader(allocator: Allocator, input: []const u8) !?ParsedCommand {
     var reader = std.io.Reader.fixed(input);
     var lex = lexer.Lexer.init(&reader);
     var parser_inst = Parser.init(allocator, &lex);
@@ -2572,7 +2625,7 @@ fn parseWithFixedReader(allocator: Allocator, input: []const u8) !?Command {
 }
 
 /// Parse input with a pipe-based reader (small buffer) and return semantic results.
-fn parseWithSmallBuffer(allocator: Allocator, input: []const u8, buf_size: usize) !?Command {
+fn parseWithSmallBuffer(allocator: Allocator, input: []const u8, buf_size: usize) !?ParsedCommand {
     const pipe = try std.posix.pipe();
     defer std.posix.close(pipe[0]);
 
@@ -2651,19 +2704,15 @@ fn appendWordPartText(allocator: Allocator, result: *std.ArrayListUnmanaged(u8),
 }
 
 /// Compare two Commands for semantic equality (by comparing their simple command payloads).
-fn commandsEqual(allocator: Allocator, a: ?Command, b: ?Command) !bool {
+fn commandsEqual(allocator: Allocator, a: ?ParsedCommand, b: ?ParsedCommand) !bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
 
     const cmd_a = a.?;
     const cmd_b = b.?;
 
-    const simple_a = switch (cmd_a.payload) {
-        .pipeline => |p| p.commands[0],
-    };
-    const simple_b = switch (cmd_b.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple_a = getFirstSimpleCommand(cmd_a);
+    const simple_b = getFirstSimpleCommand(cmd_b);
 
     // Compare assignments
     if (simple_a.assignments.len != simple_b.assignments.len) return false;
@@ -2862,9 +2911,7 @@ test "parseCommand: single-quoted parentheses are valid arguments" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
 
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
     try expectWord(simple.argv[0], &.{.{ .literal = "echo" }});
@@ -2882,9 +2929,7 @@ test "parseCommand: double-quoted parentheses are valid arguments" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
 
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
     try expectWord(simple.argv[0], &.{.{ .literal = "echo" }});
@@ -2917,10 +2962,7 @@ test "next: buffer boundary with separator (1 byte buffer)" {
     var count: usize = 0;
     while (try parser_inst.next()) |cmd| {
         if (count < 2) {
-            const simple = switch (cmd.payload) {
-                .pipeline => |p| p.commands[0],
-            };
-            commands[count] = simple;
+            commands[count] = getFirstSimpleCommand(cmd);
         }
         count += 1;
     }
@@ -3010,9 +3052,7 @@ test "parseCommand: simple expansion $VAR" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
 
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
 
@@ -3035,9 +3075,7 @@ test "parseCommand: simple expansion $1" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
 
     const arg = simple.argv[1];
     try std.testing.expect(arg.parts[0] == .parameter);
@@ -3055,9 +3093,7 @@ test "parseCommand: simple expansion $?" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
 
     const arg = simple.argv[1];
     try std.testing.expect(arg.parts[0] == .parameter);
@@ -3075,9 +3111,7 @@ test "parseCommand: braced expansion ${VAR}" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
 
     const arg = simple.argv[1];
     try std.testing.expect(arg.parts[0] == .parameter);
@@ -3096,9 +3130,7 @@ test "parseCommand: expansion with default ${VAR:-default}" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
 
     const arg = simple.argv[1];
     try std.testing.expect(arg.parts[0] == .parameter);
@@ -3124,9 +3156,7 @@ test "parseCommand: expansion without colon ${VAR-default}" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
 
     const param = simple.argv[1].parts[0].parameter;
     try std.testing.expectEqual(lexer.ModifierOp.UseDefault, param.modifier.?.op);
@@ -3144,9 +3174,7 @@ test "parseCommand: length expansion ${#VAR}" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
 
     const arg = simple.argv[1];
     try std.testing.expect(arg.parts[0] == .parameter);
@@ -3169,9 +3197,7 @@ test "parseCommand: prefix removal ${VAR#pattern}" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
 
     const param = simple.argv[1].parts[0].parameter;
     try std.testing.expectEqualStrings("VAR", param.name);
@@ -3190,9 +3216,7 @@ test "parseCommand: suffix removal ${VAR%pattern}" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
 
     const param = simple.argv[1].parts[0].parameter;
     try std.testing.expectEqualStrings("VAR", param.name);
@@ -3211,9 +3235,7 @@ test "parseCommand: expansion in double quotes" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
 
     const arg = simple.argv[1];
     try std.testing.expectEqual(@as(usize, 1), arg.parts.len);
@@ -3238,9 +3260,7 @@ test "parseCommand: mixed literal and expansion" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
 
     const arg = simple.argv[1];
     try std.testing.expectEqual(@as(usize, 3), arg.parts.len);
@@ -3263,9 +3283,7 @@ test "parseCommand: nested expansion ${VAR:-${OTHER}}" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
 
     const param = simple.argv[1].parts[0].parameter;
     try std.testing.expectEqualStrings("VAR", param.name);
@@ -3289,9 +3307,7 @@ test "parseCommand: expansion in assignment value" {
     const cmd = try parser.parseCommand();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
 
     try std.testing.expectEqual(@as(usize, 1), simple.assignments.len);
     try std.testing.expectEqualStrings("FOO", simple.assignments[0].name);
@@ -3361,9 +3377,7 @@ test "next: single command yields one Command then null" {
     const cmd1 = try parser.next();
     try std.testing.expect(cmd1 != null);
 
-    const simple1 = switch (cmd1.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple1 = getFirstSimpleCommand(cmd1.?);
 
     try std.testing.expectEqual(@as(usize, 2), simple1.argv.len);
 
@@ -3417,16 +3431,14 @@ test "next: returns Command union with simple variant" {
     try std.testing.expect(cmd != null);
 
     // Verify it's a simple command with expected structure
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
     try std.testing.expectEqual(@as(usize, 1), simple.assignments.len);
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
 }
 
-// --- Command.payload access pattern tests ---
+// --- ParsedCommand/AndOrList structure tests ---
 
-test "Command.payload: accessing simple command through payload wrapper" {
+test "ParsedCommand: accessing simple command through helpers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -3438,36 +3450,33 @@ test "Command.payload: accessing simple command through payload wrapper" {
     try std.testing.expect(cmd != null);
 
     // Test access via payload.simple (the new pattern after refactoring)
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
     try std.testing.expectEqual(@as(usize, 3), simple.argv.len);
     try std.testing.expectEqualStrings("cmd", simple.argv[0].parts[0].literal);
     try std.testing.expectEqualStrings("arg1", simple.argv[1].parts[0].literal);
     try std.testing.expectEqualStrings("arg2", simple.argv[2].parts[0].literal);
 }
 
-test "Command.payload: switch on payload union" {
+test "ParsedCommand: accessing pipeline through and_or" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
     var reader = std.io.Reader.fixed("echo hello");
     var lex = lexer.Lexer.init(&reader);
-    var parser = Parser.init(arena.allocator(), &lex);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
 
-    const cmd = try parser.next();
+    const cmd = try parser_inst.next();
     try std.testing.expect(cmd != null);
 
-    // Test switching on the payload union (pattern used by executor)
-    switch (cmd.?.payload) {
-        .pipeline => |pipeline| {
-            // For a single command, pipeline has one command
-            try std.testing.expectEqual(@as(usize, 1), pipeline.commands.len);
-            const simple = pipeline.commands[0];
-            try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
-            try std.testing.expectEqualStrings("echo", simple.argv[0].parts[0].literal);
-        },
-    }
+    // Test accessing via the new and_or structure (pattern used by executor)
+    const pipeline = cmd.?.and_or.items[0].pipeline;
+    // For a single command, pipeline has one command
+    try std.testing.expectEqual(@as(usize, 1), pipeline.commands.len);
+    const simple = switch (pipeline.commands[0]) {
+        .simple => |s| s,
+    };
+    try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
+    try std.testing.expectEqualStrings("echo", simple.argv[0].parts[0].literal);
 }
 
 // --- WordCollector quote stack depth tests ---
@@ -3486,9 +3495,7 @@ test "WordCollector: deeply nested brace expansions at stack boundary" {
     const cmd = try parser.next();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
     try std.testing.expectEqualStrings("echo", simple.argv[0].parts[0].literal);
 
@@ -3513,9 +3520,7 @@ test "WordCollector: nested double quotes and brace expansions" {
     const cmd = try parser.next();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
 
     // The second argument should be a double_quoted containing the nested expansion
@@ -3538,9 +3543,7 @@ test "WordCollector: maximum safe nesting depth (7 levels)" {
     const cmd = try parser.next();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
 
     // Verify the outermost parameter
@@ -3567,9 +3570,7 @@ test "WordCollector: popContext pointer remains valid for immediate use" {
     const cmd = try parser.next();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
 
     // The word should be a double_quoted containing a parameter expansion
@@ -3597,9 +3598,7 @@ test "WordCollector: multiple sequential pop operations" {
     const cmd = try parser.next();
     try std.testing.expect(cmd != null);
 
-    const simple = switch (cmd.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(cmd.?);
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
 
     const word = simple.argv[0];
@@ -3628,8 +3627,8 @@ test "parseCommand: negated simple command" {
 
     const result = try parser_inst.parseCommand();
     try std.testing.expect(result != null);
-    try std.testing.expect(result.?.payload == .pipeline);
-    try std.testing.expect(result.?.payload.pipeline.negated);
+    const pipeline = getPipeline(result.?);
+    try std.testing.expect(pipeline.negated);
 }
 
 test "parseCommand: simple pipeline" {
@@ -3641,9 +3640,8 @@ test "parseCommand: simple pipeline" {
 
     const result = try parser_inst.parseCommand();
     try std.testing.expect(result != null);
-    try std.testing.expect(result.?.payload == .pipeline);
 
-    const pipeline = result.?.payload.pipeline;
+    const pipeline = getPipeline(result.?);
     try std.testing.expect(!pipeline.negated);
     try std.testing.expectEqual(@as(usize, 2), pipeline.commands.len);
 }
@@ -3657,9 +3655,8 @@ test "parseCommand: negated pipeline" {
 
     const result = try parser_inst.parseCommand();
     try std.testing.expect(result != null);
-    try std.testing.expect(result.?.payload == .pipeline);
 
-    const pipeline = result.?.payload.pipeline;
+    const pipeline = getPipeline(result.?);
     try std.testing.expect(pipeline.negated);
     try std.testing.expectEqual(@as(usize, 2), pipeline.commands.len);
 }
@@ -3673,9 +3670,8 @@ test "parseCommand: three-stage pipeline" {
 
     const result = try parser_inst.parseCommand();
     try std.testing.expect(result != null);
-    try std.testing.expect(result.?.payload == .pipeline);
 
-    const pipeline = result.?.payload.pipeline;
+    const pipeline = getPipeline(result.?);
     try std.testing.expectEqual(@as(usize, 3), pipeline.commands.len);
 }
 
@@ -3689,9 +3685,8 @@ test "parseCommand: pipeline with newline continuation" {
 
     const result = try parser_inst.parseCommand();
     try std.testing.expect(result != null);
-    try std.testing.expect(result.?.payload == .pipeline);
 
-    const pipeline = result.?.payload.pipeline;
+    const pipeline = getPipeline(result.?);
     try std.testing.expectEqual(@as(usize, 2), pipeline.commands.len);
 }
 
@@ -3727,9 +3722,7 @@ test "parseCommand: bang in word is not negation" {
     const result = try parser_inst.parseCommand();
     try std.testing.expect(result != null);
 
-    const simple = switch (result.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(result.?);
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
     try expectWord(simple.argv[0], &.{.{ .literal = "!echo" }});
     try expectWord(simple.argv[1], &.{.{ .literal = "hello" }});
@@ -3745,9 +3738,7 @@ test "parseCommand: bang from would-be expansion position" {
     const result = try parser_inst.parseCommand();
     try std.testing.expect(result != null);
 
-    const simple = switch (result.?.payload) {
-        .pipeline => |p| p.commands[0],
-    };
+    const simple = getFirstSimpleCommand(result.?);
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
     try expectWord(simple.argv[0], &.{.{ .literal = "echo" }});
     try expectWord(simple.argv[1], &.{.{ .literal = "!" }});
@@ -3763,9 +3754,8 @@ test "parseCommand: bang alone without newline is negated empty pipeline" {
 
     const result = try parser_inst.parseCommand();
     try std.testing.expect(result != null);
-    try std.testing.expect(result.?.payload == .pipeline);
 
-    const pipeline = result.?.payload.pipeline;
+    const pipeline = getPipeline(result.?);
     try std.testing.expect(pipeline.negated);
     try std.testing.expectEqual(@as(usize, 0), pipeline.commands.len);
 }
@@ -3779,9 +3769,8 @@ test "parseCommand: bang with newline is negated empty pipeline" {
 
     const result = try parser_inst.parseCommand();
     try std.testing.expect(result != null);
-    try std.testing.expect(result.?.payload == .pipeline);
 
-    const pipeline = result.?.payload.pipeline;
+    const pipeline = getPipeline(result.?);
     try std.testing.expect(pipeline.negated);
     try std.testing.expectEqual(@as(usize, 0), pipeline.commands.len);
 }
@@ -3809,11 +3798,13 @@ test "parseCommand: bang followed by quote is command name" {
     const result = try parser_inst.parseCommand();
     try std.testing.expect(result != null);
 
-    const pipeline = result.?.payload.pipeline;
+    const pipeline = getPipeline(result.?);
     try std.testing.expect(!pipeline.negated);
     try std.testing.expectEqual(@as(usize, 1), pipeline.commands.len);
 
-    const simple = pipeline.commands[0];
+    const simple = switch (pipeline.commands[0]) {
+        .simple => |s| s,
+    };
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     // Word should have "!" literal part and "foo" quoted part
     try std.testing.expectEqual(@as(usize, 2), simple.argv[0].parts.len);
@@ -3833,11 +3824,13 @@ test "parseCommand: bang followed by expansion is command name" {
     const result = try parser_inst.parseCommand();
     try std.testing.expect(result != null);
 
-    const pipeline = result.?.payload.pipeline;
+    const pipeline = getPipeline(result.?);
     try std.testing.expect(!pipeline.negated);
     try std.testing.expectEqual(@as(usize, 1), pipeline.commands.len);
 
-    const simple = pipeline.commands[0];
+    const simple = switch (pipeline.commands[0]) {
+        .simple => |s| s,
+    };
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     // Word should have "!" literal part and parameter expansion part
     try std.testing.expectEqual(@as(usize, 2), simple.argv[0].parts.len);

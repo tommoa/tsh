@@ -17,6 +17,7 @@ const state = @import("state.zig");
 const builtins = @import("builtins.zig");
 const expand = @import("expand.zig");
 const SimpleCommand = parser.SimpleCommand;
+const ParsedCommand = parser.ParsedCommand;
 const Command = parser.Command;
 
 const Word = parser.Word;
@@ -420,9 +421,12 @@ pub const Executor = struct {
 
         for (cmds, 0..) |cmd, i| {
             const is_last = (i == cmds.len - 1);
+            const simple = switch (cmd) {
+                .simple => |s| s,
+            };
 
             // Expand argv in parent (needed to check for builtins in pipeline stages)
-            const argv = expand.expandArgv(self.allocator, cmd.argv, self.shell_state) catch |err| {
+            const argv = expand.expandArgv(self.allocator, simple.argv, self.shell_state) catch |err| {
                 switch (err) {
                     // Error message already printed by expansion
                     error.ParameterUnsetOrNull, error.ParameterAssignmentInvalid => {},
@@ -459,7 +463,7 @@ pub const Executor = struct {
                 // Child: close read end of new pipe (parent saves it for next stage)
                 if (pipe_fds) |fds| posix.close(fds[0]);
 
-                self.executeChild(cmd, argv, .{
+                self.executeChild(simple, argv, .{
                     .stdin_fd = read_fd,
                     .stdout_fd = if (pipe_fds) |fds| fds[1] else null,
                 });
@@ -514,50 +518,59 @@ pub const Executor = struct {
     ///     _ = try executor.executeCommand(cmd);
     /// }
     /// ```
-    pub fn executeCommand(self: *Executor, cmd: Command) ExecuteError!ExitStatus {
-        switch (cmd.payload) {
-            .pipeline => |pipeline| {
-                if (pipeline.commands.len == 0) {
-                    // Empty pipeline - return success or failure based on negation
-                    const status = ExitStatus{ .exited = 0 };
-                    if (pipeline.negated) {
-                        self.shell_state.last_status = .{ .exited = 1 };
-                        return self.shell_state.last_status;
-                    }
-                    self.shell_state.last_status = status;
-                    return status;
-                }
-                if (pipeline.commands.len == 1) {
-                    // Single-command "pipeline" - execute in current environment.
-                    // This ensures builtins like cd, export, exit work correctly.
-                    const status = try self.execute(pipeline.commands[0]);
-                    // Section 2.9.2: "If the pipeline begins with the reserved word
-                    // !, the exit status shall be the logical NOT of the exit status
-                    // of the last command."
-                    if (pipeline.negated) {
-                        const negated = switch (status) {
-                            .exited => |code| ExitStatus{ .exited = if (code == 0) 1 else 0 },
-                            .signaled => ExitStatus{ .exited = 0 }, // Non-zero exit negated to 0
-                        };
-                        self.shell_state.last_status = negated;
-                        return negated;
-                    }
-                    return status;
-                }
-                // Multi-command pipeline - all stages run in subshells
-                const status = try self.executePipeline(pipeline);
-                // Handle negation (! prefix)
-                if (pipeline.negated) {
-                    const negated = switch (status) {
-                        .exited => |code| ExitStatus{ .exited = if (code == 0) 1 else 0 },
-                        .signaled => ExitStatus{ .exited = 0 },
-                    };
-                    self.shell_state.last_status = negated;
-                    return negated;
-                }
-                return status;
-            },
+    pub fn executeCommand(self: *Executor, cmd: ParsedCommand) ExecuteError!ExitStatus {
+        const and_or = cmd.and_or;
+
+        // For now, only single-pipeline commands are supported.
+        // The parser errors on && and || tokens, so items.len > 1 shouldn't happen yet.
+        std.debug.assert(and_or.items.len == 1);
+
+        const pipeline = and_or.items[0].pipeline;
+
+        if (pipeline.commands.len == 0) {
+            // Empty pipeline - return success or failure based on negation
+            const status = ExitStatus{ .exited = 0 };
+            if (pipeline.negated) {
+                self.shell_state.last_status = .{ .exited = 1 };
+                return self.shell_state.last_status;
+            }
+            self.shell_state.last_status = status;
+            return status;
         }
+
+        if (pipeline.commands.len == 1) {
+            // Single-command "pipeline" - execute in current environment.
+            // This ensures builtins like cd, export, exit work correctly.
+            const simple = switch (pipeline.commands[0]) {
+                .simple => |s| s,
+            };
+            const status = try self.execute(simple);
+            // Section 2.9.2: "If the pipeline begins with the reserved word
+            // !, the exit status shall be the logical NOT of the exit status
+            // of the last command."
+            if (pipeline.negated) {
+                const negated = switch (status) {
+                    .exited => |code| ExitStatus{ .exited = if (code == 0) 1 else 0 },
+                    .signaled => ExitStatus{ .exited = 0 }, // Non-zero exit negated to 0
+                };
+                self.shell_state.last_status = negated;
+                return negated;
+            }
+            return status;
+        }
+
+        // Multi-command pipeline - all stages run in subshells
+        const status = try self.executePipeline(pipeline);
+        // Handle negation (! prefix)
+        if (pipeline.negated) {
+            const negated = switch (status) {
+                .exited => |code| ExitStatus{ .exited = if (code == 0) 1 else 0 },
+                .signaled => ExitStatus{ .exited = 0 },
+            };
+            self.shell_state.last_status = negated;
+            return negated;
+        }
+        return status;
     }
 
     /// Execute a simple command in the child process.
@@ -849,7 +862,7 @@ fn statusFromWaitResult(status: u32) ExitStatus {
 
 // --- Tests ---
 
-fn parseCommand(allocator: Allocator, input: []const u8) !?Command {
+fn parseCommand(allocator: Allocator, input: []const u8) !?ParsedCommand {
     var reader = std.io.Reader.fixed(input);
     var lex = lexer.Lexer.init(&reader);
     var p = parser.Parser.init(allocator, &lex);
