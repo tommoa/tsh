@@ -1147,7 +1147,7 @@ pub const Lexer = struct {
                 // send a continuation.
                 if (self.check_end_of_word) {
                     const nextByte = try self.peekByte();
-                    if (nextByte == null or nextByte == ' ' or nextByte == '\n') {
+                    if (self.isWordComplete(nextByte)) {
                         // If this is the end of a word, then we also know that we are not continuing
                         // the previous token.
                         self.needs_continuation = false;

@@ -377,17 +377,85 @@ pub const AndOrList = struct {
     }
 };
 
+/// Reserved words recognized by the shell.
+/// These are only recognized when unquoted and in command position.
+///
+/// Reference: POSIX.1-2017 Section 2.4 Reserved Words
+pub const ReservedWord = enum {
+    @"if",
+    then,
+    elif,
+    @"else",
+    fi,
+};
+
+/// A compound-list: a sequence of AND/OR lists.
+///
+/// Reference: POSIX.1-2017 Section 2.9.3 Lists
+/// "A compound-list is a sequence of lists, separated by <newline>
+/// characters"
+///
+/// The exit status of a compound-list is the exit status of the last
+/// AND/OR list executed.
+pub const CompoundList = struct {
+    commands: []const AndOrList,
+};
+
+/// A condition-body pair used in if/elif branches.
+pub const ConditionBodyPair = struct {
+    condition: CompoundList,
+    body: CompoundList,
+};
+
+/// An if-elif-else construct.
+///
+/// Reference: POSIX.1-2017 Section 2.9.4.1 Compound Commands: if
+pub const IfClause = struct {
+    /// The condition and body for 'if' plus all 'elif' branches (in order).
+    /// There is always at least one branch (the initial 'if').
+    branches: []const ConditionBodyPair,
+    /// Optional 'else' body (null if no else clause).
+    else_body: ?CompoundList,
+
+    pub fn format(self: IfClause, writer: *std.io.Writer) std.io.Writer.Error!void {
+        for (self.branches, 0..) |branch, i| {
+            if (i == 0) {
+                try writer.writeAll("if ");
+            } else {
+                try writer.writeAll("elif ");
+            }
+            try formatCompoundList(branch.condition, writer);
+            try writer.writeAll("; then ");
+            try formatCompoundList(branch.body, writer);
+        }
+        if (self.else_body) |else_body| {
+            try writer.writeAll("; else ");
+            try formatCompoundList(else_body, writer);
+        }
+        try writer.writeAll("; fi");
+    }
+
+    fn formatCompoundList(cl: CompoundList, writer: *std.io.Writer) std.io.Writer.Error!void {
+        for (cl.commands, 0..) |cmd, i| {
+            if (i > 0) try writer.writeAll("; ");
+            try cmd.format(writer);
+        }
+    }
+};
+
 /// A single command in a pipeline (POSIX 2.9.2)
 ///
-/// Currently only simple commands are supported. Future additions will include
-/// compound commands (brace groups, subshells, if/while/for/case clauses) and
-/// function definitions per POSIX Section 2.9.5.
+/// Currently supports simple commands and if clauses. Future additions will
+/// include other compound commands (brace groups, subshells, while/for/case
+/// clauses) and function definitions per POSIX Section 2.9.5.
 pub const Command = union(enum) {
     simple: SimpleCommand,
+    if_clause: IfClause,
 
     pub fn format(self: Command, writer: *std.io.Writer) std.io.Writer.Error!void {
         switch (self) {
             .simple => |s| try s.format(writer),
+            .if_clause => |ic| try ic.format(writer),
         }
     }
 };
@@ -559,6 +627,28 @@ const ParserContext = union(enum) {
         items: std.ArrayListUnmanaged(AndOrItem),
     },
 
+    /// Parsing an if clause (POSIX 2.9.4.1)
+    if_clause: struct {
+        state: enum {
+            /// Parsing the condition compound-list (after 'if' or 'elif').
+            in_condition,
+            /// Parsing the body compound-list (after 'then').
+            in_body,
+            /// Parsing the else body compound-list (after 'else').
+            in_else,
+        },
+        /// Completed if/elif branches.
+        branches: std.ArrayListUnmanaged(ConditionBodyPair),
+        /// AND/OR lists for the current condition being built.
+        current_condition: std.ArrayListUnmanaged(AndOrList),
+        /// AND/OR lists for the current body being built.
+        current_body: std.ArrayListUnmanaged(AndOrList),
+        /// AND/OR lists for the else body being built.
+        else_body: std.ArrayListUnmanaged(AndOrList),
+        /// Filled by child and_or_list context when it completes.
+        completed_and_or: ?AndOrList,
+    },
+
     /// Initialize a pipeline context.
     fn initPipeline() ParserContext {
         return .{ .pipeline = .{
@@ -590,6 +680,18 @@ const ParserContext = union(enum) {
         } };
     }
 
+    /// Initialize an if_clause context.
+    fn initIfClause() ParserContext {
+        return .{ .if_clause = .{
+            .state = .in_condition,
+            .branches = .empty,
+            .current_condition = .empty,
+            .current_body = .empty,
+            .else_body = .empty,
+            .completed_and_or = null,
+        } };
+    }
+
     fn deinit(self: *ParserContext, allocator: Allocator) void {
         switch (self.*) {
             .pipeline => |*pl| {
@@ -603,6 +705,12 @@ const ParserContext = union(enum) {
             },
             .and_or_list => |*aol| {
                 aol.items.deinit(allocator);
+            },
+            .if_clause => |*ic| {
+                ic.branches.deinit(allocator);
+                ic.current_condition.deinit(allocator);
+                ic.current_body.deinit(allocator);
+                ic.else_body.deinit(allocator);
             },
         }
     }
@@ -997,7 +1105,9 @@ pub const Parser = struct {
 
     /// Peek a token from the lexer.
     fn peekToken(self: *Parser) !?lexer.Token {
-        if (self.peeked) |tok| return tok;
+        if (self.peeked) |tok| {
+            return tok;
+        }
         self.peeked = try self.lex.nextToken();
         return self.peeked;
     }
@@ -1031,6 +1141,17 @@ pub const Parser = struct {
         if (self.context_depth == 0) return null;
         self.context_depth -= 1;
         return self.context_stack[self.context_depth];
+    }
+
+    /// Check if a context of the given type exists in the context stack.
+    ///
+    /// This is used to determine if we're inside a compound command like
+    /// `if_clause`, which affects reserved word recognition.
+    fn hasContextInStack(self: *Parser, comptime context_tag: std.meta.Tag(ParserContext)) bool {
+        for (self.context_stack[0..self.context_depth]) |ctx| {
+            if (ctx == context_tag) return true;
+        }
+        return false;
     }
 
     /// Get a user-friendly error message for a lexer error.
@@ -1128,17 +1249,42 @@ pub const Parser = struct {
                     },
                     .done => {
                         // Finished parsing the AND/OR list.
-                        // If no items, return null (empty input)
+                        // Check if we have a parent context (if_clause) or are at root level.
+                        const parent = self.popContext();
+
                         if (and_or.items.items.len == 0) {
                             and_or.items.deinit(self.allocator);
+
+                            if (parent) |p| {
+                                switch (p) {
+                                    .if_clause => |*ic_val| {
+                                        // Empty and_or - continue if_clause without adding anything
+                                        var ic = ic_val.*;
+                                        ic.completed_and_or = null;
+                                        continue :state .{ .if_clause = ic };
+                                    },
+                                    .pipeline, .simple_command, .and_or_list => unreachable,
+                                }
+                            }
                             return null;
                         }
 
-                        return ParsedCommand{
-                            .and_or = AndOrList{
-                                .items = try and_or.items.toOwnedSlice(self.allocator),
-                            },
+                        const result = AndOrList{
+                            .items = try and_or.items.toOwnedSlice(self.allocator),
                         };
+
+                        if (parent) |p| {
+                            switch (p) {
+                                .if_clause => |*ic_val| {
+                                    var ic = ic_val.*;
+                                    ic.completed_and_or = result;
+                                    continue :state .{ .if_clause = ic };
+                                },
+                                .pipeline, .simple_command, .and_or_list => unreachable,
+                            }
+                        }
+
+                        return ParsedCommand{ .and_or = result };
                     },
                 }
             },
@@ -1374,10 +1520,8 @@ pub const Parser = struct {
                                 // Continue processing and_or_list
                                 continue :state next_context;
                             },
-                            .simple_command, .pipeline => {
-                                // You can't put a pipeline inside a simple
-                                // command or inside itself, it must be nested
-                                // in another structure.
+                            .simple_command, .pipeline, .if_clause => {
+                                // Pipeline should only pop to and_or_list.
                                 unreachable;
                             },
                         }
@@ -1626,6 +1770,51 @@ pub const Parser = struct {
                             continue :simple_command .start;
                         }
 
+                        // Reserved word check - only for first word of command with
+                        // no preceding assignments or redirections.
+                        // Reference: POSIX.1-2017 Section 2.4 Reserved Words
+                        // "when the word is used as: The first word of a command"
+                        if (simple_command.argv.items.len == 0 and
+                            simple_command.assignments.items.len == 0 and
+                            simple_command.redirections.items.len == 0)
+                        {
+                            if (isUnquotedReservedWord(word)) |reserved| {
+                                switch (reserved) {
+                                    .@"if" => {
+                                        // Swap simple_command for if_clause context.
+                                        // The pipeline parent remains on the stack.
+                                        // Clean up simple_command resources before swapping.
+                                        var ctx = ParserContext{ .simple_command = simple_command };
+                                        ctx.deinit(self.allocator);
+                                        continue :state ParserContext.initIfClause();
+                                    },
+                                    .then, .elif, .@"else", .fi => {
+                                        // These reserved words only terminate an if_clause.
+                                        // At root level (not inside if_clause), they're
+                                        // treated as regular command names.
+                                        if (self.hasContextInStack(.if_clause)) {
+                                            // Push the reserved word back as a Literal token
+                                            // for parent context (if_clause) to handle.
+                                            // Uses static memory from @tagName - safe because
+                                            // we only compare strings, don't index into source.
+                                            self.peeked = .{
+                                                .type = .{ .Literal = @tagName(reserved) },
+                                                .complete = true,
+                                                .position = simple_command.word_collector.start_position,
+                                                .end_position = simple_command.word_collector.start_position + @tagName(reserved).len,
+                                                .line = simple_command.word_collector.start_line,
+                                                .column = simple_command.word_collector.start_column,
+                                                .end_line = simple_command.word_collector.start_line,
+                                                .end_column = simple_command.word_collector.start_column + @tagName(reserved).len,
+                                            };
+                                            continue :simple_command .done;
+                                        }
+                                        // Fall through to treat as regular command name
+                                    },
+                                }
+                            }
+                        }
+
                         // Check if it's an assignment (only valid before command name)
                         if (!simple_command.seen_command) {
                             if (try self.tryBuildAssignment(word)) |assignment| {
@@ -1662,9 +1851,8 @@ pub const Parser = struct {
                         };
 
                         switch (next_context) {
-                            .simple_command, .and_or_list => {
-                                // You can't stack simple commands, and simple_command
-                                // should not pop to and_or_list directly.
+                            .simple_command, .and_or_list, .if_clause => {
+                                // simple_command should only pop to pipeline.
                                 unreachable;
                             },
                             .pipeline => |*pipeline| {
@@ -1676,6 +1864,164 @@ pub const Parser = struct {
                         continue :state next_context;
                     },
                 }
+            },
+            .if_clause => |if_clause_ctx| {
+                var ic = if_clause_ctx;
+
+                // Handle completed and_or from child context.
+                if (ic.completed_and_or) |result| {
+                    ic.completed_and_or = null;
+                    switch (ic.state) {
+                        .in_condition => try ic.current_condition.append(self.allocator, result),
+                        .in_body => try ic.current_body.append(self.allocator, result),
+                        .in_else => try ic.else_body.append(self.allocator, result),
+                    }
+                }
+
+                // Check for reserved word terminator that was pushed back by simple_command
+                const tok = self.peekToken() catch |err| {
+                    self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
+                    return err;
+                } orelse {
+                    // EOF inside if - error
+                    self.setError("syntax error: unexpected end of input (expected 'fi')", self.lex.position, self.lex.line, self.lex.column);
+                    return ParseError.UnexpectedEndOfInput;
+                };
+
+                // Check if it's a reserved word. Only consider complete tokens -
+                // when simple_command detects a reserved word like "fi", it pushes
+                // back a synthetic Literal token with complete=true. However, if
+                // the token came directly from the lexer (e.g., incomplete "fi" at
+                // EOF), it may have complete=false, meaning more content could follow
+                // (like "file"). We must wait for the complete word before matching.
+                const maybe_reserved: ?ReservedWord = switch (tok.type) {
+                    .Literal => |lit| if (tok.complete) std.meta.stringToEnum(ReservedWord, lit) else null,
+                    else => null,
+                };
+
+                if (maybe_reserved) |reserved| {
+                    switch (ic.state) {
+                        .in_condition => {
+                            if (reserved == .then) {
+                                _ = try self.consumeToken();
+                                if (ic.current_condition.items.len == 0) {
+                                    self.setError("syntax error: expected command before 'then'", tok.position, tok.line, tok.column);
+                                    return ParseError.UnsupportedSyntax;
+                                }
+                                ic.state = .in_body;
+                                self.pushContext(.{ .if_clause = ic });
+                                continue :state ParserContext.initAndOrList();
+                            } else {
+                                self.setError("syntax error: expected 'then'", tok.position, tok.line, tok.column);
+                                return ParseError.UnsupportedSyntax;
+                            }
+                        },
+                        .in_body => {
+                            switch (reserved) {
+                                .elif => {
+                                    _ = try self.consumeToken();
+                                    if (ic.current_body.items.len == 0) {
+                                        self.setError("syntax error: expected command before 'elif'", tok.position, tok.line, tok.column);
+                                        return ParseError.UnsupportedSyntax;
+                                    }
+                                    // Save current branch, start new condition
+                                    try ic.branches.append(self.allocator, .{
+                                        .condition = .{ .commands = try ic.current_condition.toOwnedSlice(self.allocator) },
+                                        .body = .{ .commands = try ic.current_body.toOwnedSlice(self.allocator) },
+                                    });
+                                    ic.current_condition = .empty;
+                                    ic.current_body = .empty;
+                                    ic.state = .in_condition;
+                                    self.pushContext(.{ .if_clause = ic });
+                                    continue :state ParserContext.initAndOrList();
+                                },
+                                .@"else" => {
+                                    _ = try self.consumeToken();
+                                    if (ic.current_body.items.len == 0) {
+                                        self.setError("syntax error: expected command before 'else'", tok.position, tok.line, tok.column);
+                                        return ParseError.UnsupportedSyntax;
+                                    }
+                                    // Save current branch, start else body
+                                    try ic.branches.append(self.allocator, .{
+                                        .condition = .{ .commands = try ic.current_condition.toOwnedSlice(self.allocator) },
+                                        .body = .{ .commands = try ic.current_body.toOwnedSlice(self.allocator) },
+                                    });
+                                    ic.current_condition = .empty;
+                                    ic.current_body = .empty;
+                                    ic.state = .in_else;
+                                    self.pushContext(.{ .if_clause = ic });
+                                    continue :state ParserContext.initAndOrList();
+                                },
+                                .fi => {
+                                    _ = try self.consumeToken();
+                                    if (ic.current_body.items.len == 0) {
+                                        self.setError("syntax error: expected command before 'fi'", tok.position, tok.line, tok.column);
+                                        return ParseError.UnsupportedSyntax;
+                                    }
+                                    // Save final branch, complete if_clause
+                                    try ic.branches.append(self.allocator, .{
+                                        .condition = .{ .commands = try ic.current_condition.toOwnedSlice(self.allocator) },
+                                        .body = .{ .commands = try ic.current_body.toOwnedSlice(self.allocator) },
+                                    });
+                                    const result = IfClause{
+                                        .branches = try ic.branches.toOwnedSlice(self.allocator),
+                                        .else_body = null,
+                                    };
+                                    // Pop to pipeline, add command
+                                    var parent = self.popContext() orelse unreachable;
+                                    switch (parent) {
+                                        .pipeline => |*pl| {
+                                            try pl.commands.append(self.allocator, .{ .if_clause = result });
+                                            continue :state parent;
+                                        },
+                                        .simple_command, .and_or_list, .if_clause => unreachable,
+                                    }
+                                },
+                                .@"if" => {
+                                    // Nested if - let and_or_list handle it
+                                    self.pushContext(.{ .if_clause = ic });
+                                    continue :state ParserContext.initAndOrList();
+                                },
+                                .then => {
+                                    self.setError("syntax error: unexpected 'then'", tok.position, tok.line, tok.column);
+                                    return ParseError.UnsupportedSyntax;
+                                },
+                            }
+                        },
+                        .in_else => {
+                            if (reserved == .fi) {
+                                _ = try self.consumeToken();
+                                if (ic.else_body.items.len == 0) {
+                                    self.setError("syntax error: expected command before 'fi'", tok.position, tok.line, tok.column);
+                                    return ParseError.UnsupportedSyntax;
+                                }
+                                const result = IfClause{
+                                    .branches = try ic.branches.toOwnedSlice(self.allocator),
+                                    .else_body = .{ .commands = try ic.else_body.toOwnedSlice(self.allocator) },
+                                };
+                                var parent = self.popContext() orelse unreachable;
+                                switch (parent) {
+                                    .pipeline => |*pl| {
+                                        try pl.commands.append(self.allocator, .{ .if_clause = result });
+                                        continue :state parent;
+                                    },
+                                    .simple_command, .and_or_list, .if_clause => unreachable,
+                                }
+                            } else if (reserved == .@"if") {
+                                // Nested if in else - let and_or_list handle it
+                                self.pushContext(.{ .if_clause = ic });
+                                continue :state ParserContext.initAndOrList();
+                            } else {
+                                self.setError("syntax error: unexpected reserved word after 'else'", tok.position, tok.line, tok.column);
+                                return ParseError.UnsupportedSyntax;
+                            }
+                        },
+                    }
+                }
+
+                // Not a reserved word - push and_or_list to parse more commands
+                self.pushContext(.{ .if_clause = ic });
+                continue :state ParserContext.initAndOrList();
             },
         }
     }
@@ -1700,7 +2046,8 @@ pub const Parser = struct {
                 return cmd;
             }
             // Check if there are more tokens.
-            if (try self.peekToken() == null) {
+            const peeked = try self.peekToken();
+            if (peeked == null) {
                 return null;
             }
             // Another command is coming.
@@ -1848,6 +2195,31 @@ pub const Parser = struct {
         return true;
     }
 
+    /// Checks if a word is an unquoted reserved word.
+    ///
+    /// Reserved words are only recognized when:
+    /// 1. The word consists of exactly one part
+    /// 2. That part is a literal (no quoting or expansions)
+    /// 3. The text matches a reserved word exactly
+    ///
+    /// Note: WordCollector already concatenates continuation tokens into single
+    /// literal parts, so we don't need to handle multi-part literals here.
+    /// A reserved word split by buffer boundaries (e.g., "i" + "f") becomes
+    /// a single literal "if" after word collection.
+    ///
+    /// Reference: POSIX.1-2017 Section 2.4 Reserved Words
+    /// "This recognition shall only occur when none of the characters
+    /// are quoted"
+    fn isUnquotedReservedWord(word: Word) ?ReservedWord {
+        // Reserved word must be a single unquoted literal part
+        if (word.parts.len != 1) return null;
+
+        return switch (word.parts[0]) {
+            .literal => |lit| std.meta.stringToEnum(ReservedWord, lit),
+            else => null,
+        };
+    }
+
     /// Set error information.
     fn setError(self: *Parser, message: []const u8, position: usize, line: usize, column: usize) void {
         self.error_info = ErrorInfo{
@@ -1991,6 +2363,7 @@ fn expectSimpleCommand(
         try std.testing.expectEqual(@as(usize, 1), pipeline.commands.len);
         break :blk switch (pipeline.commands[0]) {
             .simple => |s| s,
+            .if_clause => return error.ExpectedSimpleCommand,
         };
     };
 
@@ -2037,6 +2410,7 @@ fn expectCloseTarget(target: RedirectionTarget) !void {
 fn getFirstSimpleCommand(cmd: ParsedCommand) SimpleCommand {
     return switch (getPipeline(cmd).commands[0]) {
         .simple => |s| s,
+        .if_clause => unreachable,
     };
 }
 
@@ -3558,6 +3932,7 @@ test "ParsedCommand: accessing pipeline through and_or" {
     try std.testing.expectEqual(@as(usize, 1), pipeline.commands.len);
     const simple = switch (pipeline.commands[0]) {
         .simple => |s| s,
+        .if_clause => unreachable,
     };
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
     try std.testing.expectEqualStrings("echo", simple.argv[0].parts[0].literal);
@@ -3892,6 +4267,7 @@ test "parseCommand: bang followed by quote is command name" {
 
     const simple = switch (pipeline.commands[0]) {
         .simple => |s| s,
+        .if_clause => unreachable,
     };
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     // Word should have "!" literal part and "foo" quoted part
@@ -3918,6 +4294,7 @@ test "parseCommand: bang followed by expansion is command name" {
 
     const simple = switch (pipeline.commands[0]) {
         .simple => |s| s,
+        .if_clause => unreachable,
     };
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     // Word should have "!" literal part and parameter expansion part
@@ -4149,4 +4526,291 @@ test "parseCommand: semicolon terminates and_or list" {
     // Second command: c
     const result2 = (try parser_inst.parseCommand()).?;
     try std.testing.expectEqual(@as(usize, 1), result2.and_or.items.len);
+}
+
+// --- If statement tests ---
+
+/// Helper to extract the first IfClause from a ParsedCommand.
+fn getFirstIfClause(cmd: ParsedCommand) IfClause {
+    return switch (getPipeline(cmd).commands[0]) {
+        .if_clause => |ic| ic,
+        .simple => unreachable,
+    };
+}
+
+test "parseCommand: simple if statement" {
+    // if true; then echo yes; fi
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if true; then echo yes; fi\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    // Use next() like dumpAst does
+    const result = try parser_inst.next();
+    try std.testing.expect(result != null);
+
+    const ic = getFirstIfClause(result.?);
+
+    // Should have exactly 1 branch (the if branch)
+    try std.testing.expectEqual(@as(usize, 1), ic.branches.len);
+    // No else body
+    try std.testing.expect(ic.else_body == null);
+
+    // Condition should have 1 and_or list with "true"
+    try std.testing.expectEqual(@as(usize, 1), ic.branches[0].condition.commands.len);
+    // Body should have 1 and_or list with "echo yes"
+    try std.testing.expectEqual(@as(usize, 1), ic.branches[0].body.commands.len);
+
+    // After the if statement, next() should return null (no more commands)
+    const next_result = try parser_inst.next();
+    try std.testing.expect(next_result == null);
+}
+
+test "parseCommand: simple if statement (no trailing newline)" {
+    // Tests that parsing "if ... fi" without a trailing newline works correctly.
+    // This is the scenario used by --dump-ast mode.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const command_line = "if true; then echo yes; fi";
+
+    var reader = std.io.Reader.fixed(command_line);
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    var command_count: usize = 0;
+    while (try parser_inst.next()) |_| {
+        command_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), command_count);
+}
+
+test "parseCommand: if-else statement" {
+    // if false; then echo a; else echo b; fi
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if false; then echo a; else echo b; fi\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    try std.testing.expect(result != null);
+
+    const ic = getFirstIfClause(result.?);
+
+    // Should have exactly 1 branch
+    try std.testing.expectEqual(@as(usize, 1), ic.branches.len);
+    // Should have else body
+    try std.testing.expect(ic.else_body != null);
+    try std.testing.expectEqual(@as(usize, 1), ic.else_body.?.commands.len);
+}
+
+test "parseCommand: if-elif statement" {
+    // if false; then echo 1; elif true; then echo 2; fi
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if false; then echo 1; elif true; then echo 2; fi\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    try std.testing.expect(result != null);
+
+    const ic = getFirstIfClause(result.?);
+
+    // Should have 2 branches (if + elif)
+    try std.testing.expectEqual(@as(usize, 2), ic.branches.len);
+    // No else body
+    try std.testing.expect(ic.else_body == null);
+}
+
+test "parseCommand: if-elif-else statement" {
+    // if false; then echo 1; elif false; then echo 2; else echo 3; fi
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if false; then echo 1; elif false; then echo 2; else echo 3; fi\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    try std.testing.expect(result != null);
+
+    const ic = getFirstIfClause(result.?);
+
+    // Should have 2 branches
+    try std.testing.expectEqual(@as(usize, 2), ic.branches.len);
+    // Should have else body
+    try std.testing.expect(ic.else_body != null);
+}
+
+test "parseCommand: if with multiple commands in condition" {
+    // if echo a; echo b; then echo c; fi
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if echo a; echo b; then echo c; fi\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    try std.testing.expect(result != null);
+
+    const ic = getFirstIfClause(result.?);
+
+    // Condition should have 2 and_or lists
+    try std.testing.expectEqual(@as(usize, 2), ic.branches[0].condition.commands.len);
+}
+
+test "parseCommand: if with multiple commands in body" {
+    // if true; then echo a; echo b; fi
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if true; then echo a; echo b; fi\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    try std.testing.expect(result != null);
+
+    const ic = getFirstIfClause(result.?);
+
+    // Body should have 2 and_or lists
+    try std.testing.expectEqual(@as(usize, 2), ic.branches[0].body.commands.len);
+}
+
+test "parseCommand: nested if statement" {
+    // if true; then if true; then echo nested; fi; fi
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if true; then if true; then echo nested; fi; fi\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    try std.testing.expect(result != null);
+
+    const ic = getFirstIfClause(result.?);
+
+    // Outer if has 1 branch
+    try std.testing.expectEqual(@as(usize, 1), ic.branches.len);
+    // Body has 1 command which is another if_clause
+    try std.testing.expectEqual(@as(usize, 1), ic.branches[0].body.commands.len);
+    const body_pipeline = ic.branches[0].body.commands[0].items[0].pipeline;
+    try std.testing.expectEqual(@as(usize, 1), body_pipeline.commands.len);
+    try std.testing.expect(body_pipeline.commands[0] == .if_clause);
+}
+
+test "parseCommand: quoted 'then' is not reserved word" {
+    // if 'then'; then echo yes; fi - 'then' is quoted so it's a command
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if 'then'; then echo yes; fi\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    try std.testing.expect(result != null);
+
+    const ic = getFirstIfClause(result.?);
+
+    // Condition should contain the command 'then'
+    try std.testing.expectEqual(@as(usize, 1), ic.branches[0].condition.commands.len);
+}
+
+test "parseCommand: if with newlines" {
+    // Multi-line if statement
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if true\nthen\necho yes\nfi\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    try std.testing.expect(result != null);
+
+    const ic = getFirstIfClause(result.?);
+    try std.testing.expectEqual(@as(usize, 1), ic.branches.len);
+}
+
+test "parseCommand: if then (no condition) is syntax error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if then echo yes; fi\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = parser_inst.parseCommand();
+    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
+    const err = parser_inst.getErrorInfo();
+    try std.testing.expect(err != null);
+    try std.testing.expectEqualStrings("syntax error: expected command before 'then'", err.?.message);
+}
+
+test "parseCommand: if without fi is syntax error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if true; then echo yes\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = parser_inst.parseCommand();
+    try std.testing.expectError(ParseError.UnexpectedEndOfInput, result);
+}
+
+test "parseCommand: if with empty body is syntax error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if true; then fi\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = parser_inst.parseCommand();
+    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
+}
+
+test "parseCommand: fi at root level is regular command" {
+    // Reserved words like 'fi' are only recognized inside their respective
+    // compound commands. At root level (not inside an if_clause), 'fi' is
+    // treated as a regular command name.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("fi\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    try std.testing.expect(result != null);
+    // It's a simple command with argv[0] = "fi"
+    const simple = getFirstSimpleCommand(result.?);
+    try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
+    try std.testing.expectEqualStrings("fi", simple.argv[0].parts[0].literal);
+}
+
+test "parseCommand: assignment before then is valid condition" {
+    // if FOO=bar; then echo $FOO; fi
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if FOO=bar; then echo yes; fi\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.parseCommand();
+    try std.testing.expect(result != null);
+
+    const ic = getFirstIfClause(result.?);
+    try std.testing.expectEqual(@as(usize, 1), ic.branches.len);
 }

@@ -423,6 +423,10 @@ pub const Executor = struct {
             const is_last = (i == cmds.len - 1);
             const simple = switch (cmd) {
                 .simple => |s| s,
+                .if_clause => {
+                    printError("if statements are not yet implemented\n", .{});
+                    return ExecuteError.NotImplemented;
+                },
             };
 
             // Expand argv in parent (needed to check for builtins in pipeline stages)
@@ -570,10 +574,13 @@ pub const Executor = struct {
         else if (pipeline.commands.len == 1) blk: {
             // Single-command "pipeline" - execute in current environment.
             // This ensures builtins like cd, export, exit work correctly.
-            const simple = switch (pipeline.commands[0]) {
-                .simple => |s| s,
+            break :blk switch (pipeline.commands[0]) {
+                .simple => |s| try self.execute(s),
+                .if_clause => {
+                    printError("if statements are not yet implemented\n", .{});
+                    return ExecuteError.NotImplemented;
+                },
             };
-            break :blk try self.execute(simple);
         } else
             // Multi-command pipeline - all stages run in subshells
             try self.executePipeline(pipeline);
