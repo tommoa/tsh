@@ -15,6 +15,8 @@ pub const TestError = error{
     UnknownOperator,
     /// Too many arguments for the expression structure.
     TooManyArguments,
+    /// An integer was expected but the operand could not be parsed as one.
+    IntegerExpected,
 };
 
 /// Unary operators for test expressions.
@@ -29,12 +31,33 @@ const UnaryOp = enum {
 
 /// Binary operators for test expressions.
 const BinaryOp = enum {
+    // String operators
     /// =: "True if the strings s1 and s2 are identical."
     /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
     str_equal,
     /// !=: "True if the strings s1 and s2 are not identical."
     /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
     str_not_equal,
+
+    // Integer operators
+    /// -eq: "True if the integers n1 and n2 are algebraically equal."
+    /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
+    int_eq,
+    /// -ne: "True if the integers n1 and n2 are not algebraically equal."
+    /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
+    int_ne,
+    /// -lt: "True if the integer n1 is algebraically less than the integer n2."
+    /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
+    int_lt,
+    /// -le: "True if the integer n1 is algebraically less than or equal to the integer n2."
+    /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
+    int_le,
+    /// -gt: "True if the integer n1 is algebraically greater than the integer n2."
+    /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
+    int_gt,
+    /// -ge: "True if the integer n1 is algebraically greater than or equal to the integer n2."
+    /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
+    int_ge,
 };
 
 /// Evaluate a test expression per POSIX.1-2017 argument-count algorithm.
@@ -99,7 +122,7 @@ pub fn evaluate(args: []const []const u8) TestError!bool {
             const a3 = args[pos + 2];
 
             if (binaryOp(a2)) |op| {
-                const result = evalBinary(op, a1, a3);
+                const result = try evalBinary(op, a1, a3);
                 return if (negate) !result else result;
             }
 
@@ -159,6 +182,12 @@ fn binaryOp(s: []const u8) ?BinaryOp {
     const ops = std.StaticStringMap(BinaryOp).initComptime(.{
         .{ "=", .str_equal },
         .{ "!=", .str_not_equal },
+        .{ "-eq", .int_eq },
+        .{ "-ne", .int_ne },
+        .{ "-lt", .int_lt },
+        .{ "-le", .int_le },
+        .{ "-gt", .int_gt },
+        .{ "-ge", .int_ge },
     });
     return ops.get(s);
 }
@@ -172,10 +201,23 @@ fn evalUnary(op: UnaryOp, operand: []const u8) bool {
 }
 
 /// Evaluate a binary operator.
-fn evalBinary(op: BinaryOp, left: []const u8, right: []const u8) bool {
+fn evalBinary(op: BinaryOp, left: []const u8, right: []const u8) TestError!bool {
     return switch (op) {
         .str_equal => std.mem.eql(u8, left, right),
         .str_not_equal => !std.mem.eql(u8, left, right),
+        .int_eq, .int_ne, .int_lt, .int_le, .int_gt, .int_ge => {
+            const l = std.fmt.parseInt(i64, left, 10) catch return error.IntegerExpected;
+            const r = std.fmt.parseInt(i64, right, 10) catch return error.IntegerExpected;
+            return switch (op) {
+                .int_eq => l == r,
+                .int_ne => l != r,
+                .int_lt => l < r,
+                .int_le => l <= r,
+                .int_gt => l > r,
+                .int_ge => l >= r,
+                else => unreachable,
+            };
+        },
     };
 }
 
@@ -337,4 +379,103 @@ test ">4 args: with leading ! strips and continues" {
 
 test ">4 args: without valid structure is error" {
     try testing.expectError(error.TooManyArguments, evaluate(&.{ "a", "b", "c", "d", "e" }));
+}
+
+// === Integer comparisons ===
+// POSIX.1-2017: "True if the integers n1 and n2 are algebraically [comparison]."
+
+test "3 args: -eq equal" {
+    try testing.expectEqual(true, try evaluate(&.{ "5", "-eq", "5" }));
+}
+
+test "3 args: -eq not equal" {
+    try testing.expectEqual(false, try evaluate(&.{ "5", "-eq", "10" }));
+}
+
+test "3 args: -ne not equal" {
+    try testing.expectEqual(true, try evaluate(&.{ "5", "-ne", "10" }));
+}
+
+test "3 args: -ne equal" {
+    try testing.expectEqual(false, try evaluate(&.{ "5", "-ne", "5" }));
+}
+
+test "3 args: -lt less" {
+    try testing.expectEqual(true, try evaluate(&.{ "5", "-lt", "10" }));
+}
+
+test "3 args: -lt equal" {
+    try testing.expectEqual(false, try evaluate(&.{ "5", "-lt", "5" }));
+}
+
+test "3 args: -lt greater" {
+    try testing.expectEqual(false, try evaluate(&.{ "10", "-lt", "5" }));
+}
+
+test "3 args: -le less" {
+    try testing.expectEqual(true, try evaluate(&.{ "5", "-le", "10" }));
+}
+
+test "3 args: -le equal" {
+    try testing.expectEqual(true, try evaluate(&.{ "5", "-le", "5" }));
+}
+
+test "3 args: -le greater" {
+    try testing.expectEqual(false, try evaluate(&.{ "10", "-le", "5" }));
+}
+
+test "3 args: -gt greater" {
+    try testing.expectEqual(true, try evaluate(&.{ "10", "-gt", "5" }));
+}
+
+test "3 args: -gt equal" {
+    try testing.expectEqual(false, try evaluate(&.{ "5", "-gt", "5" }));
+}
+
+test "3 args: -gt less" {
+    try testing.expectEqual(false, try evaluate(&.{ "5", "-gt", "10" }));
+}
+
+test "3 args: -ge greater" {
+    try testing.expectEqual(true, try evaluate(&.{ "10", "-ge", "5" }));
+}
+
+test "3 args: -ge equal" {
+    try testing.expectEqual(true, try evaluate(&.{ "5", "-ge", "5" }));
+}
+
+test "3 args: -ge less" {
+    try testing.expectEqual(false, try evaluate(&.{ "5", "-ge", "10" }));
+}
+
+// Negative numbers (algebraic comparison)
+test "3 args: -lt with negative numbers" {
+    try testing.expectEqual(true, try evaluate(&.{ "-10", "-lt", "5" }));
+    try testing.expectEqual(true, try evaluate(&.{ "-10", "-lt", "-5" }));
+}
+
+test "3 args: -eq with negative numbers" {
+    try testing.expectEqual(true, try evaluate(&.{ "-5", "-eq", "-5" }));
+}
+
+// Error cases
+test "3 args: -eq with non-integer left" {
+    try testing.expectError(error.IntegerExpected, evaluate(&.{ "foo", "-eq", "5" }));
+}
+
+test "3 args: -eq with non-integer right" {
+    try testing.expectError(error.IntegerExpected, evaluate(&.{ "5", "-eq", "bar" }));
+}
+
+test "3 args: -eq with empty string" {
+    try testing.expectError(error.IntegerExpected, evaluate(&.{ "", "-eq", "5" }));
+}
+
+// With negation
+test "4 args: ! 5 -eq 5 is false" {
+    try testing.expectEqual(false, try evaluate(&.{ "!", "5", "-eq", "5" }));
+}
+
+test "4 args: ! 5 -lt 3 is true" {
+    try testing.expectEqual(true, try evaluate(&.{ "!", "5", "-lt", "3" }));
 }
