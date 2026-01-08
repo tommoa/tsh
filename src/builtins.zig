@@ -10,16 +10,18 @@
 //! - Errors in special builtins may cause the shell to exit
 //!
 //! Currently implemented builtins:
-//! - exit: Exit the shell (Section 2.14.1)
 //! - cd: Change working directory (Section 2.14.1)
-//! - pwd: Print working directory (Section 2.14.1)
+//! - exit: Exit the shell (Section 2.14.1)
 //! - export: Export variables to the environment (Section 2.14.1)
+//! - pwd: Print working directory (Section 2.14.1)
+//! - test/[: Evaluate conditional expressions (Section 4 Utilities)
 //! - unset: Unset variables (Section 2.14.1)
 
 const std = @import("std");
 const posix = std.posix;
 const state = @import("state.zig");
 const options = @import("options.zig");
+const builtin_test = @import("builtin_test.zig");
 const ShellState = state.ShellState;
 const printError = state.printError;
 
@@ -35,10 +37,12 @@ pub const BuiltinResult = struct {
 ///
 /// Use `fromName` to look up a builtin by name, and `run` to execute it.
 pub const Builtin = enum {
-    exit,
+    @"[",
     cd,
-    pwd,
+    exit,
     @"export",
+    pwd,
+    @"test",
     unset,
 
     /// Look up a builtin by name.
@@ -53,10 +57,12 @@ pub const Builtin = enum {
     /// Args should include the command name as args[0].
     pub fn run(self: Builtin, args: []const []const u8, shell: *ShellState) BuiltinResult {
         return switch (self) {
-            .exit => runExit(args, shell),
+            .@"[" => runBracket(args),
             .cd => runCd(args, shell),
-            .pwd => runPwd(args, shell),
+            .exit => runExit(args, shell),
             .@"export" => runExport(args, shell),
+            .pwd => runPwd(args, shell),
+            .@"test" => runTest(args),
             .unset => runUnset(args, shell),
         };
     }
@@ -491,6 +497,70 @@ fn runUnset(args: []const []const u8, shell: *ShellState) BuiltinResult {
     return .{ .exit_code = if (had_error) 1 else 0 };
 }
 
+/// test expression
+///
+/// Evaluate a conditional expression and return an exit status of 0 (true)
+/// or 1 (false). Returns 2 if an error occurs.
+///
+/// POSIX Reference: Section 4 Utilities - test
+fn runTest(args: []const []const u8) BuiltinResult {
+    // Skip argv[0] ("test")
+    const test_args = if (args.len > 0) args[1..] else args;
+
+    const result = builtin_test.evaluate(test_args) catch |err| {
+        printTestError("test", err);
+        // POSIX.1-2017 Section 4 Utilities, test, EXIT STATUS:
+        // ">1: An error occurred."
+        return .{ .exit_code = 2 };
+    };
+
+    // POSIX.1-2017 Section 4 Utilities, test, EXIT STATUS:
+    // "0: expression evaluated to true."
+    // "1: expression evaluated to false or expression was missing."
+    return .{ .exit_code = if (result) 0 else 1 };
+}
+
+/// [ expression ]
+///
+/// Alternate form of test. The closing bracket ] must be present as the
+/// last argument.
+///
+/// POSIX Reference: Section 4 Utilities - test
+fn runBracket(args: []const []const u8) BuiltinResult {
+    // Skip argv[0] ("[")
+    const test_args = if (args.len > 0) args[1..] else args;
+
+    // POSIX.1-2017 Section 4 Utilities, test, DESCRIPTION:
+    // "the application shall ensure that the closing square bracket
+    // is a separate argument"
+    if (test_args.len == 0 or !std.mem.eql(u8, test_args[test_args.len - 1], "]")) {
+        printError("[: missing ']'\n", .{});
+        return .{ .exit_code = 2 };
+    }
+
+    // POSIX.1-2017 Section 4 Utilities, test, OPERANDS:
+    // "when using the "[...]" form, the <right-square-bracket> final argument
+    // shall not be counted in this algorithm"
+    const inner_args = test_args[0 .. test_args.len - 1];
+
+    const result = builtin_test.evaluate(inner_args) catch |err| {
+        printTestError("[", err);
+        return .{ .exit_code = 2 };
+    };
+
+    return .{ .exit_code = if (result) 0 else 1 };
+}
+
+/// Print an error message for test/[ builtin errors.
+fn printTestError(name: []const u8, err: builtin_test.TestError) void {
+    const msg = switch (err) {
+        error.IntegerExpected => "integer expected",
+        error.UnknownOperator => "unknown operator",
+        error.TooManyArguments => "too many arguments",
+    };
+    printError("{s}: {s}\n", .{ name, msg });
+}
+
 /// Check if a string is a valid shell identifier.
 ///
 /// Valid identifiers match: [A-Za-z_][A-Za-z0-9_]*
@@ -520,10 +590,12 @@ test {
 }
 
 test "Builtin.fromName: recognizes builtins" {
-    try std.testing.expectEqual(Builtin.exit, Builtin.fromName("exit").?);
+    try std.testing.expectEqual(Builtin.@"[", Builtin.fromName("[").?);
     try std.testing.expectEqual(Builtin.cd, Builtin.fromName("cd").?);
-    try std.testing.expectEqual(Builtin.pwd, Builtin.fromName("pwd").?);
+    try std.testing.expectEqual(Builtin.exit, Builtin.fromName("exit").?);
     try std.testing.expectEqual(Builtin.@"export", Builtin.fromName("export").?);
+    try std.testing.expectEqual(Builtin.pwd, Builtin.fromName("pwd").?);
+    try std.testing.expectEqual(Builtin.@"test", Builtin.fromName("test").?);
     try std.testing.expectEqual(Builtin.unset, Builtin.fromName("unset").?);
 }
 
@@ -632,4 +704,88 @@ test "runExit: negative values wrap correctly" {
     const result_neg256 = runExit(&[_][]const u8{ "exit", "-256" }, &shell);
     try std.testing.expect(result_neg256.should_exit);
     try std.testing.expectEqual(@as(u8, 0), result_neg256.exit_code);
+}
+
+// --- test builtin tests ---
+
+test "runTest: returns 0 for true expression" {
+    const result = runTest(&[_][]const u8{ "test", "-n", "hello" });
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(!result.should_exit);
+}
+
+test "runTest: returns 1 for false expression" {
+    const result = runTest(&[_][]const u8{ "test", "-z", "hello" });
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+}
+
+test "runTest: returns 1 for empty expression" {
+    // POSIX: "0 arguments: Exit false (1)."
+    const result = runTest(&[_][]const u8{"test"});
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+}
+
+test "runTest: returns 2 for error" {
+    // Too many arguments causes an error
+    const result = runTest(&[_][]const u8{ "test", "a", "b", "c", "d", "e" });
+    try std.testing.expectEqual(@as(u8, 2), result.exit_code);
+}
+
+test "runTest: string equality" {
+    const result_true = runTest(&[_][]const u8{ "test", "foo", "=", "foo" });
+    try std.testing.expectEqual(@as(u8, 0), result_true.exit_code);
+
+    const result_false = runTest(&[_][]const u8{ "test", "foo", "=", "bar" });
+    try std.testing.expectEqual(@as(u8, 1), result_false.exit_code);
+}
+
+test "runTest: integer comparison" {
+    const result = runTest(&[_][]const u8{ "test", "5", "-lt", "10" });
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "runTest: file test -d /tmp" {
+    const result = runTest(&[_][]const u8{ "test", "-d", "/tmp" });
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+// --- [ builtin tests ---
+
+test "runBracket: returns 0 for true expression" {
+    const result = runBracket(&[_][]const u8{ "[", "-n", "hello", "]" });
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(!result.should_exit);
+}
+
+test "runBracket: returns 1 for false expression" {
+    const result = runBracket(&[_][]const u8{ "[", "-z", "hello", "]" });
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+}
+
+test "runBracket: returns 2 for missing ]" {
+    const result = runBracket(&[_][]const u8{ "[", "-n", "hello" });
+    try std.testing.expectEqual(@as(u8, 2), result.exit_code);
+}
+
+test "runBracket: returns 2 for empty args (no ])" {
+    const result = runBracket(&[_][]const u8{"["});
+    try std.testing.expectEqual(@as(u8, 2), result.exit_code);
+}
+
+test "runBracket: empty expression with ] returns 1" {
+    // [ ] is equivalent to test with 0 args -> false
+    const result = runBracket(&[_][]const u8{ "[", "]" });
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+}
+
+test "runBracket: string equality" {
+    const result = runBracket(&[_][]const u8{ "[", "foo", "=", "foo", "]" });
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "runBracket: ] in wrong position is not closing bracket" {
+    // [ ] = ] ] - the middle ] is treated as an operand, last ] is the closer
+    // This is "test ] = ]" which is string equality, should be true
+    const result = runBracket(&[_][]const u8{ "[", "]", "=", "]", "]" });
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
