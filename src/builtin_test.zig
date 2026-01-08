@@ -21,12 +21,46 @@ pub const TestError = error{
 
 /// Unary operators for test expressions.
 const UnaryOp = enum {
+    // String operators
     /// -n: "True if the length of string is non-zero."
     /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
     str_not_empty,
     /// -z: "True if the length of string is zero."
     /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
     str_empty,
+
+    // File operators
+    /// -e: "True if pathname resolves to an existing directory entry.
+    /// False if pathname cannot be resolved."
+    /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
+    file_exists,
+    /// -f: "True if pathname resolves to an existing directory entry for a regular file.
+    /// False if pathname cannot be resolved, or if pathname resolves to an existing
+    /// directory entry for a file that is not a regular file."
+    /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
+    file_is_regular,
+    /// -d: "True if pathname resolves to an existing directory entry for a directory.
+    /// False if pathname cannot be resolved, or if pathname resolves to an existing
+    /// directory entry for a file that is not a directory."
+    /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
+    file_is_dir,
+    /// -r: "True if pathname resolves to an existing directory entry for a file
+    /// for which permission to read from the file will be granted."
+    /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
+    file_is_readable,
+    /// -w: "True if pathname resolves to an existing directory entry for a file
+    /// for which permission to write to the file will be granted."
+    /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
+    file_is_writable,
+    /// -x: "True if pathname resolves to an existing directory entry for a file
+    /// for which permission to execute the file (or search it, if it is a directory)
+    /// will be granted."
+    /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
+    file_is_executable,
+    /// -s: "True if pathname resolves to an existing directory entry for a file
+    /// that has a size greater than zero."
+    /// POSIX.1-2017 Section 4 Utilities, test, OPERANDS
+    file_not_empty,
 };
 
 /// Binary operators for test expressions.
@@ -171,8 +205,17 @@ pub fn evaluate(args: []const []const u8) TestError!bool {
 /// Look up a unary operator by its string representation.
 fn unaryOp(s: []const u8) ?UnaryOp {
     const ops = std.StaticStringMap(UnaryOp).initComptime(.{
+        // String operators
         .{ "-n", .str_not_empty },
         .{ "-z", .str_empty },
+        // File operators
+        .{ "-e", .file_exists },
+        .{ "-f", .file_is_regular },
+        .{ "-d", .file_is_dir },
+        .{ "-r", .file_is_readable },
+        .{ "-w", .file_is_writable },
+        .{ "-x", .file_is_executable },
+        .{ "-s", .file_not_empty },
     });
     return ops.get(s);
 }
@@ -197,7 +240,74 @@ fn evalUnary(op: UnaryOp, operand: []const u8) bool {
     return switch (op) {
         .str_not_empty => operand.len > 0,
         .str_empty => operand.len == 0,
+        .file_exists => fileExists(operand),
+        .file_is_regular => fileIsRegular(operand),
+        .file_is_dir => fileIsDir(operand),
+        .file_is_readable => fileIsReadable(operand),
+        .file_is_writable => fileIsWritable(operand),
+        .file_is_executable => fileIsExecutable(operand),
+        .file_not_empty => fileNotEmpty(operand),
     };
+}
+
+// --- File test helper functions ---
+// These implement POSIX.1-2017 file test primaries.
+// Per POSIX, file tests return false (not error) when pathname cannot be resolved.
+
+const posix = std.posix;
+
+/// -e: True if pathname resolves to an existing directory entry.
+fn fileExists(path: []const u8) bool {
+    const path_z = posix.toPosixPath(path) catch return false;
+    posix.faccessatZ(posix.AT.FDCWD, &path_z, posix.F_OK, 0) catch return false;
+    return true;
+}
+
+/// -f: True if pathname resolves to an existing directory entry for a regular file.
+fn fileIsRegular(path: []const u8) bool {
+    const path_z = posix.toPosixPath(path) catch return false;
+    const stat = posix.fstatatZ(posix.AT.FDCWD, &path_z, 0) catch return false;
+    return stat.mode & posix.S.IFMT == posix.S.IFREG;
+}
+
+/// -d: True if pathname resolves to an existing directory entry for a directory.
+fn fileIsDir(path: []const u8) bool {
+    const path_z = posix.toPosixPath(path) catch return false;
+    const stat = posix.fstatatZ(posix.AT.FDCWD, &path_z, 0) catch return false;
+    return stat.mode & posix.S.IFMT == posix.S.IFDIR;
+}
+
+/// -r: True if pathname resolves to an existing directory entry for a file
+/// for which permission to read from the file will be granted.
+fn fileIsReadable(path: []const u8) bool {
+    const path_z = posix.toPosixPath(path) catch return false;
+    posix.faccessatZ(posix.AT.FDCWD, &path_z, posix.R_OK, 0) catch return false;
+    return true;
+}
+
+/// -w: True if pathname resolves to an existing directory entry for a file
+/// for which permission to write to the file will be granted.
+fn fileIsWritable(path: []const u8) bool {
+    const path_z = posix.toPosixPath(path) catch return false;
+    posix.faccessatZ(posix.AT.FDCWD, &path_z, posix.W_OK, 0) catch return false;
+    return true;
+}
+
+/// -x: True if pathname resolves to an existing directory entry for a file
+/// for which permission to execute the file (or search it, if it is a directory)
+/// will be granted.
+fn fileIsExecutable(path: []const u8) bool {
+    const path_z = posix.toPosixPath(path) catch return false;
+    posix.faccessatZ(posix.AT.FDCWD, &path_z, posix.X_OK, 0) catch return false;
+    return true;
+}
+
+/// -s: True if pathname resolves to an existing directory entry for a file
+/// that has a size greater than zero.
+fn fileNotEmpty(path: []const u8) bool {
+    const path_z = posix.toPosixPath(path) catch return false;
+    const stat = posix.fstatatZ(posix.AT.FDCWD, &path_z, 0) catch return false;
+    return stat.size > 0;
 }
 
 /// Evaluate a binary operator.
@@ -478,4 +588,83 @@ test "4 args: ! 5 -eq 5 is false" {
 
 test "4 args: ! 5 -lt 3 is true" {
     try testing.expectEqual(true, try evaluate(&.{ "!", "5", "-lt", "3" }));
+}
+
+// === File operators ===
+// POSIX.1-2017: File tests return false (not error) when pathname cannot be resolved.
+
+// -e: file exists
+test "2 args: -e nonexistent returns false (not error)" {
+    try testing.expectEqual(false, try evaluate(&.{ "-e", "/nonexistent/path/that/does/not/exist" }));
+}
+
+test "2 args: -e /tmp" {
+    try testing.expectEqual(true, try evaluate(&.{ "-e", "/tmp" }));
+}
+
+// -f: regular file
+test "2 args: -f nonexistent returns false (not error)" {
+    try testing.expectEqual(false, try evaluate(&.{ "-f", "/nonexistent/path/that/does/not/exist" }));
+}
+
+test "2 args: -f /tmp is false (it's a directory)" {
+    try testing.expectEqual(false, try evaluate(&.{ "-f", "/tmp" }));
+}
+
+// -d: directory
+test "2 args: -d nonexistent returns false (not error)" {
+    try testing.expectEqual(false, try evaluate(&.{ "-d", "/nonexistent/path/that/does/not/exist" }));
+}
+
+test "2 args: -d /tmp" {
+    try testing.expectEqual(true, try evaluate(&.{ "-d", "/tmp" }));
+}
+
+// -r: readable
+test "2 args: -r nonexistent returns false" {
+    try testing.expectEqual(false, try evaluate(&.{ "-r", "/nonexistent/path" }));
+}
+
+test "2 args: -r /tmp" {
+    try testing.expectEqual(true, try evaluate(&.{ "-r", "/tmp" }));
+}
+
+// -w: writable
+test "2 args: -w nonexistent returns false" {
+    try testing.expectEqual(false, try evaluate(&.{ "-w", "/nonexistent/path" }));
+}
+
+test "2 args: -w /tmp" {
+    try testing.expectEqual(true, try evaluate(&.{ "-w", "/tmp" }));
+}
+
+// -x: executable (or searchable for directories)
+test "2 args: -x nonexistent returns false" {
+    try testing.expectEqual(false, try evaluate(&.{ "-x", "/nonexistent/path" }));
+}
+
+test "2 args: -x /tmp (searchable directory)" {
+    try testing.expectEqual(true, try evaluate(&.{ "-x", "/tmp" }));
+}
+
+// -s: file has size > 0
+test "2 args: -s nonexistent returns false" {
+    try testing.expectEqual(false, try evaluate(&.{ "-s", "/nonexistent/path" }));
+}
+
+// Negation with file operators
+test "3 args: ! -e /tmp is false" {
+    try testing.expectEqual(false, try evaluate(&.{ "!", "-e", "/tmp" }));
+}
+
+test "3 args: ! -e /nonexistent is true" {
+    try testing.expectEqual(true, try evaluate(&.{ "!", "-e", "/nonexistent/path" }));
+}
+
+test "3 args: ! -d /tmp is false" {
+    try testing.expectEqual(false, try evaluate(&.{ "!", "-d", "/tmp" }));
+}
+
+test "3 args: ! -f /tmp is true (it's a directory, not a file)" {
+    try testing.expectEqual(true, try evaluate(&.{ "!", "-f", "/tmp" }));
 }
