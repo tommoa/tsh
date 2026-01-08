@@ -19,6 +19,9 @@ const expand = @import("expand.zig");
 const SimpleCommand = parser.SimpleCommand;
 const ParsedCommand = parser.ParsedCommand;
 const Command = parser.Command;
+const IfClause = parser.IfClause;
+const CompoundList = parser.CompoundList;
+const AndOrList = parser.AndOrList;
 
 const Word = parser.Word;
 const WordPart = parser.WordPart;
@@ -421,25 +424,6 @@ pub const Executor = struct {
 
         for (cmds, 0..) |cmd, i| {
             const is_last = (i == cmds.len - 1);
-            const simple = switch (cmd) {
-                .simple => |s| s,
-                .if_clause => {
-                    printError("if statements are not yet implemented\n", .{});
-                    return ExecuteError.NotImplemented;
-                },
-            };
-
-            // Expand argv in parent (needed to check for builtins in pipeline stages)
-            const argv = expand.expandArgv(self.allocator, simple.argv, self.shell_state) catch |err| {
-                switch (err) {
-                    // Error message already printed by expansion
-                    error.ParameterUnsetOrNull, error.ParameterAssignmentInvalid => {},
-                    else => printError("failed to expand arguments: {s}\n", .{@errorName(err)}),
-                }
-                self.cleanupPipeline(pids.items, read_fd);
-                self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
-                return self.shell_state.last_status;
-            };
 
             // Create pipe for non-last commands
             const pipe_fds: ?[2]posix.fd_t = if (!is_last)
@@ -467,7 +451,7 @@ pub const Executor = struct {
                 // Child: close read end of new pipe (parent saves it for next stage)
                 if (pipe_fds) |fds| posix.close(fds[0]);
 
-                self.executeChild(simple, argv, .{
+                self.executeSingleCommandInChild(cmd, .{
                     .stdin_fd = read_fd,
                     .stdout_fd = if (pipe_fds) |fds| fds[1] else null,
                 });
@@ -571,17 +555,11 @@ pub const Executor = struct {
         const status: ExitStatus = if (pipeline.commands.len == 0)
             // Empty pipeline - return success
             .{ .exited = 0 }
-        else if (pipeline.commands.len == 1) blk: {
+        else if (pipeline.commands.len == 1)
             // Single-command "pipeline" - execute in current environment.
             // This ensures builtins like cd, export, exit work correctly.
-            break :blk switch (pipeline.commands[0]) {
-                .simple => |s| try self.execute(s),
-                .if_clause => {
-                    printError("if statements are not yet implemented\n", .{});
-                    return ExecuteError.NotImplemented;
-                },
-            };
-        } else
+            try self.executeSingleCommand(pipeline.commands[0])
+        else
             // Multi-command pipeline - all stages run in subshells
             try self.executePipeline(pipeline);
 
@@ -598,16 +576,127 @@ pub const Executor = struct {
         return status;
     }
 
+    /// Execute a compound-list (sequence of AND/OR lists).
+    ///
+    /// Reference: POSIX.1-2017 Section 2.9.3 Lists
+    /// The exit status of a compound-list is the exit status of the last
+    /// AND/OR list that was executed.
+    fn executeCompoundList(self: *Executor, list: CompoundList) ExecuteError!ExitStatus {
+        var status: ExitStatus = .{ .exited = 0 };
+        for (list.commands) |and_or| {
+            status = try self.executeAndOrList(and_or);
+        }
+        return status;
+    }
+
+    /// Execute an AND/OR list.
+    ///
+    /// This is a helper that wraps an AndOrList in a ParsedCommand and
+    /// delegates to executeCommand, reusing its AND/OR evaluation logic.
+    fn executeAndOrList(self: *Executor, and_or: AndOrList) ExecuteError!ExitStatus {
+        return self.executeCommand(.{ .and_or = and_or });
+    }
+
+    /// Execute an if clause (if/elif/else/fi construct).
+    ///
+    /// Reference: POSIX.1-2017 Section 2.9.4.1
+    /// "The if command shall execute a compound-list and use its exit status
+    /// to determine whether to execute another compound-list."
+    ///
+    /// The exit status of the if command is the exit status of the then or
+    /// else compound-list that was executed, or zero if none was executed.
+    fn executeIfClause(self: *Executor, ic: IfClause) ExecuteError!ExitStatus {
+        // Evaluate each branch's condition in order
+        for (ic.branches) |branch| {
+            const cond_status = try self.executeCompoundList(branch.condition);
+            if (cond_status.toExitCode() == 0) {
+                // Condition succeeded (exit status 0), execute body
+                return try self.executeCompoundList(branch.body);
+            }
+        }
+
+        // No condition matched, try else
+        if (ic.else_body) |else_body| {
+            return try self.executeCompoundList(else_body);
+        }
+
+        // POSIX.1-2017 Section 2.9.4.1:
+        // "...or zero, if none was executed."
+        return ExitStatus{ .exited = 0 };
+    }
+
+    /// Execute a single command (simple or compound) in the current environment.
+    ///
+    /// This is the unified dispatch point for all command types. Simple commands
+    /// are executed via execute(), compound commands via their specific handlers.
+    ///
+    /// Reference: POSIX.1-2017 Section 2.9.1 Simple Commands
+    /// Reference: POSIX.1-2017 Section 2.9.4 Compound Commands
+    fn executeSingleCommand(self: *Executor, cmd: Command) ExecuteError!ExitStatus {
+        return switch (cmd) {
+            .simple => |s| try self.execute(s),
+            .if_clause => |ic| try self.executeIfClause(ic),
+        };
+    }
+
+    /// Execute a single command in a child process (for pipeline stages).
+    ///
+    /// Applies pipe wiring and executes the command, then exits with its status.
+    /// This function never returns.
+    ///
+    /// Simple commands use the specialized executeChild path which handles
+    /// redirections, builtins, and external command execution. Compound commands
+    /// (if, while, for, etc.) use executeSingleCommand since they don't need
+    /// special child-process handling beyond pipe wiring.
+    fn executeSingleCommandInChild(self: *Executor, cmd: Command, config: ExecConfig) noreturn {
+        // Apply pipe wiring first
+        config.applyPipes();
+
+        switch (cmd) {
+            .simple => |s| {
+                // Simple commands need special handling: argv expansion,
+                // redirections, builtin dispatch, and exec for externals.
+                const argv = expand.expandArgv(self.allocator, s.argv, self.shell_state) catch |err| {
+                    switch (err) {
+                        error.ParameterUnsetOrNull, error.ParameterAssignmentInvalid => {},
+                        else => printError("failed to expand arguments: {s}\n", .{@errorName(err)}),
+                    }
+                    posix.exit(ExitStatus.GENERAL_ERROR);
+                };
+                // executeChild applies its own pipe wiring, but we already did it.
+                // Pass a no-op config since pipes are already set up.
+                self.executeChild(s, argv, .{ .stdin_fd = null, .stdout_fd = null });
+            },
+            .if_clause => |ic| {
+                // Compound commands can use the normal execution path
+                const status = self.executeIfClause(ic) catch |err| {
+                    switch (err) {
+                        error.ExitRequested => posix.exit(self.shell_state.exit_code),
+                        else => {
+                            printError("command execution failed: {s}\n", .{@errorName(err)});
+                            posix.exit(ExitStatus.GENERAL_ERROR);
+                        },
+                    }
+                };
+                posix.exit(status.toExitCode());
+            },
+        }
+    }
+
     /// Execute a simple command in the child process.
-    /// Handles pipe wiring, redirections, builtins, and external commands.
+    /// Handles redirections, builtins, and external commands.
     /// This function never returns - it either execs or exits.
+    ///
+    /// Note: When called from executeSingleCommandInChild, pipe wiring is
+    /// already applied and config will have null fds. When called directly
+    /// from tests or other paths, config may contain pipe fds to apply.
     fn executeChild(
         self: *Executor,
         cmd: SimpleCommand,
         argv: [*:null]const ?[*:0]const u8,
         config: ExecConfig,
     ) noreturn {
-        // 1. Apply pipe wiring (before redirections)
+        // 1. Apply pipe wiring if provided (before redirections)
         config.applyPipes();
 
         // 2. Apply command redirections
@@ -1875,4 +1964,312 @@ test "executor: empty negated pipeline in AND/OR list" {
     // ! Y=2 || echo yes -> exit 0 (! negates 0 to 1, || runs echo)
     try expectStatus(&arena, &shell_state, "! Y=2 || echo yes > " ++ tmp_or ++ "\n", 0);
     try expectFileContent(tmp_or, "yes\n");
+}
+
+// --- If statement tests ---
+
+test "executor: if true; then echo yes; fi" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_if_true";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "if true; then echo yes > " ++ tmp_path ++ "; fi\n", 0);
+    try expectFileContent(tmp_path, "yes\n");
+}
+
+test "executor: if false; then echo yes; fi" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_if_false";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    // No branch executed, exit status is 0
+    try expectStatus(&arena, &shell_state, "if false; then echo yes > " ++ tmp_path ++ "; fi\n", 0);
+    // File should not exist (body not executed)
+    try expectFileNotFound(tmp_path);
+}
+
+test "executor: if true; then echo yes; else echo no; fi" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_if_else_true";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "if true; then echo yes > " ++ tmp_path ++ "; else echo no > " ++ tmp_path ++ "; fi\n", 0);
+    try expectFileContent(tmp_path, "yes\n");
+}
+
+test "executor: if false; then echo yes; else echo no; fi" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_if_else_false";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "if false; then echo yes > " ++ tmp_path ++ "; else echo no > " ++ tmp_path ++ "; fi\n", 0);
+    try expectFileContent(tmp_path, "no\n");
+}
+
+test "executor: if false; then echo 1; elif true; then echo 2; fi" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_if_elif";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "if false; then echo 1 > " ++ tmp_path ++ "; elif true; then echo 2 > " ++ tmp_path ++ "; fi\n", 0);
+    try expectFileContent(tmp_path, "2\n");
+}
+
+test "executor: if false; then echo 1; elif false; then echo 2; else echo 3; fi" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_if_elif_else";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "if false; then echo 1 > " ++ tmp_path ++ "; elif false; then echo 2 > " ++ tmp_path ++ "; else echo 3 > " ++ tmp_path ++ "; fi\n", 0);
+    try expectFileContent(tmp_path, "3\n");
+}
+
+test "executor: if true; then echo 1; elif true; then echo 2; else echo 3; fi" {
+    // First matching branch wins
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_if_first_match";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "if true; then echo 1 > " ++ tmp_path ++ "; elif true; then echo 2 > " ++ tmp_path ++ "; else echo 3 > " ++ tmp_path ++ "; fi\n", 0);
+    try expectFileContent(tmp_path, "1\n");
+}
+
+test "executor: multiple elif branches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_multi_elif";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    // First true elif wins
+    try expectStatus(&arena, &shell_state, "if false; then echo 1 > " ++ tmp_path ++ "; elif false; then echo 2 > " ++ tmp_path ++ "; elif true; then echo 3 > " ++ tmp_path ++ "; elif true; then echo 4 > " ++ tmp_path ++ "; fi\n", 0);
+    try expectFileContent(tmp_path, "3\n");
+}
+
+test "executor: if exit status propagation from body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+
+    // Exit status from executed body
+    try expectStatus(&arena, &shell_state, "if true; then false; fi\n", 1);
+    try expectStatus(&arena, &shell_state, "if true; then true; fi\n", 0);
+}
+
+test "executor: if with no branch executed returns 0" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "if false; then echo yes; fi\n", 0);
+}
+
+test "executor: multi-command condition" {
+    // Exit status of condition is from last command
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_multi_cond";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+
+    // Condition: echo checking; true -> exit 0, body runs
+    try expectStatus(&arena, &shell_state, "if echo checking > /dev/null; true; then echo yes > " ++ tmp_path ++ "; fi\n", 0);
+    try expectFileContent(tmp_path, "yes\n");
+
+    cleanupTempFile(tmp_path);
+
+    // Condition: echo checking; false -> exit 1, body skipped
+    try expectStatus(&arena, &shell_state, "if echo checking > /dev/null; false; then echo yes > " ++ tmp_path ++ "; else echo no > " ++ tmp_path ++ "; fi\n", 0);
+    try expectFileContent(tmp_path, "no\n");
+}
+
+test "executor: multi-command body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_multi_body";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "if true; then echo a > " ++ tmp_path ++ "; echo b >> " ++ tmp_path ++ "; echo c >> " ++ tmp_path ++ "; fi\n", 0);
+    try expectFileContent(tmp_path, "a\nb\nc\n");
+}
+
+test "executor: nested if statements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_nested_if";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+
+    // if true; then if true; then echo nested; fi; fi
+    try expectStatus(&arena, &shell_state, "if true; then if true; then echo nested > " ++ tmp_path ++ "; fi; fi\n", 0);
+    try expectFileContent(tmp_path, "nested\n");
+
+    cleanupTempFile(tmp_path);
+
+    // if true; then if false; then echo a; else echo b; fi; fi
+    try expectStatus(&arena, &shell_state, "if true; then if false; then echo a > " ++ tmp_path ++ "; else echo b > " ++ tmp_path ++ "; fi; fi\n", 0);
+    try expectFileContent(tmp_path, "b\n");
+
+    cleanupTempFile(tmp_path);
+
+    // if false; then echo outer; else if true; then echo inner; fi; fi
+    try expectStatus(&arena, &shell_state, "if false; then echo outer > " ++ tmp_path ++ "; else if true; then echo inner > " ++ tmp_path ++ "; fi; fi\n", 0);
+    try expectFileContent(tmp_path, "inner\n");
+}
+
+test "executor: pipeline with if" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_if_pipeline";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+
+    // if true; then echo hello; fi | cat > file
+    try expectStatus(&arena, &shell_state, "if true; then echo hello; fi | cat > " ++ tmp_path ++ "\n", 0);
+    try expectFileContent(tmp_path, "hello\n");
+}
+
+test "executor: AND/OR in condition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_if_and_or";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+
+    // if true && true; then echo yes; fi
+    try expectStatus(&arena, &shell_state, "if true && true; then echo yes > " ++ tmp_path ++ "; fi\n", 0);
+    try expectFileContent(tmp_path, "yes\n");
+
+    cleanupTempFile(tmp_path);
+
+    // if true && false; then echo yes; else echo no; fi
+    try expectStatus(&arena, &shell_state, "if true && false; then echo yes > " ++ tmp_path ++ "; else echo no > " ++ tmp_path ++ "; fi\n", 0);
+    try expectFileContent(tmp_path, "no\n");
+
+    cleanupTempFile(tmp_path);
+
+    // if false || true; then echo yes; fi
+    try expectStatus(&arena, &shell_state, "if false || true; then echo yes > " ++ tmp_path ++ "; fi\n", 0);
+    try expectFileContent(tmp_path, "yes\n");
+
+    cleanupTempFile(tmp_path);
+
+    // if false || false; then echo yes; else echo no; fi
+    try expectStatus(&arena, &shell_state, "if false || false; then echo yes > " ++ tmp_path ++ "; else echo no > " ++ tmp_path ++ "; fi\n", 0);
+    try expectFileContent(tmp_path, "no\n");
+}
+
+test "executor: newline-separated if statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_if_newlines";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+
+    // if true\nthen\necho yes\nfi
+    try expectStatus(&arena, &shell_state, "if true\nthen\necho yes > " ++ tmp_path ++ "\nfi\n", 0);
+    try expectFileContent(tmp_path, "yes\n");
+
+    cleanupTempFile(tmp_path);
+
+    // Multi-line body
+    try expectStatus(&arena, &shell_state, "if true\nthen\necho a > " ++ tmp_path ++ "\necho b >> " ++ tmp_path ++ "\nfi\n", 0);
+    try expectFileContent(tmp_path, "a\nb\n");
+}
+
+test "executor: if statement affects shell environment" {
+    // Verify that if statements run in the current environment, not a subshell
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+
+    // Set a variable in an if body
+    const cmd = try parseCommand(arena.allocator(), "if true; then FOO=bar; fi\n") orelse return error.NoCommand;
+    _ = try exec.executeCommand(cmd);
+
+    // Variable should persist in shell state
+    try std.testing.expectEqualStrings("bar", shell_state.getVariable("FOO").?);
+}
+
+test "executor: exit in if condition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+
+    // if exit 5; then echo yes; fi
+    const cmd = try parseCommand(arena.allocator(), "if exit 5; then echo yes; fi\n") orelse return error.NoCommand;
+    const result = exec.executeCommand(cmd);
+
+    // Should return ExitRequested
+    try std.testing.expectError(ExecuteError.ExitRequested, result);
+    try std.testing.expectEqual(@as(u8, 5), shell_state.exit_code);
+}
+
+test "executor: exit in if body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    var exec = Executor.init(arena.allocator(), &shell_state);
+
+    // if true; then exit 42; fi
+    const cmd = try parseCommand(arena.allocator(), "if true; then exit 42; fi\n") orelse return error.NoCommand;
+    const result = exec.executeCommand(cmd);
+
+    // Should return ExitRequested
+    try std.testing.expectError(ExecuteError.ExitRequested, result);
+    try std.testing.expectEqual(@as(u8, 42), shell_state.exit_code);
 }

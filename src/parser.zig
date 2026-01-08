@@ -448,6 +448,13 @@ pub const IfClause = struct {
 /// Currently supports simple commands and if clauses. Future additions will
 /// include other compound commands (brace groups, subshells, while/for/case
 /// clauses) and function definitions per POSIX Section 2.9.5.
+///
+/// TODO: POSIX allows redirections on compound commands (e.g., `if ...; fi > file`).
+/// The grammar is: `command : compound_command redirect_list`. Currently, redirections
+/// after compound commands are incorrectly parsed as separate empty commands. To fix:
+/// 1. Add an optional `redirections` field to Command (or wrap compound commands)
+/// 2. After parsing a compound command, check for trailing redirections
+/// 3. Update executor to apply redirections around compound command execution
 pub const Command = union(enum) {
     simple: SimpleCommand,
     if_clause: IfClause,
