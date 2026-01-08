@@ -515,6 +515,10 @@ fn isValidIdentifier(s: []const u8) bool {
 
 // --- Tests ---
 
+test {
+    _ = @import("builtin_test.zig");
+}
+
 test "Builtin.fromName: recognizes builtins" {
     try std.testing.expectEqual(Builtin.exit, Builtin.fromName("exit").?);
     try std.testing.expectEqual(Builtin.cd, Builtin.fromName("cd").?);
