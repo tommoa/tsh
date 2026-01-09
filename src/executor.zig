@@ -272,23 +272,28 @@ pub const Executor = struct {
                 try self.shell_state.setVariable(assignment.name, value);
             }
 
-            // If there are redirections, apply them to the shell (e.g., "> file" creates/truncates file)
-            if (redirections.len > 0) {
-                // files_only=true: only create/truncate files, don't redirect shell's fds.
-                switch (applyRedirections(self.allocator, redirections, true, self.shell_state)) {
-                    .ok => {
-                        self.shell_state.last_status = .{ .exited = 0 };
-                    },
-                    .err => |msg| {
-                        // Empty message means error was already printed (e.g., ParameterUnsetOrNull)
-                        if (msg.len > 0) {
-                            printError("{s}\n", .{msg});
-                            self.setError(msg, null);
-                        }
-                        self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
-                    },
-                }
+            // Apply redirections with save/restore (no-op if empty).
+            // This handles commands like "> file" which create/truncate the file.
+            // The save/restore ensures the shell's fds are not permanently modified.
+            const saved_fds = SavedFds.save(redirections) catch {
+                printError("too many redirections\n", .{});
+                self.setError("too many redirections", null);
+                self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
                 return self.shell_state.last_status;
+            };
+            defer _ = saved_fds.restore();
+
+            switch (applyRedirections(self.allocator, redirections, self.shell_state)) {
+                .ok => {},
+                .err => |msg| {
+                    // Empty message means error was already printed (e.g., ParameterUnsetOrNull)
+                    if (msg.len > 0) {
+                        printError("{s}\n", .{msg});
+                        self.setError(msg, null);
+                    }
+                    self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
+                    return self.shell_state.last_status;
+                },
             }
 
             self.shell_state.last_status = .{ .exited = 0 };
@@ -350,19 +355,17 @@ pub const Executor = struct {
             };
             defer _ = saved_fds.restore();
 
-            if (redirections.len > 0) {
-                switch (applyRedirections(self.allocator, redirections, false, self.shell_state)) {
-                    .ok => {},
-                    .err => |msg| {
-                        // Empty message means error was already printed (e.g., ParameterUnsetOrNull)
-                        if (msg.len > 0) {
-                            printError("{s}\n", .{msg});
-                            self.setError(msg, null);
-                        }
-                        self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
-                        return self.shell_state.last_status;
-                    },
-                }
+            switch (applyRedirections(self.allocator, redirections, self.shell_state)) {
+                .ok => {},
+                .err => |msg| {
+                    // Empty message means error was already printed (e.g., ParameterUnsetOrNull)
+                    if (msg.len > 0) {
+                        printError("{s}\n", .{msg});
+                        self.setError(msg, null);
+                    }
+                    self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
+                    return self.shell_state.last_status;
+                },
             }
 
             // Run the builtin
@@ -630,13 +633,42 @@ pub const Executor = struct {
     /// This is the unified dispatch point for all command types. Simple commands
     /// are executed via execute(), compound commands via their specific handlers.
     ///
+    /// For compound commands, redirections are applied here with save/restore since
+    /// they run entirely in the current shell. For simple commands, execute() handles
+    /// redirections (save/restore for builtins, child-only for externals).
+    ///
     /// Reference: POSIX.1-2017 Section 2.9.1 Simple Commands
     /// Reference: POSIX.1-2017 Section 2.9.4 Compound Commands
     fn executeSingleCommand(self: *Executor, cmd: Command) ExecuteError!ExitStatus {
-        // TODO: Apply cmd.redirections here for compound commands
+        // Simple commands handle their own redirections (different logic for builtins vs externals)
+        if (cmd.type == .simple) {
+            return self.execute(cmd.type.simple, cmd.redirections);
+        }
+
+        // Compound commands run in current shell - apply redirections with save/restore
+        const saved_fds = SavedFds.save(cmd.redirections) catch {
+            printError("too many redirections\n", .{});
+            self.setError("too many redirections", null);
+            self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
+            return self.shell_state.last_status;
+        };
+        defer _ = saved_fds.restore();
+
+        switch (applyRedirections(self.allocator, cmd.redirections, self.shell_state)) {
+            .ok => {},
+            .err => |msg| {
+                if (msg.len > 0) {
+                    printError("{s}\n", .{msg});
+                    self.setError(msg, null);
+                }
+                self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
+                return self.shell_state.last_status;
+            },
+        }
+
         return switch (cmd.type) {
-            .simple => |s| try self.execute(s, cmd.redirections),
-            .if_clause => |ic| try self.executeIfClause(ic),
+            .simple => unreachable, // handled above
+            .if_clause => |ic| self.executeIfClause(ic),
         };
     }
 
@@ -647,42 +679,48 @@ pub const Executor = struct {
     ///
     /// Simple commands use the specialized executeChild path which handles
     /// redirections, builtins, and external command execution. Compound commands
-    /// (if, while, for, etc.) use executeSingleCommand since they don't need
-    /// special child-process handling beyond pipe wiring.
+    /// apply redirections here before execution (no save/restore needed in child).
     fn executeSingleCommandInChild(self: *Executor, cmd: Command, config: ExecConfig) noreturn {
         // Apply pipe wiring first
         config.applyPipes();
 
-        // TODO: Apply cmd.redirections here for compound commands
-        switch (cmd.type) {
-            .simple => |s| {
-                // Simple commands need special handling: argv expansion,
-                // redirections, builtin dispatch, and exec for externals.
-                const argv = expand.expandArgv(self.allocator, s.argv, self.shell_state) catch |err| {
-                    switch (err) {
-                        error.ParameterUnsetOrNull, error.ParameterAssignmentInvalid => {},
-                        else => printError("failed to expand arguments: {s}\n", .{@errorName(err)}),
-                    }
-                    posix.exit(ExitStatus.GENERAL_ERROR);
-                };
-                // executeChild applies its own pipe wiring, but we already did it.
-                // Pass a no-op config since pipes are already set up.
-                self.executeChild(s, cmd.redirections, argv, .{ .stdin_fd = null, .stdout_fd = null });
-            },
-            .if_clause => |ic| {
-                // Compound commands can use the normal execution path
-                const status = self.executeIfClause(ic) catch |err| {
-                    switch (err) {
-                        error.ExitRequested => posix.exit(self.shell_state.exit_code),
-                        else => {
-                            printError("command execution failed: {s}\n", .{@errorName(err)});
-                            posix.exit(ExitStatus.GENERAL_ERROR);
-                        },
-                    }
-                };
-                posix.exit(status.toExitCode());
+        // Simple commands use executeChild which handles redirections internally
+        if (cmd.type == .simple) {
+            const s = cmd.type.simple;
+            const argv = expand.expandArgv(self.allocator, s.argv, self.shell_state) catch |err| {
+                switch (err) {
+                    error.ParameterUnsetOrNull, error.ParameterAssignmentInvalid => {},
+                    else => printError("failed to expand arguments: {s}\n", .{@errorName(err)}),
+                }
+                posix.exit(ExitStatus.GENERAL_ERROR);
+            };
+            // executeChild applies redirections and handles builtins/externals.
+            // Pass a no-op config since pipes are already set up.
+            self.executeChild(s, cmd.redirections, argv, .{ .stdin_fd = null, .stdout_fd = null });
+        }
+
+        // Compound commands: apply redirections here (no save/restore in child)
+        switch (applyRedirections(self.allocator, cmd.redirections, self.shell_state)) {
+            .ok => {},
+            .err => |msg| {
+                if (msg.len > 0) printError("{s}\n", .{msg});
+                posix.exit(ExitStatus.GENERAL_ERROR);
             },
         }
+
+        const status = switch (cmd.type) {
+            .simple => unreachable, // handled above
+            .if_clause => |ic| self.executeIfClause(ic) catch |err| {
+                switch (err) {
+                    error.ExitRequested => posix.exit(self.shell_state.exit_code),
+                    else => {
+                        printError("command execution failed: {s}\n", .{@errorName(err)});
+                        posix.exit(ExitStatus.GENERAL_ERROR);
+                    },
+                }
+            },
+        };
+        posix.exit(status.toExitCode());
     }
 
     /// Execute a simple command in the child process.
@@ -703,7 +741,7 @@ pub const Executor = struct {
         config.applyPipes();
 
         // 2. Apply command redirections
-        switch (applyRedirections(self.allocator, redirections, false, self.shell_state)) {
+        switch (applyRedirections(self.allocator, redirections, self.shell_state)) {
             .ok => {},
             .err => |msg| {
                 // Empty message means error was already printed (e.g., ParameterUnsetOrNull)
@@ -888,17 +926,13 @@ fn findExecutable(allocator: Allocator, cmd: [*:0]const u8, env_map: *const proc
 /// Opens files, performs dup2 operations, and handles fd close.
 /// Works in any context (parent or child process).
 ///
-/// When `files_only` is true, only file operations are performed (open/create/truncate)
-/// without modifying file descriptors. This is used for redirections-only commands
-/// like `> file` which should create the file but not redirect the shell's fds.
-///
 /// On success, returns .ok.
 /// On failure, returns .err with an error message. The caller is responsible
 /// for printing the error and determining the appropriate exit status.
 /// Note: An empty error message indicates the error was already printed (e.g.,
 /// by ExpansionError.ParameterUnsetOrNull or ParameterAssignmentInvalid) and
 /// should not be printed again.
-fn applyRedirections(allocator: Allocator, redirections: []const ParsedRedirection, files_only: bool, shell: *ShellState) RedirectionResult {
+fn applyRedirections(allocator: Allocator, redirections: []const ParsedRedirection, shell: *ShellState) RedirectionResult {
     for (redirections) |redir| {
         const source_fd: posix.fd_t = @intCast(redir.source_fd orelse defaultSourceFd(redir.op));
 
@@ -926,10 +960,7 @@ fn applyRedirections(allocator: Allocator, redirections: []const ParsedRedirecti
                     };
                     return .{ .err = msg };
                 };
-                if (files_only) {
-                    // Just close the file - we only wanted to create/truncate it
-                    posix.close(fd);
-                } else if (fd != source_fd) {
+                if (fd != source_fd) {
                     posix.dup2(fd, source_fd) catch |err| {
                         posix.close(fd);
                         const msg = std.fmt.allocPrint(allocator, "dup2: {s}", .{@errorName(err)}) catch {
@@ -944,21 +975,15 @@ fn applyRedirections(allocator: Allocator, redirections: []const ParsedRedirecti
                 // previously closed and open() reused that fd number.
             },
             .fd => |target_fd| {
-                // fd duplication is a no-op in files_only mode
-                if (!files_only) {
-                    posix.dup2(@intCast(target_fd), source_fd) catch |err| {
-                        const msg = std.fmt.allocPrint(allocator, "dup2: {s}", .{@errorName(err)}) catch {
-                            return .{ .err = @errorName(err) };
-                        };
-                        return .{ .err = msg };
+                posix.dup2(@intCast(target_fd), source_fd) catch |err| {
+                    const msg = std.fmt.allocPrint(allocator, "dup2: {s}", .{@errorName(err)}) catch {
+                        return .{ .err = @errorName(err) };
                     };
-                }
+                    return .{ .err = msg };
+                };
             },
             .close => {
-                // fd close is a no-op in files_only mode
-                if (!files_only) {
-                    posix.close(source_fd);
-                }
+                posix.close(source_fd);
             },
         }
     }
