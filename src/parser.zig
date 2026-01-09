@@ -77,6 +77,21 @@ pub const WordPart = union(enum) {
             .parameter => |param| try param.format(writer),
         }
     }
+
+    /// Free all memory allocated for this word part.
+    pub fn deinit(self: WordPart, allocator: Allocator) void {
+        switch (self) {
+            .literal => |lit| allocator.free(lit),
+            .quoted => |q| allocator.free(q),
+            .double_quoted => |parts| {
+                for (parts) |part| {
+                    part.deinit(allocator);
+                }
+                allocator.free(parts);
+            },
+            .parameter => |param| param.deinit(allocator),
+        }
+    }
 };
 
 /// A parameter expansion (${param}, ${param:-default}, etc.)
@@ -147,6 +162,19 @@ pub const ParameterExpansion = struct {
 
         try writer.writeByte('}');
     }
+
+    /// Free all memory allocated for this parameter expansion.
+    pub fn deinit(self: ParameterExpansion, allocator: Allocator) void {
+        allocator.free(self.name);
+        if (self.modifier) |mod| {
+            if (mod.word) |word_parts| {
+                for (word_parts) |part| {
+                    part.deinit(allocator);
+                }
+                allocator.free(word_parts);
+            }
+        }
+    }
 };
 
 /// A complete word, which may consist of multiple parts.
@@ -181,6 +209,14 @@ pub const Word = struct {
         }
         try writer.writeByte(']');
     }
+
+    /// Free all memory allocated for this word.
+    pub fn deinit(self: Word, allocator: Allocator) void {
+        for (self.parts) |part| {
+            part.deinit(allocator);
+        }
+        allocator.free(self.parts);
+    }
 };
 
 /// A variable assignment (e.g., `FOO=bar`).
@@ -202,6 +238,12 @@ pub const Assignment = struct {
         try writer.print("{s} = ", .{self.name});
         try self.value.format(writer);
     }
+
+    /// Free all memory allocated for this assignment.
+    pub fn deinit(self: Assignment, allocator: Allocator) void {
+        allocator.free(self.name);
+        self.value.deinit(allocator);
+    }
 };
 
 /// The target of a redirection operation.
@@ -219,6 +261,14 @@ pub const RedirectionTarget = union(enum) {
             .file => |word| try word.format(writer),
             .fd => |fd| try writer.print("{d}", .{fd}),
             .close => try writer.writeAll("-"),
+        }
+    }
+
+    /// Free all memory allocated for this redirection target.
+    pub fn deinit(self: RedirectionTarget, allocator: Allocator) void {
+        switch (self) {
+            .file => |word| word.deinit(allocator),
+            .fd, .close => {},
         }
     }
 };
@@ -252,16 +302,20 @@ pub const ParsedRedirection = struct {
         try writer.writeByte(' ');
         try self.target.format(writer);
     }
+
+    /// Free all memory allocated for this redirection.
+    pub fn deinit(self: ParsedRedirection, allocator: Allocator) void {
+        self.target.deinit(allocator);
+    }
 };
 
-/// A simple command consisting of assignments, arguments, and redirections.
+/// A simple command consisting of assignments and arguments.
+/// Redirections are stored in the parent Command struct.
 pub const SimpleCommand = struct {
     /// Variable assignments that precede the command.
     assignments: []const Assignment,
     /// The command name and its arguments.
     argv: []const Word,
-    /// Redirections in the order they appeared.
-    redirections: []const ParsedRedirection,
 
     /// Format the command for human-readable output.
     pub fn format(self: SimpleCommand, writer: *std.io.Writer) std.io.Writer.Error!void {
@@ -269,7 +323,7 @@ pub const SimpleCommand = struct {
     }
 
     /// Format the command with indentation (for nested commands).
-    fn formatIndented(self: SimpleCommand, writer: *std.io.Writer, indent: usize) std.io.Writer.Error!void {
+    pub fn formatIndented(self: SimpleCommand, writer: *std.io.Writer, indent: usize) std.io.Writer.Error!void {
         try writer.splatByteAll(' ', indent);
         try writer.writeAll("SimpleCommand:\n");
 
@@ -294,17 +348,18 @@ pub const SimpleCommand = struct {
                 try writer.writeByte('\n');
             }
         }
+    }
 
-        if (self.redirections.len > 0) {
-            try writer.splatByteAll(' ', indent + 2);
-            try writer.writeAll("redirections:\n");
-            for (self.redirections, 0..) |redir, i| {
-                try writer.splatByteAll(' ', indent + 4);
-                try writer.print("[{d}] ", .{i});
-                try redir.format(writer);
-                try writer.writeByte('\n');
-            }
+    /// Free all memory allocated for this simple command.
+    pub fn deinit(self: SimpleCommand, allocator: Allocator) void {
+        for (self.assignments) |assignment| {
+            assignment.deinit(allocator);
         }
+        allocator.free(self.assignments);
+        for (self.argv) |word| {
+            word.deinit(allocator);
+        }
+        allocator.free(self.argv);
     }
 };
 
@@ -327,6 +382,14 @@ pub const Pipeline = struct {
             if (i > 0) try writer.writeAll(" | ");
             try cmd.format(writer);
         }
+    }
+
+    /// Free all memory allocated for this pipeline.
+    pub fn deinit(self: Pipeline, allocator: Allocator) void {
+        for (self.commands) |cmd| {
+            cmd.deinit(allocator);
+        }
+        allocator.free(self.commands);
     }
 };
 
@@ -355,6 +418,11 @@ pub const AndOrItem = struct {
             }
         }
     }
+
+    /// Free all memory allocated for this item.
+    pub fn deinit(self: AndOrItem, allocator: Allocator) void {
+        self.pipeline.deinit(allocator);
+    }
 };
 
 /// An AND/OR list of pipelines (POSIX 2.9.3)
@@ -374,6 +442,14 @@ pub const AndOrList = struct {
         for (self.items) |item| {
             try item.format(writer);
         }
+    }
+
+    /// Free all memory allocated for this list.
+    pub fn deinit(self: AndOrList, allocator: Allocator) void {
+        for (self.items) |item| {
+            item.deinit(allocator);
+        }
+        allocator.free(self.items);
     }
 };
 
@@ -399,12 +475,26 @@ pub const ReservedWord = enum {
 /// AND/OR list executed.
 pub const CompoundList = struct {
     commands: []const AndOrList,
+
+    /// Free all memory allocated for this compound list.
+    pub fn deinit(self: CompoundList, allocator: Allocator) void {
+        for (self.commands) |cmd| {
+            cmd.deinit(allocator);
+        }
+        allocator.free(self.commands);
+    }
 };
 
 /// A condition-body pair used in if/elif branches.
 pub const ConditionBodyPair = struct {
     condition: CompoundList,
     body: CompoundList,
+
+    /// Free all memory allocated for this pair.
+    pub fn deinit(self: ConditionBodyPair, allocator: Allocator) void {
+        self.condition.deinit(allocator);
+        self.body.deinit(allocator);
+    }
 };
 
 /// An if-elif-else construct.
@@ -441,6 +531,17 @@ pub const IfClause = struct {
             try cmd.format(writer);
         }
     }
+
+    /// Free all memory allocated for this if clause.
+    pub fn deinit(self: IfClause, allocator: Allocator) void {
+        for (self.branches) |branch| {
+            branch.deinit(allocator);
+        }
+        allocator.free(self.branches);
+        if (self.else_body) |else_body| {
+            else_body.deinit(allocator);
+        }
+    }
 };
 
 /// A single command in a pipeline (POSIX 2.9.2)
@@ -449,21 +550,51 @@ pub const IfClause = struct {
 /// include other compound commands (brace groups, subshells, while/for/case
 /// clauses) and function definitions per POSIX Section 2.9.5.
 ///
-/// TODO: POSIX allows redirections on compound commands (e.g., `if ...; fi > file`).
-/// The grammar is: `command : compound_command redirect_list`. Currently, redirections
-/// after compound commands are incorrectly parsed as separate empty commands. To fix:
-/// 1. Add an optional `redirections` field to Command (or wrap compound commands)
-/// 2. After parsing a compound command, check for trailing redirections
-/// 3. Update executor to apply redirections around compound command execution
-pub const Command = union(enum) {
-    simple: SimpleCommand,
-    if_clause: IfClause,
+/// Redirections apply to the entire command. For simple commands, they may
+/// appear anywhere in the command (before, after, or interleaved with arguments).
+/// For compound commands, they appear after the terminator (e.g., `fi > file`).
+pub const Command = struct {
+    /// The command type (simple command or compound command).
+    pub const Type = union(enum) {
+        simple: SimpleCommand,
+        if_clause: IfClause,
+    };
+
+    type: Type,
+    /// Redirections applying to the entire command.
+    redirections: []const ParsedRedirection,
 
     pub fn format(self: Command, writer: *std.io.Writer) std.io.Writer.Error!void {
-        switch (self) {
-            .simple => |s| try s.format(writer),
+        try self.formatIndented(writer, 0);
+    }
+
+    fn formatIndented(self: Command, writer: *std.io.Writer, indent: usize) std.io.Writer.Error!void {
+        switch (self.type) {
+            .simple => |s| try s.formatIndented(writer, indent),
             .if_clause => |ic| try ic.format(writer),
         }
+        if (self.redirections.len > 0) {
+            try writer.splatByteAll(' ', indent + 2);
+            try writer.writeAll("redirections:\n");
+            for (self.redirections, 0..) |redir, i| {
+                try writer.splatByteAll(' ', indent + 4);
+                try writer.print("[{d}] ", .{i});
+                try redir.format(writer);
+                try writer.writeByte('\n');
+            }
+        }
+    }
+
+    /// Free all memory allocated for this command.
+    pub fn deinit(self: Command, allocator: Allocator) void {
+        switch (self.type) {
+            .simple => |s| s.deinit(allocator),
+            .if_clause => |ic| ic.deinit(allocator),
+        }
+        for (self.redirections) |redir| {
+            redir.deinit(allocator);
+        }
+        allocator.free(self.redirections);
     }
 };
 
@@ -574,8 +705,10 @@ const ParserContext = union(enum) {
         /// If non-null, we just consumed a pipe and expect the command count to increase.
         command_count_before_pipe: ?usize,
     },
-    /// A simple command, as defined by POSIX section 2.9.1.
-    simple_command: struct {
+    /// A command context - handles both simple and compound commands.
+    /// For simple commands: collects assignments, argv, and redirections.
+    /// For compound commands: delegates to if_clause/etc, then collects trailing redirections.
+    command: struct {
         state: enum {
             /// Reserved words are recognized pre-expansion, but only when the
             /// literal token matches and is unquoted.
@@ -587,11 +720,13 @@ const ParserContext = union(enum) {
             need_redir_target,
             /// Word collection finished, decide what to do with it.
             word_complete,
+            /// Collecting trailing redirections after compound command completes.
+            trailing_redirections,
             /// Finished parsing command.
             done,
         },
-        /// Whether we've seen a command. This helps us track whether we may be doing
-        /// assignments or not.
+        /// Whether we've seen a command name. This helps us track whether we may be
+        /// doing assignments or not.
         /// Assignments (FOO=bar) are treated as regular arguments if this is `true`.
         seen_command: bool,
         /// Pending redirection (while collecting target).
@@ -599,12 +734,18 @@ const ParserContext = union(enum) {
         /// The builder of the words (arguments) for this command.
         word_collector: WordCollector,
 
-        /// The assignments for this command.
+        /// The assignments for this command (simple commands only).
         assignments: std.ArrayListUnmanaged(Assignment),
-        /// The arguments for this command.
+        /// The arguments for this command (simple commands only).
         argv: std.ArrayListUnmanaged(Word),
-        /// The redirections for this command.
+        /// The redirections for this command (all command types).
         redirections: std.ArrayListUnmanaged(ParsedRedirection),
+
+        /// For compound commands: the parsed compound command.
+        /// If set, this is a compound command; if null, it's a simple command.
+        compound_command: ?union(enum) {
+            if_clause: IfClause,
+        },
 
         /// Set up pending redirection info with default source fd (null).
         fn setPendingRedir(self: *@This(), redir: lexer.Redirection, tok: lexer.Token) void {
@@ -674,9 +815,9 @@ const ParserContext = union(enum) {
         } };
     }
 
-    /// Initialize a simple_command context.
-    fn initSimpleCommand(allocator: Allocator) ParserContext {
-        return .{ .simple_command = .{
+    /// Initialize a command context.
+    fn initCommand(allocator: Allocator) ParserContext {
+        return .{ .command = .{
             .state = .start,
             .seen_command = false,
             .pending_redir = null,
@@ -684,6 +825,7 @@ const ParserContext = union(enum) {
             .assignments = .empty,
             .argv = .empty,
             .redirections = .empty,
+            .compound_command = null,
         } };
     }
 
@@ -704,11 +846,16 @@ const ParserContext = union(enum) {
             .pipeline => |*pl| {
                 pl.commands.deinit(allocator);
             },
-            .simple_command => |*sc| {
-                sc.word_collector.deinit();
-                sc.assignments.deinit(allocator);
-                sc.argv.deinit(allocator);
-                sc.redirections.deinit(allocator);
+            .command => |*cmd| {
+                cmd.word_collector.deinit();
+                cmd.assignments.deinit(allocator);
+                cmd.argv.deinit(allocator);
+                cmd.redirections.deinit(allocator);
+                if (cmd.compound_command) |cc| {
+                    switch (cc) {
+                        .if_clause => |ic| ic.deinit(allocator),
+                    }
+                }
             },
             .and_or_list => |*aol| {
                 aol.items.deinit(allocator);
@@ -1270,7 +1417,7 @@ pub const Parser = struct {
                                         ic.completed_and_or = null;
                                         continue :state .{ .if_clause = ic };
                                     },
-                                    .pipeline, .simple_command, .and_or_list => unreachable,
+                                    .pipeline, .command, .and_or_list => unreachable,
                                 }
                             }
                             return null;
@@ -1287,7 +1434,7 @@ pub const Parser = struct {
                                     ic.completed_and_or = result;
                                     continue :state .{ .if_clause = ic };
                                 },
-                                .pipeline, .simple_command, .and_or_list => unreachable,
+                                .pipeline, .command, .and_or_list => unreachable,
                             }
                         }
 
@@ -1328,12 +1475,12 @@ pub const Parser = struct {
                                 // Not a `!`, fall through to collect as a command
                                 pipeline.state = .collecting_commands;
                                 self.pushContext(.{ .pipeline = pipeline });
-                                continue :state ParserContext.initSimpleCommand(self.allocator);
+                                continue :state ParserContext.initCommand(self.allocator);
                             },
                             else => {
                                 pipeline.state = .collecting_commands;
                                 self.pushContext(.{ .pipeline = pipeline });
-                                continue :state ParserContext.initSimpleCommand(self.allocator);
+                                continue :state ParserContext.initCommand(self.allocator);
                             },
                         }
                     },
@@ -1365,22 +1512,22 @@ pub const Parser = struct {
                                     continue :pipeline .start;
                                 } else {
                                     // Non-empty continuation - `!` is part of longer word like `!foo`
-                                    // Pre-seed simple_command with "!" and continue collecting
+                                    // Pre-seed command with "!" and continue collecting
                                     pipeline.state = .collecting_commands;
                                     self.pushContext(.{ .pipeline = pipeline });
-                                    var sc = ParserContext.initSimpleCommand(self.allocator);
+                                    var cmd = ParserContext.initCommand(self.allocator);
                                     // Set position to 1 before continuation (where `!` was)
-                                    sc.simple_command.word_collector.start_position = tok.position -| 1;
-                                    sc.simple_command.word_collector.start_line = tok.line;
-                                    sc.simple_command.word_collector.start_column = tok.column -| 1;
+                                    cmd.command.word_collector.start_position = tok.position -| 1;
+                                    cmd.command.word_collector.start_line = tok.line;
+                                    cmd.command.word_collector.start_column = tok.column -| 1;
                                     // Add "!" as first part
                                     const bang = try self.allocator.dupe(u8, "!");
-                                    try sc.simple_command.word_collector.parts.append(self.allocator, .{ .literal = bang });
+                                    try cmd.command.word_collector.parts.append(self.allocator, .{ .literal = bang });
                                     // Add the continuation content
-                                    try sc.simple_command.word_collector.continueLastPart(cont);
+                                    try cmd.command.word_collector.continueLastPart(cont);
                                     // Transition to collecting_word state
-                                    sc.simple_command.state = .collecting_word;
-                                    continue :state sc;
+                                    cmd.command.state = .collecting_word;
+                                    continue :state cmd;
                                 }
                             },
                             else => {
@@ -1388,22 +1535,22 @@ pub const Parser = struct {
                                 // `!` is part of command name, not negation
                                 pipeline.state = .collecting_commands;
                                 self.pushContext(.{ .pipeline = pipeline });
-                                var sc = ParserContext.initSimpleCommand(self.allocator);
+                                var cmd = ParserContext.initCommand(self.allocator);
                                 // Set position to 1 before this token (where `!` was)
-                                sc.simple_command.word_collector.start_position = tok.position -| 1;
-                                sc.simple_command.word_collector.start_line = tok.line;
-                                sc.simple_command.word_collector.start_column = tok.column -| 1;
+                                cmd.command.word_collector.start_position = tok.position -| 1;
+                                cmd.command.word_collector.start_line = tok.line;
+                                cmd.command.word_collector.start_column = tok.column -| 1;
                                 // Add "!" as first part
                                 const bang = try self.allocator.dupe(u8, "!");
-                                try sc.simple_command.word_collector.parts.append(self.allocator, .{ .literal = bang });
-                                // Transition to collecting_word state (don't consume token - let simple_command handle it)
-                                sc.simple_command.state = .collecting_word;
-                                continue :state sc;
+                                try cmd.command.word_collector.parts.append(self.allocator, .{ .literal = bang });
+                                // Transition to collecting_word state (don't consume token - let command handle it)
+                                cmd.command.state = .collecting_word;
+                                continue :state cmd;
                             },
                         }
                     },
                     .collecting_commands => {
-                        // We only get here after `simple_command` has finished.
+                        // We only get here after `command` has finished.
 
                         // Check if we expected a command after pipe but didn't get one
                         if (pipeline.command_count_before_pipe) |count_before| {
@@ -1486,7 +1633,7 @@ pub const Parser = struct {
 
                                 pipeline.command_count_before_pipe = pipeline.commands.items.len;
                                 self.pushContext(.{ .pipeline = pipeline });
-                                continue :state ParserContext.initSimpleCommand(self.allocator);
+                                continue :state ParserContext.initCommand(self.allocator);
                             },
                             else => {
                                 // We got a different token. We should finish
@@ -1527,7 +1674,7 @@ pub const Parser = struct {
                                 // Continue processing and_or_list
                                 continue :state next_context;
                             },
-                            .simple_command, .pipeline, .if_clause => {
+                            .command, .pipeline, .if_clause => {
                                 // Pipeline should only pop to and_or_list.
                                 unreachable;
                             },
@@ -1535,9 +1682,9 @@ pub const Parser = struct {
                     },
                 }
             },
-            .simple_command => |simple_command_val| {
-                var simple_command = simple_command_val;
-                simple_command: switch (simple_command.state) {
+            .command => |command_val| {
+                var command = command_val;
+                command: switch (command.state) {
                     .start => {
                         const tok = self.peekToken() catch |err| {
                             self.setError(
@@ -1548,16 +1695,16 @@ pub const Parser = struct {
                             );
                             return err;
                         } orelse {
-                            continue :simple_command .done;
+                            continue :command .done;
                         };
 
                         switch (tok.type) {
                             // Tokens that can start or continue a word
                             .Literal, .EscapedLiteral, .SingleQuoted, .DoubleQuoteBegin, .SimpleExpansion, .BraceExpansionBegin, .Continuation => {
-                                // Start the first word of the simple_command.
+                                // Start the first word of the command.
                                 _ = try self.consumeToken();
-                                simple_command.word_collector.startWord(tok);
-                                simple_command.word_collector.addTokenToParts(tok) catch |err| {
+                                command.word_collector.startWord(tok);
+                                command.word_collector.addTokenToParts(tok) catch |err| {
                                     switch (err) {
                                         error.BadSubstitution => {
                                             self.setError("bad substitution", self.lex.position, self.lex.line, self.lex.column);
@@ -1567,15 +1714,15 @@ pub const Parser = struct {
                                     return err;
                                 };
                                 if (tok.complete) {
-                                    continue :simple_command .word_complete;
+                                    continue :command .word_complete;
                                 } else {
-                                    continue :simple_command .collecting_word;
+                                    continue :command .collecting_word;
                                 }
                             },
                             .Redirection => |redir| {
-                                simple_command.setPendingRedir(redir, tok);
+                                command.setPendingRedir(redir, tok);
                                 _ = try self.consumeToken();
-                                continue :simple_command .need_redir_target;
+                                continue :command .need_redir_target;
                             },
                             // Tokens that explicitly terminate (and consume)
                             .Newline, .Semicolon, .DoubleSemicolon => {
@@ -1583,7 +1730,7 @@ pub const Parser = struct {
                                 // TODO: Do NOT consume the separator here when we
                                 // have other states (e.g., command lists with `;`).
                                 _ = try self.consumeToken();
-                                continue :simple_command .done;
+                                continue :command .done;
                             },
                             // Tokens not yet implemented - explicit errors
                             .LeftParen => {
@@ -1607,7 +1754,7 @@ pub const Parser = struct {
                             },
                             // Unknown/unhandled tokens - yield to parent without consuming
                             else => {
-                                continue :simple_command .done;
+                                continue :command .done;
                             },
                         }
                     },
@@ -1618,29 +1765,31 @@ pub const Parser = struct {
                             return err;
                         } orelse {
                             // End of input mid-word, finish what we have
-                            continue :simple_command .word_complete;
+                            continue :command .word_complete;
                         };
 
                         switch (tok.type) {
                             .Redirection => |redir| {
                                 // Encountered redirection while collecting word.
                                 // Try to interpret word_parts as a source fd number.
-                                // If successful, use it as the source fd for this
-                                // redirection.
-                                // If not (overflow, non-digits), treat word as a
-                                // regular argument.
-                                if (wordPartsToFdNumber(simple_command.word_collector.parts.items)) |source_fd| {
+                                // If successful, use it as the source fd for this redirection.
+                                if (wordPartsToFdNumber(command.word_collector.parts.items)) |source_fd| {
                                     // Valid source fd - use it for the redirection
-                                    simple_command.setPendingRedir(redir, tok);
+                                    command.setPendingRedir(redir, tok);
                                     _ = try self.consumeToken();
-                                    simple_command.word_collector.parts = .empty;
-                                    simple_command.pending_redir.?.source_fd = source_fd;
-                                    continue :simple_command .need_redir_target;
+                                    command.word_collector.parts.deinit(self.allocator);
+                                    command.word_collector.parts = .empty;
+                                    command.pending_redir.?.source_fd = source_fd;
+                                    continue :command .need_redir_target;
+                                } else if (command.compound_command != null) {
+                                    // In trailing mode, word must be fd number - syntax error
+                                    self.setError("syntax error: unexpected word after compound command", tok.position, tok.line, tok.column);
+                                    return ParseError.UnsupportedSyntax;
                                 } else {
                                     // The word isn't valid for use as an fd.
                                     // Finalize the previous word and we'll look at
                                     // the redirection again later.
-                                    continue :simple_command .word_complete;
+                                    continue :command .word_complete;
                                 }
                             },
                             .LeftParen => {
@@ -1661,7 +1810,7 @@ pub const Parser = struct {
                             },
                             else => {
                                 _ = try self.consumeToken();
-                                simple_command.word_collector.addTokenToParts(tok) catch |err| {
+                                command.word_collector.addTokenToParts(tok) catch |err| {
                                     switch (err) {
                                         error.BadSubstitution => {
                                             self.setError("bad substitution", self.lex.position, self.lex.line, self.lex.column);
@@ -1671,9 +1820,9 @@ pub const Parser = struct {
                                     return err;
                                 };
                                 if (tok.complete) {
-                                    continue :simple_command .word_complete;
+                                    continue :command .word_complete;
                                 } else {
-                                    continue :simple_command .collecting_word;
+                                    continue :command .collecting_word;
                                 }
                             },
                         }
@@ -1690,7 +1839,7 @@ pub const Parser = struct {
                             return err;
                         } orelse {
                             // EOF - error points to end of redirection operator
-                            const redir = simple_command.pending_redir.?;
+                            const redir = command.pending_redir.?;
                             self.setError(
                                 "missing redirection target",
                                 redir.position,
@@ -1703,7 +1852,7 @@ pub const Parser = struct {
                         switch (tok.type) {
                             .Newline, .Semicolon, .DoubleSemicolon => {
                                 // Separator where redirection target was expected
-                                const redir = simple_command.pending_redir.?;
+                                const redir = command.pending_redir.?;
                                 self.setError(
                                     "missing redirection target",
                                     redir.position,
@@ -1715,7 +1864,7 @@ pub const Parser = struct {
                             .Redirection => {
                                 // Another redirection where target was expected -
                                 // error points to end of first redirection
-                                const redir = simple_command.pending_redir.?;
+                                const redir = command.pending_redir.?;
                                 self.setError(
                                     "missing redirection target",
                                     redir.position,
@@ -1736,8 +1885,8 @@ pub const Parser = struct {
                             },
                             else => {
                                 _ = try self.consumeToken();
-                                simple_command.word_collector.startWord(tok);
-                                simple_command.word_collector.addTokenToParts(tok) catch |err| {
+                                command.word_collector.startWord(tok);
+                                command.word_collector.addTokenToParts(tok) catch |err| {
                                     switch (err) {
                                         error.BadSubstitution => {
                                             self.setError("bad substitution", self.lex.position, self.lex.line, self.lex.column);
@@ -1747,25 +1896,25 @@ pub const Parser = struct {
                                     return err;
                                 };
                                 if (tok.complete) {
-                                    continue :simple_command .word_complete;
+                                    continue :command .word_complete;
                                 } else {
-                                    continue :simple_command .collecting_word;
+                                    continue :command .collecting_word;
                                 }
                             },
                         }
                     },
 
                     .word_complete => {
-                        const word = try simple_command.word_collector.finishWord();
+                        const word = try command.word_collector.finishWord();
 
                         // If we have a pending redirection, this word is its target
-                        if (simple_command.pending_redir) |redir| {
+                        if (command.pending_redir) |redir| {
                             const target: RedirectionTarget = if (redir.op == .Fd)
                                 try self.parseFdTarget(word)
                             else
                                 .{ .file = word };
 
-                            try simple_command.redirections.append(self.allocator, .{
+                            try command.redirections.append(self.allocator, .{
                                 .op = redir.op,
                                 .source_fd = redir.source_fd,
                                 .target = target,
@@ -1773,32 +1922,83 @@ pub const Parser = struct {
                                 .line = redir.line,
                                 .column = redir.column,
                             });
-                            simple_command.pending_redir = null;
-                            continue :simple_command .start;
+                            command.pending_redir = null;
+                            // Return to appropriate state based on whether we're in trailing mode
+                            if (command.compound_command != null) {
+                                continue :command .trailing_redirections;
+                            } else {
+                                continue :command .start;
+                            }
+                        }
+
+                        // In trailing mode (after compound command), words must be part of redirections.
+                        // If we get here without pending_redir, it's a syntax error.
+                        if (command.compound_command != null) {
+                            // Check if this word is followed by a redirection (fd number case)
+                            const next_tok = self.peekToken() catch |err| {
+                                self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
+                                word.deinit(self.allocator);
+                                return err;
+                            } orelse {
+                                // EOF - word without redirection after compound command
+                                self.setError("syntax error: unexpected word after compound command", self.lex.position, self.lex.line, self.lex.column);
+                                word.deinit(self.allocator);
+                                return ParseError.UnsupportedSyntax;
+                            };
+
+                            switch (next_tok.type) {
+                                .Redirection => |redir| {
+                                    // Check if the word is a valid fd number
+                                    if (wordPartsToFdNumber(word.parts)) |source_fd| {
+                                        // Free the word - we only needed the fd number
+                                        word.deinit(self.allocator);
+                                        _ = try self.consumeToken();
+                                        command.pending_redir = .{
+                                            .op = redir,
+                                            .source_fd = source_fd,
+                                            .position = next_tok.position,
+                                            .line = next_tok.line,
+                                            .column = next_tok.column,
+                                            .end_line = next_tok.end_line,
+                                            .end_column = next_tok.end_column,
+                                        };
+                                        continue :command .need_redir_target;
+                                    } else {
+                                        // Not a valid fd number
+                                        self.setError("syntax error: unexpected word after compound command", next_tok.position, next_tok.line, next_tok.column);
+                                        word.deinit(self.allocator);
+                                        return ParseError.UnsupportedSyntax;
+                                    }
+                                },
+                                else => {
+                                    // Not followed by redirection
+                                    self.setError("syntax error: unexpected word after compound command", next_tok.position, next_tok.line, next_tok.column);
+                                    word.deinit(self.allocator);
+                                    return ParseError.UnsupportedSyntax;
+                                },
+                            }
                         }
 
                         // Reserved word check - only for first word of command with
                         // no preceding assignments or redirections.
                         // Reference: POSIX.1-2017 Section 2.4 Reserved Words
                         // "when the word is used as: The first word of a command"
-                        if (simple_command.argv.items.len == 0 and
-                            simple_command.assignments.items.len == 0 and
-                            simple_command.redirections.items.len == 0)
+                        if (command.argv.items.len == 0 and
+                            command.assignments.items.len == 0 and
+                            command.redirections.items.len == 0)
                         {
                             if (isUnquotedReservedWord(word)) |reserved| {
                                 switch (reserved) {
                                     .@"if" => {
-                                        // Swap simple_command for if_clause context.
-                                        // The pipeline parent remains on the stack.
-                                        // Clean up simple_command resources before swapping.
-                                        var ctx = ParserContext{ .simple_command = simple_command };
-                                        ctx.deinit(self.allocator);
+                                        // Push command context with state set for trailing redirections.
+                                        // When if_clause completes, it pops to command which
+                                        // then collects trailing redirections.
+                                        command.state = .trailing_redirections;
+                                        self.pushContext(.{ .command = command });
                                         continue :state ParserContext.initIfClause();
                                     },
                                     .then, .elif, .@"else", .fi => {
                                         // These reserved words only terminate an if_clause.
-                                        // At root level (not inside if_clause), they're
-                                        // treated as regular command names.
                                         if (self.hasContextInStack(.if_clause)) {
                                             // Push the reserved word back as a Literal token
                                             // for parent context (if_clause) to handle.
@@ -1807,68 +2007,117 @@ pub const Parser = struct {
                                             self.peeked = .{
                                                 .type = .{ .Literal = @tagName(reserved) },
                                                 .complete = true,
-                                                .position = simple_command.word_collector.start_position,
-                                                .end_position = simple_command.word_collector.start_position + @tagName(reserved).len,
-                                                .line = simple_command.word_collector.start_line,
-                                                .column = simple_command.word_collector.start_column,
-                                                .end_line = simple_command.word_collector.start_line,
-                                                .end_column = simple_command.word_collector.start_column + @tagName(reserved).len,
+                                                .position = command.word_collector.start_position,
+                                                .end_position = command.word_collector.start_position + @tagName(reserved).len,
+                                                .line = command.word_collector.start_line,
+                                                .column = command.word_collector.start_column,
+                                                .end_line = command.word_collector.start_line,
+                                                .end_column = command.word_collector.start_column + @tagName(reserved).len,
                                             };
-                                            continue :simple_command .done;
+                                            continue :command .done;
                                         }
-                                        // Fall through to treat as regular command name
+                                        // Outside if-clause context: syntax error (POSIX requires this)
+                                        self.setError(
+                                            "syntax error near unexpected token",
+                                            word.position,
+                                            word.line,
+                                            word.column,
+                                        );
+                                        return ParseError.UnsupportedSyntax;
                                     },
                                 }
                             }
                         }
 
                         // Check if it's an assignment (only valid before command name)
-                        if (!simple_command.seen_command) {
+                        if (!command.seen_command) {
                             if (try self.tryBuildAssignment(word)) |assignment| {
-                                try simple_command.assignments.append(self.allocator, assignment);
-                                continue :simple_command .start;
+                                try command.assignments.append(self.allocator, assignment);
+                                continue :command .start;
                             }
                         }
 
                         // It's a command/argument
-                        try simple_command.argv.append(self.allocator, word);
-                        simple_command.seen_command = true;
-                        continue :simple_command .start;
+                        try command.argv.append(self.allocator, word);
+                        command.seen_command = true;
+                        continue :command .start;
+                    },
+
+                    .trailing_redirections => {
+                        // After compound command, only redirections are allowed.
+                        const tok = self.peekToken() catch |err| {
+                            self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
+                            return err;
+                        } orelse {
+                            continue :command .done;
+                        };
+
+                        switch (tok.type) {
+                            .Redirection => |redir| {
+                                _ = try self.consumeToken();
+                                command.setPendingRedir(redir, tok);
+                                continue :command .need_redir_target;
+                            },
+                            // Start of potential N> pattern (e.g., "2>" in "fi 2>file")
+                            .Literal, .EscapedLiteral, .SingleQuoted, .DoubleQuoteBegin, .SimpleExpansion, .BraceExpansionBegin, .Continuation => {
+                                _ = try self.consumeToken();
+                                command.word_collector.startWord(tok);
+                                command.word_collector.addTokenToParts(tok) catch |err| {
+                                    switch (err) {
+                                        error.BadSubstitution => {
+                                            self.setError("bad substitution", self.lex.position, self.lex.line, self.lex.column);
+                                        },
+                                        else => {},
+                                    }
+                                    return err;
+                                };
+                                if (tok.complete) {
+                                    continue :command .word_complete;
+                                } else {
+                                    continue :command .collecting_word;
+                                }
+                            },
+                            else => {
+                                // Separator or other token - command is done
+                                continue :command .done;
+                            },
+                        }
                     },
 
                     .done => {
-                        // Build the SimpleCommand if we have any content.
-                        var new_command: ?SimpleCommand = null;
-                        if (simple_command.assignments.items.len != 0 or
-                            simple_command.argv.items.len != 0 or
-                            simple_command.redirections.items.len != 0)
-                        {
-                            new_command = SimpleCommand{
-                                .assignments = try simple_command.assignments.toOwnedSlice(self.allocator),
-                                .argv = try simple_command.argv.toOwnedSlice(self.allocator),
-                                .redirections = try simple_command.redirections.toOwnedSlice(self.allocator),
-                            };
-                        }
+                        // Pop to parent context (pipeline) and add our command.
+                        var parent = self.popContext() orelse unreachable;
 
-                        // Pop parent context from stack and add our result to it.
-                        var next_context = self.popContext() orelse {
-                            // Stack empty - we're at root level, which shouldn't
-                            // happen since simple_command is always nested in pipeline.
-                            unreachable;
-                        };
+                        // Build the Command struct
+                        const has_content = command.assignments.items.len != 0 or
+                            command.argv.items.len != 0 or
+                            command.redirections.items.len != 0 or
+                            command.compound_command != null;
 
-                        switch (next_context) {
-                            .simple_command, .and_or_list, .if_clause => {
-                                // simple_command should only pop to pipeline.
-                                unreachable;
-                            },
-                            .pipeline => |*pipeline| {
-                                if (new_command) |cmd| {
-                                    try pipeline.commands.append(self.allocator, .{ .simple = cmd });
+                        if (has_content) {
+                            const cmd_type: Command.Type = if (command.compound_command) |cc|
+                                switch (cc) {
+                                    .if_clause => |ic| .{ .if_clause = ic },
                                 }
-                            },
+                            else
+                                .{ .simple = SimpleCommand{
+                                    .assignments = try command.assignments.toOwnedSlice(self.allocator),
+                                    .argv = try command.argv.toOwnedSlice(self.allocator),
+                                } };
+
+                            const cmd = Command{
+                                .type = cmd_type,
+                                .redirections = try command.redirections.toOwnedSlice(self.allocator),
+                            };
+
+                            switch (parent) {
+                                .pipeline => |*pl| {
+                                    try pl.commands.append(self.allocator, cmd);
+                                },
+                                .command, .and_or_list, .if_clause => unreachable,
+                            }
                         }
-                        continue :state next_context;
+                        continue :state parent;
                     },
                 }
             },
@@ -1885,7 +2134,7 @@ pub const Parser = struct {
                     }
                 }
 
-                // Check for reserved word terminator that was pushed back by simple_command
+                // Check for reserved word terminator that was pushed back by command
                 const tok = self.peekToken() catch |err| {
                     self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
                     return err;
@@ -1896,7 +2145,7 @@ pub const Parser = struct {
                 };
 
                 // Check if it's a reserved word. Only consider complete tokens -
-                // when simple_command detects a reserved word like "fi", it pushes
+                // when command detects a reserved word like "fi", it pushes
                 // back a synthetic Literal token with complete=true. However, if
                 // the token came directly from the lexer (e.g., incomplete "fi" at
                 // EOF), it may have complete=false, meaning more content could follow
@@ -1974,14 +2223,15 @@ pub const Parser = struct {
                                         .branches = try ic.branches.toOwnedSlice(self.allocator),
                                         .else_body = null,
                                     };
-                                    // Pop to pipeline, add command
+                                    // Pop to command context (will collect trailing redirections)
+                                    // State was pre-configured to .trailing_redirections when if was detected
                                     var parent = self.popContext() orelse unreachable;
                                     switch (parent) {
-                                        .pipeline => |*pl| {
-                                            try pl.commands.append(self.allocator, .{ .if_clause = result });
+                                        .command => |*cmd_ctx| {
+                                            cmd_ctx.compound_command = .{ .if_clause = result };
                                             continue :state parent;
                                         },
-                                        .simple_command, .and_or_list, .if_clause => unreachable,
+                                        .and_or_list, .if_clause, .pipeline => unreachable,
                                     }
                                 },
                                 .@"if" => {
@@ -2006,13 +2256,15 @@ pub const Parser = struct {
                                     .branches = try ic.branches.toOwnedSlice(self.allocator),
                                     .else_body = .{ .commands = try ic.else_body.toOwnedSlice(self.allocator) },
                                 };
+                                // Pop to command context (will collect trailing redirections)
+                                // State was pre-configured to .trailing_redirections when if was detected
                                 var parent = self.popContext() orelse unreachable;
                                 switch (parent) {
-                                    .pipeline => |*pl| {
-                                        try pl.commands.append(self.allocator, .{ .if_clause = result });
+                                    .command => |*cmd_ctx| {
+                                        cmd_ctx.compound_command = .{ .if_clause = result };
                                         continue :state parent;
                                     },
-                                    .simple_command, .and_or_list, .if_clause => unreachable,
+                                    .and_or_list, .if_clause, .pipeline => unreachable,
                                 }
                             } else if (reserved == .@"if") {
                                 // Nested if in else - let and_or_list handle it
@@ -2363,15 +2615,16 @@ fn expectSimpleCommand(
     expected_redirections: usize,
 ) !void {
     const c = cmd orelse return error.ExpectedCommand;
-    const simple = blk: {
+    const command = blk: {
         const pipeline = c.and_or.items[0].pipeline;
         // For testing simple commands wrapped in pipelines, use first command
         // TODO: Add dedicated pipeline testing helper when pipeline execution is implemented
         try std.testing.expectEqual(@as(usize, 1), pipeline.commands.len);
-        break :blk switch (pipeline.commands[0]) {
-            .simple => |s| s,
-            .if_clause => return error.ExpectedSimpleCommand,
-        };
+        break :blk pipeline.commands[0];
+    };
+    const simple = switch (command.type) {
+        .simple => |s| s,
+        .if_clause => return error.ExpectedSimpleCommand,
     };
 
     try std.testing.expectEqual(expected_assignments.len, simple.assignments.len);
@@ -2385,7 +2638,7 @@ fn expectSimpleCommand(
         try expectWord(word, expected);
     }
 
-    try std.testing.expectEqual(expected_redirections, simple.redirections.len);
+    try std.testing.expectEqual(expected_redirections, command.redirections.len);
 }
 
 fn expectFileTarget(target: RedirectionTarget, expected_parts: []const WordPart) !void {
@@ -2412,10 +2665,16 @@ fn expectCloseTarget(target: RedirectionTarget) !void {
     }
 }
 
+/// Helper to extract the first Command from a ParsedCommand.
+/// Use this when testing simple commands that are wrapped in the AndOrList/Pipeline structure.
+fn getFirstCommand(cmd: ParsedCommand) Command {
+    return getPipeline(cmd).commands[0];
+}
+
 /// Helper to extract the first SimpleCommand from a ParsedCommand.
 /// Use this when testing simple commands that are wrapped in the AndOrList/Pipeline structure.
 fn getFirstSimpleCommand(cmd: ParsedCommand) SimpleCommand {
-    return switch (getPipeline(cmd).commands[0]) {
+    return switch (getFirstCommand(cmd).type) {
         .simple => |s| s,
         .if_clause => unreachable,
     };
@@ -2569,13 +2828,17 @@ test "parseCommand: simple redirection" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = getFirstSimpleCommand(cmd);
+    const command = getFirstCommand(cmd);
+    const simple = switch (command.type) {
+        .simple => |s| s,
+        .if_clause => unreachable,
+    };
 
     try std.testing.expectEqual(@as(usize, 0), simple.assignments.len);
     try std.testing.expectEqual(@as(usize, 0), simple.argv.len);
-    try std.testing.expectEqual(@as(usize, 1), simple.redirections.len);
+    try std.testing.expectEqual(@as(usize, 1), command.redirections.len);
 
-    const redir = simple.redirections[0];
+    const redir = command.redirections[0];
     try std.testing.expectEqual(lexer.Redirection.Out, redir.op);
     try std.testing.expectEqual(@as(?u32, null), redir.source_fd);
     try expectFileTarget(redir.target, &.{.{ .literal = "file" }});
@@ -2591,11 +2854,15 @@ test "parseCommand: command with redirection" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = getFirstSimpleCommand(cmd);
+    const command = getFirstCommand(cmd);
+    const simple = switch (command.type) {
+        .simple => |s| s,
+        .if_clause => unreachable,
+    };
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
-    try std.testing.expectEqual(@as(usize, 1), simple.redirections.len);
-    try expectFileTarget(simple.redirections[0].target, &.{.{ .literal = "out" }});
+    try std.testing.expectEqual(@as(usize, 1), command.redirections.len);
+    try expectFileTarget(command.redirections[0].target, &.{.{ .literal = "out" }});
 }
 
 test "parseCommand: fd redirection 2>&1" {
@@ -2608,12 +2875,16 @@ test "parseCommand: fd redirection 2>&1" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = getFirstSimpleCommand(cmd);
+    const command = getFirstCommand(cmd);
+    const simple = switch (command.type) {
+        .simple => |s| s,
+        .if_clause => unreachable,
+    };
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
-    try std.testing.expectEqual(@as(usize, 1), simple.redirections.len);
+    try std.testing.expectEqual(@as(usize, 1), command.redirections.len);
 
-    const redir = simple.redirections[0];
+    const redir = command.redirections[0];
     try std.testing.expectEqual(lexer.Redirection.Fd, redir.op);
     try std.testing.expectEqual(@as(?u32, 2), redir.source_fd);
     try expectFdTarget(redir.target, 1);
@@ -2629,14 +2900,18 @@ test "parseCommand: multiple redirections" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = getFirstSimpleCommand(cmd);
+    const command = getFirstCommand(cmd);
+    const simple = switch (command.type) {
+        .simple => |s| s,
+        .if_clause => unreachable,
+    };
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
-    try std.testing.expectEqual(@as(usize, 3), simple.redirections.len);
+    try std.testing.expectEqual(@as(usize, 3), command.redirections.len);
 
-    try std.testing.expectEqual(lexer.Redirection.Out, simple.redirections[0].op);
-    try std.testing.expectEqual(lexer.Redirection.Fd, simple.redirections[1].op);
-    try std.testing.expectEqual(lexer.Redirection.In, simple.redirections[2].op);
+    try std.testing.expectEqual(lexer.Redirection.Out, command.redirections[0].op);
+    try std.testing.expectEqual(lexer.Redirection.Fd, command.redirections[1].op);
+    try std.testing.expectEqual(lexer.Redirection.In, command.redirections[2].op);
 }
 
 test "parseCommand: missing redirection target" {
@@ -2697,7 +2972,11 @@ test "parseCommand: quoted redirection-like string is literal" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = getFirstSimpleCommand(cmd);
+    const command = getFirstCommand(cmd);
+    const simple = switch (command.type) {
+        .simple => |s| s,
+        .if_clause => unreachable,
+    };
 
     // Should have 2 argv items: "cmd" and "2>&1"
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
@@ -2706,7 +2985,7 @@ test "parseCommand: quoted redirection-like string is literal" {
     try expectWord(simple.argv[1], &.{.{ .double_quoted = &.{.{ .literal = "2>&1" }} }});
 
     // No redirections
-    try std.testing.expectEqual(@as(usize, 0), simple.redirections.len);
+    try std.testing.expectEqual(@as(usize, 0), command.redirections.len);
 }
 
 test "parseCommand: single-quoted redirection-like string is literal" {
@@ -2720,7 +2999,11 @@ test "parseCommand: single-quoted redirection-like string is literal" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = getFirstSimpleCommand(cmd);
+    const command = getFirstCommand(cmd);
+    const simple = switch (command.type) {
+        .simple => |s| s,
+        .if_clause => unreachable,
+    };
 
     // Should have 2 argv items: "cmd" and "2>&1"
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
@@ -2728,7 +3011,7 @@ test "parseCommand: single-quoted redirection-like string is literal" {
     try expectWord(simple.argv[1], &.{.{ .quoted = "2>&1" }}); // Single quotes preserve content as-is
 
     // No redirections
-    try std.testing.expectEqual(@as(usize, 0), simple.redirections.len);
+    try std.testing.expectEqual(@as(usize, 0), command.redirections.len);
 }
 
 test "parseCommand: command followed by double-quoted expansion" {
@@ -2806,7 +3089,11 @@ test "parseCommand: complex command" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = getFirstSimpleCommand(cmd);
+    const command = getFirstCommand(cmd);
+    const simple = switch (command.type) {
+        .simple => |s| s,
+        .if_clause => unreachable,
+    };
 
     try std.testing.expectEqual(@as(usize, 1), simple.assignments.len);
     try std.testing.expectEqualStrings("FOO", simple.assignments[0].name);
@@ -2815,7 +3102,7 @@ test "parseCommand: complex command" {
     try expectWord(simple.argv[0], &.{.{ .literal = "cmd" }});
     try expectWord(simple.argv[1], &.{.{ .quoted = "arg 1" }});
 
-    try std.testing.expectEqual(@as(usize, 2), simple.redirections.len);
+    try std.testing.expectEqual(@as(usize, 2), command.redirections.len);
 }
 
 test "parseCommand: assignment after command is not assignment" {
@@ -2847,12 +3134,16 @@ test "parseCommand: fd close >&-" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = getFirstSimpleCommand(cmd);
+    const command = getFirstCommand(cmd);
+    const simple = switch (command.type) {
+        .simple => |s| s,
+        .if_clause => unreachable,
+    };
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
-    try std.testing.expectEqual(@as(usize, 1), simple.redirections.len);
+    try std.testing.expectEqual(@as(usize, 1), command.redirections.len);
 
-    const redir = simple.redirections[0];
+    const redir = command.redirections[0];
     try std.testing.expectEqual(lexer.Redirection.Fd, redir.op);
     try std.testing.expectEqual(@as(?u32, null), redir.source_fd);
     try expectCloseTarget(redir.target);
@@ -2868,11 +3159,11 @@ test "parseCommand: fd close 2>&-" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = getFirstSimpleCommand(cmd);
+    const command = getFirstCommand(cmd);
 
-    try std.testing.expectEqual(@as(usize, 1), simple.redirections.len);
+    try std.testing.expectEqual(@as(usize, 1), command.redirections.len);
 
-    const redir = simple.redirections[0];
+    const redir = command.redirections[0];
     try std.testing.expectEqual(lexer.Redirection.Fd, redir.op);
     try std.testing.expectEqual(@as(?u32, 2), redir.source_fd);
     try expectCloseTarget(redir.target);
@@ -2940,13 +3231,17 @@ test "parseCommand: fd redirection 2>&1 with buffer boundary" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = getFirstSimpleCommand(cmd);
+    const command = getFirstCommand(cmd);
+    const simple = switch (command.type) {
+        .simple => |s| s,
+        .if_clause => unreachable,
+    };
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     try expectWord(simple.argv[0], &.{.{ .literal = "cmd" }});
 
-    try std.testing.expectEqual(@as(usize, 1), simple.redirections.len);
-    const redir = simple.redirections[0];
+    try std.testing.expectEqual(@as(usize, 1), command.redirections.len);
+    const redir = command.redirections[0];
     try std.testing.expectEqual(lexer.Redirection.Fd, redir.op);
     try std.testing.expectEqual(@as(?u32, 2), redir.source_fd);
     try expectFdTarget(redir.target, 1);
@@ -2972,12 +3267,16 @@ test "parseCommand: multi-digit fd 12>&1 with buffer boundary" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = getFirstSimpleCommand(cmd);
+    const command = getFirstCommand(cmd);
+    const simple = switch (command.type) {
+        .simple => |s| s,
+        .if_clause => unreachable,
+    };
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
-    try std.testing.expectEqual(@as(usize, 1), simple.redirections.len);
+    try std.testing.expectEqual(@as(usize, 1), command.redirections.len);
 
-    const redir = simple.redirections[0];
+    const redir = command.redirections[0];
     try std.testing.expectEqual(lexer.Redirection.Fd, redir.op);
     try std.testing.expectEqual(@as(?u32, 12), redir.source_fd);
     try expectFdTarget(redir.target, 1);
@@ -3003,14 +3302,18 @@ test "parseCommand: non-digit word before redirection with buffer boundary" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = getFirstSimpleCommand(cmd);
+    const command = getFirstCommand(cmd);
+    const simple = switch (command.type) {
+        .simple => |s| s,
+        .if_clause => unreachable,
+    };
 
     // "a2" should be argv[0], redirection should be separate
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     try expectWord(simple.argv[0], &.{.{ .literal = "a2" }}); // Split across buffer boundaries
 
-    try std.testing.expectEqual(@as(usize, 1), simple.redirections.len);
-    const redir = simple.redirections[0];
+    try std.testing.expectEqual(@as(usize, 1), command.redirections.len);
+    const redir = command.redirections[0];
     try std.testing.expectEqual(lexer.Redirection.Out, redir.op);
     try std.testing.expectEqual(@as(?u32, null), redir.source_fd);
     try expectFileTarget(redir.target, &.{.{ .literal = "file" }});
@@ -3036,13 +3339,17 @@ test "parseCommand: input fd redirection 0<&3 with buffer boundary" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = getFirstSimpleCommand(cmd);
+    const command = getFirstCommand(cmd);
+    const simple = switch (command.type) {
+        .simple => |s| s,
+        .if_clause => unreachable,
+    };
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     try expectWord(simple.argv[0], &.{.{ .literal = "cmd" }});
 
-    try std.testing.expectEqual(@as(usize, 1), simple.redirections.len);
-    const redir = simple.redirections[0];
+    try std.testing.expectEqual(@as(usize, 1), command.redirections.len);
+    const redir = command.redirections[0];
     try std.testing.expectEqual(lexer.Redirection.Fd, redir.op);
     try std.testing.expectEqual(@as(?u32, 0), redir.source_fd);
     try expectFdTarget(redir.target, 3);
@@ -3068,12 +3375,16 @@ test "parseCommand: input redirection 0<file with buffer boundary" {
     const result = try parser_inst.parseCommand();
     const cmd = result orelse return error.ExpectedCommand;
 
-    const simple = getFirstSimpleCommand(cmd);
+    const command = getFirstCommand(cmd);
+    const simple = switch (command.type) {
+        .simple => |s| s,
+        .if_clause => unreachable,
+    };
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
-    try std.testing.expectEqual(@as(usize, 1), simple.redirections.len);
+    try std.testing.expectEqual(@as(usize, 1), command.redirections.len);
 
-    const redir = simple.redirections[0];
+    const redir = command.redirections[0];
     try std.testing.expectEqual(lexer.Redirection.In, redir.op);
     try std.testing.expectEqual(@as(?u32, 0), redir.source_fd);
     try expectFileTarget(redir.target, &.{.{ .literal = "input" }});
@@ -3176,6 +3487,9 @@ fn commandsEqual(allocator: Allocator, a: ?ParsedCommand, b: ?ParsedCommand) !bo
     const cmd_a = a.?;
     const cmd_b = b.?;
 
+    const command_a = getFirstCommand(cmd_a);
+    const command_b = getFirstCommand(cmd_b);
+
     const simple_a = getFirstSimpleCommand(cmd_a);
     const simple_b = getFirstSimpleCommand(cmd_b);
 
@@ -3196,9 +3510,9 @@ fn commandsEqual(allocator: Allocator, a: ?ParsedCommand, b: ?ParsedCommand) !bo
         if (!std.mem.eql(u8, str_a, str_b)) return false;
     }
 
-    // Compare redirections
-    if (simple_a.redirections.len != simple_b.redirections.len) return false;
-    for (simple_a.redirections, simple_b.redirections) |redir_a, redir_b| {
+    // Compare redirections (now on Command, not SimpleCommand)
+    if (command_a.redirections.len != command_b.redirections.len) return false;
+    for (command_a.redirections, command_b.redirections) |redir_a, redir_b| {
         if (redir_a.op != redir_b.op) return false;
         if (redir_a.source_fd != redir_b.source_fd) return false;
         // Compare targets based on their type
@@ -3937,7 +4251,7 @@ test "ParsedCommand: accessing pipeline through and_or" {
     const pipeline = cmd.?.and_or.items[0].pipeline;
     // For a single command, pipeline has one command
     try std.testing.expectEqual(@as(usize, 1), pipeline.commands.len);
-    const simple = switch (pipeline.commands[0]) {
+    const simple = switch (pipeline.commands[0].type) {
         .simple => |s| s,
         .if_clause => unreachable,
     };
@@ -4272,7 +4586,7 @@ test "parseCommand: bang followed by quote is command name" {
     try std.testing.expect(!pipeline.negated);
     try std.testing.expectEqual(@as(usize, 1), pipeline.commands.len);
 
-    const simple = switch (pipeline.commands[0]) {
+    const simple = switch (pipeline.commands[0].type) {
         .simple => |s| s,
         .if_clause => unreachable,
     };
@@ -4299,7 +4613,7 @@ test "parseCommand: bang followed by expansion is command name" {
     try std.testing.expect(!pipeline.negated);
     try std.testing.expectEqual(@as(usize, 1), pipeline.commands.len);
 
-    const simple = switch (pipeline.commands[0]) {
+    const simple = switch (pipeline.commands[0].type) {
         .simple => |s| s,
         .if_clause => unreachable,
     };
@@ -4539,7 +4853,7 @@ test "parseCommand: semicolon terminates and_or list" {
 
 /// Helper to extract the first IfClause from a ParsedCommand.
 fn getFirstIfClause(cmd: ParsedCommand) IfClause {
-    return switch (getPipeline(cmd).commands[0]) {
+    return switch (getPipeline(cmd).commands[0].type) {
         .if_clause => |ic| ic,
         .simple => unreachable,
     };
@@ -4711,7 +5025,7 @@ test "parseCommand: nested if statement" {
     try std.testing.expectEqual(@as(usize, 1), ic.branches[0].body.commands.len);
     const body_pipeline = ic.branches[0].body.commands[0].items[0].pipeline;
     try std.testing.expectEqual(@as(usize, 1), body_pipeline.commands.len);
-    try std.testing.expect(body_pipeline.commands[0] == .if_clause);
+    try std.testing.expect(body_pipeline.commands[0].type == .if_clause);
 }
 
 test "parseCommand: quoted 'then' is not reserved word" {
@@ -4787,10 +5101,9 @@ test "parseCommand: if with empty body is syntax error" {
     try std.testing.expectError(ParseError.UnsupportedSyntax, result);
 }
 
-test "parseCommand: fi at root level is regular command" {
-    // Reserved words like 'fi' are only recognized inside their respective
-    // compound commands. At root level (not inside an if_clause), 'fi' is
-    // treated as a regular command name.
+test "parseCommand: fi at root level is syntax error" {
+    // Reserved words like 'fi' outside their compound command context
+    // are syntax errors (matching bash/dash behavior).
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -4798,12 +5111,52 @@ test "parseCommand: fi at root level is regular command" {
     var lex = lexer.Lexer.init(&reader);
     var parser_inst = Parser.init(arena.allocator(), &lex);
 
+    const result = parser_inst.parseCommand();
+    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
+}
+
+test "parseCommand: word after fi is syntax error" {
+    // Bare words after compound commands are syntax errors (matching bash/dash).
+    // e.g., "if true; then echo x; fi hello" is rejected.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if true; then echo x; fi hello\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = parser_inst.parseCommand();
+    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
+}
+
+test "parseCommand: non-fd word before redirection after fi is syntax error" {
+    // "if true; then echo x; fi hello>file" - "hello" is not a valid fd number.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if true; then echo x; fi hello>file\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = parser_inst.parseCommand();
+    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
+}
+
+test "parseCommand: fd number redirection after fi is valid" {
+    // "if true; then echo x; fi 2>file" - "2" is a valid fd number.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if true; then echo x; fi 2>file\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
     const result = try parser_inst.parseCommand();
     try std.testing.expect(result != null);
-    // It's a simple command with argv[0] = "fi"
-    const simple = getFirstSimpleCommand(result.?);
-    try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
-    try std.testing.expectEqualStrings("fi", simple.argv[0].parts[0].literal);
+
+    const cmd = getFirstCommand(result.?);
+    try std.testing.expectEqual(@as(usize, 1), cmd.redirections.len);
+    try std.testing.expectEqual(@as(?u32, 2), cmd.redirections[0].source_fd);
 }
 
 test "parseCommand: assignment before then is valid condition" {

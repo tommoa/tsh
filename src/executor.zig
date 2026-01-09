@@ -252,7 +252,7 @@ pub const Executor = struct {
     /// the exit builtin was invoked.
     ///
     /// POSIX Reference: Section 2.9.1 - Simple Commands
-    pub fn execute(self: *Executor, cmd: SimpleCommand) ExecuteError!ExitStatus {
+    pub fn execute(self: *Executor, cmd: SimpleCommand, redirections: []const ParsedRedirection) ExecuteError!ExitStatus {
         self.error_info = null;
 
         // Handle commands with no argv
@@ -273,9 +273,9 @@ pub const Executor = struct {
             }
 
             // If there are redirections, apply them to the shell (e.g., "> file" creates/truncates file)
-            if (cmd.redirections.len > 0) {
+            if (redirections.len > 0) {
                 // files_only=true: only create/truncate files, don't redirect shell's fds.
-                switch (applyRedirections(self.allocator, cmd.redirections, true, self.shell_state)) {
+                switch (applyRedirections(self.allocator, redirections, true, self.shell_state)) {
                     .ok => {
                         self.shell_state.last_status = .{ .exited = 0 };
                     },
@@ -342,7 +342,7 @@ pub const Executor = struct {
 
             // Save fds and apply redirections for builtins
             // If no redirections, save/restore are no-ops (empty entries list)
-            const saved_fds = SavedFds.save(cmd.redirections) catch {
+            const saved_fds = SavedFds.save(redirections) catch {
                 printError("too many redirections\n", .{});
                 self.setError("too many redirections", null);
                 self.shell_state.last_status = .{ .exited = ExitStatus.GENERAL_ERROR };
@@ -350,8 +350,8 @@ pub const Executor = struct {
             };
             defer _ = saved_fds.restore();
 
-            if (cmd.redirections.len > 0) {
-                switch (applyRedirections(self.allocator, cmd.redirections, false, self.shell_state)) {
+            if (redirections.len > 0) {
+                switch (applyRedirections(self.allocator, redirections, false, self.shell_state)) {
                     .ok => {},
                     .err => |msg| {
                         // Empty message means error was already printed (e.g., ParameterUnsetOrNull)
@@ -388,7 +388,7 @@ pub const Executor = struct {
 
         if (pid == 0) {
             // Child process - executeChild is noreturn (it execs or exits)
-            self.executeChild(cmd, argv, .{});
+            self.executeChild(cmd, redirections, argv, .{});
         }
 
         // Parent process
@@ -633,8 +633,9 @@ pub const Executor = struct {
     /// Reference: POSIX.1-2017 Section 2.9.1 Simple Commands
     /// Reference: POSIX.1-2017 Section 2.9.4 Compound Commands
     fn executeSingleCommand(self: *Executor, cmd: Command) ExecuteError!ExitStatus {
-        return switch (cmd) {
-            .simple => |s| try self.execute(s),
+        // TODO: Apply cmd.redirections here for compound commands
+        return switch (cmd.type) {
+            .simple => |s| try self.execute(s, cmd.redirections),
             .if_clause => |ic| try self.executeIfClause(ic),
         };
     }
@@ -652,7 +653,8 @@ pub const Executor = struct {
         // Apply pipe wiring first
         config.applyPipes();
 
-        switch (cmd) {
+        // TODO: Apply cmd.redirections here for compound commands
+        switch (cmd.type) {
             .simple => |s| {
                 // Simple commands need special handling: argv expansion,
                 // redirections, builtin dispatch, and exec for externals.
@@ -665,7 +667,7 @@ pub const Executor = struct {
                 };
                 // executeChild applies its own pipe wiring, but we already did it.
                 // Pass a no-op config since pipes are already set up.
-                self.executeChild(s, argv, .{ .stdin_fd = null, .stdout_fd = null });
+                self.executeChild(s, cmd.redirections, argv, .{ .stdin_fd = null, .stdout_fd = null });
             },
             .if_clause => |ic| {
                 // Compound commands can use the normal execution path
@@ -693,6 +695,7 @@ pub const Executor = struct {
     fn executeChild(
         self: *Executor,
         cmd: SimpleCommand,
+        redirections: []const ParsedRedirection,
         argv: [*:null]const ?[*:0]const u8,
         config: ExecConfig,
     ) noreturn {
@@ -700,7 +703,7 @@ pub const Executor = struct {
         config.applyPipes();
 
         // 2. Apply command redirections
-        switch (applyRedirections(self.allocator, cmd.redirections, false, self.shell_state)) {
+        switch (applyRedirections(self.allocator, redirections, false, self.shell_state)) {
             .ok => {},
             .err => |msg| {
                 // Empty message means error was already printed (e.g., ParameterUnsetOrNull)
