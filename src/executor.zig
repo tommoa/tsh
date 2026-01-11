@@ -20,6 +20,7 @@ const SimpleCommand = parser.SimpleCommand;
 const ParsedCommand = parser.ParsedCommand;
 const Command = parser.Command;
 const IfClause = parser.IfClause;
+const LoopClause = parser.LoopClause;
 const CompoundList = parser.CompoundList;
 const AndOrList = parser.AndOrList;
 
@@ -628,6 +629,35 @@ pub const Executor = struct {
         return ExitStatus{ .exited = 0 };
     }
 
+    /// Execute a while or until loop.
+    ///
+    /// Reference: POSIX.1-2017 Section 2.9.4.3
+    /// "The while loop shall continuously execute one compound-list as long as
+    /// another compound-list has a zero exit status."
+    /// "The until loop shall continuously execute one compound-list as long as
+    /// another compound-list has a non-zero exit status."
+    ///
+    /// The exit status is the exit status of the last body execution,
+    /// or zero if the body was never executed.
+    fn executeLoopClause(self: *Executor, lc: LoopClause, is_until: bool) ExecuteError!ExitStatus {
+        var status: ExitStatus = .{ .exited = 0 };
+
+        while (true) {
+            const cond_status = try self.executeCompoundList(lc.condition);
+            const cond_exit = cond_status.toExitCode();
+
+            // while: continue if condition exits 0
+            // until: continue if condition exits non-zero
+            const should_continue = if (is_until) (cond_exit != 0) else (cond_exit == 0);
+
+            if (!should_continue) break;
+
+            status = try self.executeCompoundList(lc.body);
+        }
+
+        return status;
+    }
+
     /// Execute a single command (simple or compound) in the current environment.
     ///
     /// This is the unified dispatch point for all command types. Simple commands
@@ -669,8 +699,24 @@ pub const Executor = struct {
         return switch (cmd.type) {
             .simple => unreachable, // handled above
             .if_clause => |ic| self.executeIfClause(ic),
-            .while_clause, .until_clause => return error.NotImplemented,
+            .while_clause => |lc| self.executeLoopClause(lc, false),
+            .until_clause => |lc| self.executeLoopClause(lc, true),
         };
+    }
+
+    /// Handle an ExecuteError in a child process by exiting with appropriate status.
+    ///
+    /// For ExitRequested errors (from the exit builtin), uses the shell's exit code.
+    /// For all other errors, prints a diagnostic message and exits with GENERAL_ERROR.
+    /// This function never returns - it always calls posix.exit().
+    fn exitWithError(self: *Executor, err: ExecuteError) noreturn {
+        switch (err) {
+            error.ExitRequested => posix.exit(self.shell_state.exit_code),
+            else => {
+                printError("command execution failed: {s}\n", .{@errorName(err)});
+                posix.exit(ExitStatus.GENERAL_ERROR);
+            },
+        }
     }
 
     /// Execute a single command in a child process (for pipeline stages).
@@ -711,20 +757,9 @@ pub const Executor = struct {
 
         const status = switch (cmd.type) {
             .simple => unreachable, // handled above
-            .if_clause => |ic| self.executeIfClause(ic) catch |err| {
-                switch (err) {
-                    error.ExitRequested => posix.exit(self.shell_state.exit_code),
-                    else => {
-                        printError("command execution failed: {s}\n", .{@errorName(err)});
-                        posix.exit(ExitStatus.GENERAL_ERROR);
-                    },
-                }
-            },
-            .while_clause, .until_clause => {
-                // Not implemented yet
-                printError("loop execution not yet implemented\n", .{});
-                posix.exit(ExitStatus.GENERAL_ERROR);
-            },
+            .if_clause => |ic| self.executeIfClause(ic) catch |err| self.exitWithError(err),
+            .while_clause => |lc| self.executeLoopClause(lc, false) catch |err| self.exitWithError(err),
+            .until_clause => |lc| self.executeLoopClause(lc, true) catch |err| self.exitWithError(err),
         };
         posix.exit(status.toExitCode());
     }
