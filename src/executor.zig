@@ -669,6 +669,7 @@ pub const Executor = struct {
         return switch (cmd.type) {
             .simple => unreachable, // handled above
             .if_clause => |ic| self.executeIfClause(ic),
+            .while_clause, .until_clause => return error.NotImplemented,
         };
     }
 
@@ -718,6 +719,11 @@ pub const Executor = struct {
                         posix.exit(ExitStatus.GENERAL_ERROR);
                     },
                 }
+            },
+            .while_clause, .until_clause => {
+                // Not implemented yet
+                printError("loop execution not yet implemented\n", .{});
+                posix.exit(ExitStatus.GENERAL_ERROR);
             },
         };
         posix.exit(status.toExitCode());

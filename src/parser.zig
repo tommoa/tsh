@@ -463,6 +463,10 @@ pub const ReservedWord = enum {
     elif,
     @"else",
     fi,
+    @"while",
+    until,
+    do,
+    done,
 };
 
 /// A compound-list: a sequence of AND/OR lists.
@@ -475,6 +479,14 @@ pub const ReservedWord = enum {
 /// AND/OR list executed.
 pub const CompoundList = struct {
     commands: []const AndOrList,
+
+    /// Format this compound list to a writer.
+    pub fn format(self: CompoundList, writer: *std.io.Writer) std.io.Writer.Error!void {
+        for (self.commands, 0..) |cmd, i| {
+            if (i > 0) try writer.writeAll("; ");
+            try cmd.format(writer);
+        }
+    }
 
     /// Free all memory allocated for this compound list.
     pub fn deinit(self: CompoundList, allocator: Allocator) void {
@@ -514,22 +526,15 @@ pub const IfClause = struct {
             } else {
                 try writer.writeAll("elif ");
             }
-            try formatCompoundList(branch.condition, writer);
+            try branch.condition.format(writer);
             try writer.writeAll("; then ");
-            try formatCompoundList(branch.body, writer);
+            try branch.body.format(writer);
         }
         if (self.else_body) |else_body| {
             try writer.writeAll("; else ");
-            try formatCompoundList(else_body, writer);
+            try else_body.format(writer);
         }
         try writer.writeAll("; fi");
-    }
-
-    fn formatCompoundList(cl: CompoundList, writer: *std.io.Writer) std.io.Writer.Error!void {
-        for (cl.commands, 0..) |cmd, i| {
-            if (i > 0) try writer.writeAll("; ");
-            try cmd.format(writer);
-        }
     }
 
     /// Free all memory allocated for this if clause.
@@ -544,11 +549,43 @@ pub const IfClause = struct {
     }
 };
 
+/// A loop construct (while or until).
+///
+/// Reference: POSIX.1-2017 Section 2.9.4.3 Compound Commands: while/until
+///
+/// Syntax:
+///   while compound-list-1; do compound-list-2; done
+///   until compound-list-1; do compound-list-2; done
+///
+/// Executes body while/until condition exits with specified status.
+/// For while: continues if condition exits 0.
+/// For until: continues if condition exits non-zero.
+pub const LoopClause = struct {
+    /// The condition compound-list.
+    condition: CompoundList,
+    /// The loop body.
+    body: CompoundList,
+
+    pub fn format(self: LoopClause, writer: *std.io.Writer) std.io.Writer.Error!void {
+        try writer.writeAll("loop ");
+        try self.condition.format(writer);
+        try writer.writeAll("; do ");
+        try self.body.format(writer);
+        try writer.writeAll("; done");
+    }
+
+    /// Free all memory allocated for this loop clause.
+    pub fn deinit(self: LoopClause, allocator: Allocator) void {
+        self.condition.deinit(allocator);
+        self.body.deinit(allocator);
+    }
+};
+
 /// A single command in a pipeline (POSIX 2.9.2)
 ///
-/// Currently supports simple commands and if clauses. Future additions will
-/// include other compound commands (brace groups, subshells, while/for/case
-/// clauses) and function definitions per POSIX Section 2.9.5.
+/// Currently supports simple commands, if clauses, and while/until loops.
+/// Future additions will include other compound commands (brace groups,
+/// subshells, for/case clauses) and function definitions per POSIX Section 2.9.5.
 ///
 /// Redirections apply to the entire command. For simple commands, they may
 /// appear anywhere in the command (before, after, or interleaved with arguments).
@@ -558,6 +595,8 @@ pub const Command = struct {
     pub const Type = union(enum) {
         simple: SimpleCommand,
         if_clause: IfClause,
+        while_clause: LoopClause,
+        until_clause: LoopClause,
     };
 
     type: Type,
@@ -572,6 +611,14 @@ pub const Command = struct {
         switch (self.type) {
             .simple => |s| try s.formatIndented(writer, indent),
             .if_clause => |ic| try ic.format(writer),
+            .while_clause => |wc| {
+                try writer.writeAll("while ");
+                try wc.format(writer);
+            },
+            .until_clause => |uc| {
+                try writer.writeAll("until ");
+                try uc.format(writer);
+            },
         }
         if (self.redirections.len > 0) {
             try writer.splatByteAll(' ', indent + 2);
@@ -590,6 +637,8 @@ pub const Command = struct {
         switch (self.type) {
             .simple => |s| s.deinit(allocator),
             .if_clause => |ic| ic.deinit(allocator),
+            .while_clause => |wc| wc.deinit(allocator),
+            .until_clause => |uc| uc.deinit(allocator),
         }
         for (self.redirections) |redir| {
             redir.deinit(allocator);
@@ -745,6 +794,8 @@ const ParserContext = union(enum) {
         /// If set, this is a compound command; if null, it's a simple command.
         compound_command: ?union(enum) {
             if_clause: IfClause,
+            while_clause: LoopClause,
+            until_clause: LoopClause,
         },
 
         /// Set up pending redirection info with default source fd (null).
@@ -797,6 +848,24 @@ const ParserContext = union(enum) {
         completed_and_or: ?AndOrList,
     },
 
+    /// Parsing a while or until clause (POSIX 2.9.4.3)
+    loop_clause: struct {
+        state: enum {
+            /// Parsing the condition compound-list (after 'while' or 'until').
+            in_condition,
+            /// Parsing the body compound-list (after 'do').
+            in_body,
+        },
+        /// True for 'until', false for 'while'.
+        is_until: bool,
+        /// AND/OR lists for the condition being built.
+        condition: std.ArrayListUnmanaged(AndOrList),
+        /// AND/OR lists for the body being built.
+        body: std.ArrayListUnmanaged(AndOrList),
+        /// Filled by child and_or_list context when it completes.
+        completed_and_or: ?AndOrList,
+    },
+
     /// Initialize a pipeline context.
     fn initPipeline() ParserContext {
         return .{ .pipeline = .{
@@ -841,6 +910,17 @@ const ParserContext = union(enum) {
         } };
     }
 
+    /// Initialize a loop_clause context (for while/until).
+    fn initLoopClause(is_until: bool) ParserContext {
+        return .{ .loop_clause = .{
+            .state = .in_condition,
+            .is_until = is_until,
+            .condition = .empty,
+            .body = .empty,
+            .completed_and_or = null,
+        } };
+    }
+
     fn deinit(self: *ParserContext, allocator: Allocator) void {
         switch (self.*) {
             .pipeline => |*pl| {
@@ -854,6 +934,8 @@ const ParserContext = union(enum) {
                 if (cmd.compound_command) |cc| {
                     switch (cc) {
                         .if_clause => |ic| ic.deinit(allocator),
+                        .while_clause => |wc| wc.deinit(allocator),
+                        .until_clause => |uc| uc.deinit(allocator),
                     }
                 }
             },
@@ -865,6 +947,10 @@ const ParserContext = union(enum) {
                 ic.current_condition.deinit(allocator);
                 ic.current_body.deinit(allocator);
                 ic.else_body.deinit(allocator);
+            },
+            .loop_clause => |*lc| {
+                lc.condition.deinit(allocator);
+                lc.body.deinit(allocator);
             },
         }
     }
@@ -1417,6 +1503,12 @@ pub const Parser = struct {
                                         ic.completed_and_or = null;
                                         continue :state .{ .if_clause = ic };
                                     },
+                                    .loop_clause => |*lc_val| {
+                                        // Empty and_or - continue loop_clause without adding anything
+                                        var lc = lc_val.*;
+                                        lc.completed_and_or = null;
+                                        continue :state .{ .loop_clause = lc };
+                                    },
                                     .pipeline, .command, .and_or_list => unreachable,
                                 }
                             }
@@ -1433,6 +1525,11 @@ pub const Parser = struct {
                                     var ic = ic_val.*;
                                     ic.completed_and_or = result;
                                     continue :state .{ .if_clause = ic };
+                                },
+                                .loop_clause => |*lc_val| {
+                                    var lc = lc_val.*;
+                                    lc.completed_and_or = result;
+                                    continue :state .{ .loop_clause = lc };
                                 },
                                 .pipeline, .command, .and_or_list => unreachable,
                             }
@@ -1674,7 +1771,7 @@ pub const Parser = struct {
                                 // Continue processing and_or_list
                                 continue :state next_context;
                             },
-                            .command, .pipeline, .if_clause => {
+                            .command, .pipeline, .if_clause, .loop_clause => {
                                 // Pipeline should only pop to and_or_list.
                                 unreachable;
                             },
@@ -1993,9 +2090,50 @@ pub const Parser = struct {
                                         // Push command context with state set for trailing redirections.
                                         // When if_clause completes, it pops to command which
                                         // then collects trailing redirections.
+                                        word.deinit(self.allocator);
                                         command.state = .trailing_redirections;
                                         self.pushContext(.{ .command = command });
                                         continue :state ParserContext.initIfClause();
+                                    },
+                                    .@"while" => {
+                                        word.deinit(self.allocator);
+                                        command.state = .trailing_redirections;
+                                        self.pushContext(.{ .command = command });
+                                        continue :state ParserContext.initLoopClause(false);
+                                    },
+                                    .until => {
+                                        word.deinit(self.allocator);
+                                        command.state = .trailing_redirections;
+                                        self.pushContext(.{ .command = command });
+                                        continue :state ParserContext.initLoopClause(true);
+                                    },
+                                    .do, .done => {
+                                        // These reserved words only terminate a loop_clause.
+                                        if (self.hasContextInStack(.loop_clause)) {
+                                            // Push the reserved word back as a Literal token
+                                            // for parent context (loop_clause) to handle.
+                                            self.peeked = .{
+                                                .type = .{ .Literal = @tagName(reserved) },
+                                                .complete = true,
+                                                .position = command.word_collector.start_position,
+                                                .end_position = command.word_collector.start_position + @tagName(reserved).len,
+                                                .line = command.word_collector.start_line,
+                                                .column = command.word_collector.start_column,
+                                                .end_line = command.word_collector.start_line,
+                                                .end_column = command.word_collector.start_column + @tagName(reserved).len,
+                                            };
+                                            word.deinit(self.allocator);
+                                            continue :command .done;
+                                        }
+                                        // Outside loop context: syntax error
+                                        self.setError(
+                                            "syntax error near unexpected token",
+                                            word.position,
+                                            word.line,
+                                            word.column,
+                                        );
+                                        word.deinit(self.allocator);
+                                        return ParseError.UnsupportedSyntax;
                                     },
                                     .then, .elif, .@"else", .fi => {
                                         // These reserved words only terminate an if_clause.
@@ -2014,6 +2152,7 @@ pub const Parser = struct {
                                                 .end_line = command.word_collector.start_line,
                                                 .end_column = command.word_collector.start_column + @tagName(reserved).len,
                                             };
+                                            word.deinit(self.allocator);
                                             continue :command .done;
                                         }
                                         // Outside if-clause context: syntax error (POSIX requires this)
@@ -2023,6 +2162,7 @@ pub const Parser = struct {
                                             word.line,
                                             word.column,
                                         );
+                                        word.deinit(self.allocator);
                                         return ParseError.UnsupportedSyntax;
                                     },
                                 }
@@ -2033,6 +2173,7 @@ pub const Parser = struct {
                         if (!command.seen_command) {
                             if (try self.tryBuildAssignment(word)) |assignment| {
                                 try command.assignments.append(self.allocator, assignment);
+                                word.deinit(self.allocator);
                                 continue :command .start;
                             }
                         }
@@ -2098,6 +2239,8 @@ pub const Parser = struct {
                             const cmd_type: Command.Type = if (command.compound_command) |cc|
                                 switch (cc) {
                                     .if_clause => |ic| .{ .if_clause = ic },
+                                    .while_clause => |wc| .{ .while_clause = wc },
+                                    .until_clause => |uc| .{ .until_clause = uc },
                                 }
                             else
                                 .{ .simple = SimpleCommand{
@@ -2114,7 +2257,7 @@ pub const Parser = struct {
                                 .pipeline => |*pl| {
                                     try pl.commands.append(self.allocator, cmd);
                                 },
-                                .command, .and_or_list, .if_clause => unreachable,
+                                .command, .and_or_list, .if_clause, .loop_clause => unreachable,
                             }
                         }
                         continue :state parent;
@@ -2231,7 +2374,7 @@ pub const Parser = struct {
                                             cmd_ctx.compound_command = .{ .if_clause = result };
                                             continue :state parent;
                                         },
-                                        .and_or_list, .if_clause, .pipeline => unreachable,
+                                        .and_or_list, .if_clause, .loop_clause, .pipeline => unreachable,
                                     }
                                 },
                                 .@"if" => {
@@ -2239,8 +2382,18 @@ pub const Parser = struct {
                                     self.pushContext(.{ .if_clause = ic });
                                     continue :state ParserContext.initAndOrList();
                                 },
+                                .@"while", .until => {
+                                    // Nested loop - let and_or_list handle it
+                                    self.pushContext(.{ .if_clause = ic });
+                                    continue :state ParserContext.initAndOrList();
+                                },
                                 .then => {
                                     self.setError("syntax error: unexpected 'then'", tok.position, tok.line, tok.column);
+                                    return ParseError.UnsupportedSyntax;
+                                },
+                                .do, .done => {
+                                    // Loop reserved words are not valid in if context at this level
+                                    self.setError("syntax error near unexpected token", tok.position, tok.line, tok.column);
                                     return ParseError.UnsupportedSyntax;
                                 },
                             }
@@ -2264,10 +2417,14 @@ pub const Parser = struct {
                                         cmd_ctx.compound_command = .{ .if_clause = result };
                                         continue :state parent;
                                     },
-                                    .and_or_list, .if_clause, .pipeline => unreachable,
+                                    .and_or_list, .if_clause, .loop_clause, .pipeline => unreachable,
                                 }
                             } else if (reserved == .@"if") {
                                 // Nested if in else - let and_or_list handle it
+                                self.pushContext(.{ .if_clause = ic });
+                                continue :state ParserContext.initAndOrList();
+                            } else if (reserved == .@"while" or reserved == .until) {
+                                // Nested loop in else - let and_or_list handle it
                                 self.pushContext(.{ .if_clause = ic });
                                 continue :state ParserContext.initAndOrList();
                             } else {
@@ -2280,6 +2437,106 @@ pub const Parser = struct {
 
                 // Not a reserved word - push and_or_list to parse more commands
                 self.pushContext(.{ .if_clause = ic });
+                continue :state ParserContext.initAndOrList();
+            },
+            .loop_clause => |loop_clause_ctx| {
+                var lc = loop_clause_ctx;
+
+                // Handle completed and_or from child context.
+                if (lc.completed_and_or) |result| {
+                    lc.completed_and_or = null;
+                    switch (lc.state) {
+                        .in_condition => try lc.condition.append(self.allocator, result),
+                        .in_body => try lc.body.append(self.allocator, result),
+                    }
+                }
+
+                // Check for reserved word terminator
+                const tok = self.peekToken() catch |err| {
+                    self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
+                    return err;
+                } orelse {
+                    // EOF inside loop - error
+                    self.setError("syntax error: unexpected end of input (expected 'done')", self.lex.position, self.lex.line, self.lex.column);
+                    return ParseError.UnexpectedEndOfInput;
+                };
+
+                // Check if it's a reserved word
+                const maybe_reserved: ?ReservedWord = switch (tok.type) {
+                    .Literal => |lit| if (tok.complete) std.meta.stringToEnum(ReservedWord, lit) else null,
+                    else => null,
+                };
+
+                if (maybe_reserved) |reserved| {
+                    switch (lc.state) {
+                        .in_condition => {
+                            if (reserved == .do) {
+                                _ = try self.consumeToken();
+                                if (lc.condition.items.len == 0) {
+                                    self.setError("syntax error: expected command before 'do'", tok.position, tok.line, tok.column);
+                                    return ParseError.UnsupportedSyntax;
+                                }
+                                lc.state = .in_body;
+                                self.pushContext(.{ .loop_clause = lc });
+                                continue :state ParserContext.initAndOrList();
+                            } else {
+                                self.setError("syntax error: expected 'do'", tok.position, tok.line, tok.column);
+                                return ParseError.UnsupportedSyntax;
+                            }
+                        },
+                        .in_body => {
+                            switch (reserved) {
+                                .done => {
+                                    _ = try self.consumeToken();
+                                    if (lc.body.items.len == 0) {
+                                        self.setError("syntax error: expected command before 'done'", tok.position, tok.line, tok.column);
+                                        return ParseError.UnsupportedSyntax;
+                                    }
+                                    // Complete the loop clause
+                                    const condition = CompoundList{ .commands = try lc.condition.toOwnedSlice(self.allocator) };
+                                    const body = CompoundList{ .commands = try lc.body.toOwnedSlice(self.allocator) };
+
+                                    // Pop to command context
+                                    var parent = self.popContext() orelse unreachable;
+                                    switch (parent) {
+                                        .command => |*cmd_ctx| {
+                                            if (lc.is_until) {
+                                                cmd_ctx.compound_command = .{ .until_clause = .{
+                                                    .condition = condition,
+                                                    .body = body,
+                                                } };
+                                            } else {
+                                                cmd_ctx.compound_command = .{ .while_clause = .{
+                                                    .condition = condition,
+                                                    .body = body,
+                                                } };
+                                            }
+                                            continue :state parent;
+                                        },
+                                        .and_or_list, .if_clause, .loop_clause, .pipeline => unreachable,
+                                    }
+                                },
+                                .@"while", .until, .@"if" => {
+                                    // Nested loop or if - let and_or_list handle it
+                                    self.pushContext(.{ .loop_clause = lc });
+                                    continue :state ParserContext.initAndOrList();
+                                },
+                                .do => {
+                                    self.setError("syntax error: unexpected 'do'", tok.position, tok.line, tok.column);
+                                    return ParseError.UnsupportedSyntax;
+                                },
+                                .then, .elif, .@"else", .fi => {
+                                    // These are not valid in a loop context at this level
+                                    self.setError("syntax error near unexpected token", tok.position, tok.line, tok.column);
+                                    return ParseError.UnsupportedSyntax;
+                                },
+                            }
+                        },
+                    }
+                }
+
+                // Not a reserved word - push and_or_list to parse more commands
+                self.pushContext(.{ .loop_clause = lc });
                 continue :state ParserContext.initAndOrList();
             },
         }
@@ -2624,7 +2881,7 @@ fn expectSimpleCommand(
     };
     const simple = switch (command.type) {
         .simple => |s| s,
-        .if_clause => return error.ExpectedSimpleCommand,
+        .if_clause, .while_clause, .until_clause => return error.ExpectedSimpleCommand,
     };
 
     try std.testing.expectEqual(expected_assignments.len, simple.assignments.len);
@@ -2676,7 +2933,7 @@ fn getFirstCommand(cmd: ParsedCommand) Command {
 fn getFirstSimpleCommand(cmd: ParsedCommand) SimpleCommand {
     return switch (getFirstCommand(cmd).type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
 }
 
@@ -2831,7 +3088,7 @@ test "parseCommand: simple redirection" {
     const command = getFirstCommand(cmd);
     const simple = switch (command.type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
 
     try std.testing.expectEqual(@as(usize, 0), simple.assignments.len);
@@ -2857,7 +3114,7 @@ test "parseCommand: command with redirection" {
     const command = getFirstCommand(cmd);
     const simple = switch (command.type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
@@ -2878,7 +3135,7 @@ test "parseCommand: fd redirection 2>&1" {
     const command = getFirstCommand(cmd);
     const simple = switch (command.type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
@@ -2903,7 +3160,7 @@ test "parseCommand: multiple redirections" {
     const command = getFirstCommand(cmd);
     const simple = switch (command.type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
@@ -2975,7 +3232,7 @@ test "parseCommand: quoted redirection-like string is literal" {
     const command = getFirstCommand(cmd);
     const simple = switch (command.type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
 
     // Should have 2 argv items: "cmd" and "2>&1"
@@ -3002,7 +3259,7 @@ test "parseCommand: single-quoted redirection-like string is literal" {
     const command = getFirstCommand(cmd);
     const simple = switch (command.type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
 
     // Should have 2 argv items: "cmd" and "2>&1"
@@ -3092,7 +3349,7 @@ test "parseCommand: complex command" {
     const command = getFirstCommand(cmd);
     const simple = switch (command.type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
 
     try std.testing.expectEqual(@as(usize, 1), simple.assignments.len);
@@ -3137,7 +3394,7 @@ test "parseCommand: fd close >&-" {
     const command = getFirstCommand(cmd);
     const simple = switch (command.type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
@@ -3234,7 +3491,7 @@ test "parseCommand: fd redirection 2>&1 with buffer boundary" {
     const command = getFirstCommand(cmd);
     const simple = switch (command.type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
@@ -3270,7 +3527,7 @@ test "parseCommand: multi-digit fd 12>&1 with buffer boundary" {
     const command = getFirstCommand(cmd);
     const simple = switch (command.type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
@@ -3305,7 +3562,7 @@ test "parseCommand: non-digit word before redirection with buffer boundary" {
     const command = getFirstCommand(cmd);
     const simple = switch (command.type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
 
     // "a2" should be argv[0], redirection should be separate
@@ -3342,7 +3599,7 @@ test "parseCommand: input fd redirection 0<&3 with buffer boundary" {
     const command = getFirstCommand(cmd);
     const simple = switch (command.type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
@@ -3378,7 +3635,7 @@ test "parseCommand: input redirection 0<file with buffer boundary" {
     const command = getFirstCommand(cmd);
     const simple = switch (command.type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
 
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
@@ -4253,7 +4510,7 @@ test "ParsedCommand: accessing pipeline through and_or" {
     try std.testing.expectEqual(@as(usize, 1), pipeline.commands.len);
     const simple = switch (pipeline.commands[0].type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
     try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
     try std.testing.expectEqualStrings("echo", simple.argv[0].parts[0].literal);
@@ -4588,7 +4845,7 @@ test "parseCommand: bang followed by quote is command name" {
 
     const simple = switch (pipeline.commands[0].type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     // Word should have "!" literal part and "foo" quoted part
@@ -4615,7 +4872,7 @@ test "parseCommand: bang followed by expansion is command name" {
 
     const simple = switch (pipeline.commands[0].type) {
         .simple => |s| s,
-        .if_clause => unreachable,
+        .if_clause, .while_clause, .until_clause => unreachable,
     };
     try std.testing.expectEqual(@as(usize, 1), simple.argv.len);
     // Word should have "!" literal part and parameter expansion part
@@ -4855,7 +5112,7 @@ test "parseCommand: semicolon terminates and_or list" {
 fn getFirstIfClause(cmd: ParsedCommand) IfClause {
     return switch (getPipeline(cmd).commands[0].type) {
         .if_clause => |ic| ic,
-        .simple => unreachable,
+        .simple, .while_clause, .until_clause => unreachable,
     };
 }
 
@@ -5173,4 +5430,257 @@ test "parseCommand: assignment before then is valid condition" {
 
     const ic = getFirstIfClause(result.?);
     try std.testing.expectEqual(@as(usize, 1), ic.branches.len);
+}
+
+// --- While/Until loop tests ---
+
+/// Helper to extract the first LoopClause from a ParsedCommand.
+fn getFirstLoopClause(cmd: ParsedCommand) LoopClause {
+    const cmd_type = getPipeline(cmd).commands[0].type;
+    return switch (cmd_type) {
+        .while_clause => |lc| lc,
+        .until_clause => |lc| lc,
+        else => unreachable,
+    };
+}
+
+test "parseCommand: simple while loop" {
+    // while true; do echo yes; done
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("while true; do echo yes; done\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.next();
+    try std.testing.expect(result != null);
+
+    const lc = getFirstLoopClause(result.?);
+
+    // Condition should have 1 and_or list with "true"
+    try std.testing.expectEqual(@as(usize, 1), lc.condition.commands.len);
+    // Body should have 1 and_or list with "echo yes"
+    try std.testing.expectEqual(@as(usize, 1), lc.body.commands.len);
+}
+
+test "parseCommand: simple until loop" {
+    // until false; do echo yes; done
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("until false; do echo yes; done\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.next();
+    try std.testing.expect(result != null);
+
+    const lc = getFirstLoopClause(result.?);
+
+    // Condition should have 1 and_or list with "false"
+    try std.testing.expectEqual(@as(usize, 1), lc.condition.commands.len);
+    // Body should have 1 and_or list with "echo yes"
+    try std.testing.expectEqual(@as(usize, 1), lc.body.commands.len);
+}
+
+test "parseCommand: while with multiple commands in condition" {
+    // while echo a; test -f /tmp/flag; do echo waiting; done
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("while echo a; test -f /tmp/flag; do echo waiting; done\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.next();
+    try std.testing.expect(result != null);
+
+    const lc = getFirstLoopClause(result.?);
+
+    // Condition should have 2 and_or lists
+    try std.testing.expectEqual(@as(usize, 2), lc.condition.commands.len);
+}
+
+test "parseCommand: while with multiple commands in body" {
+    // while true; do echo a; echo b; done
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("while true; do echo a; echo b; done\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.next();
+    try std.testing.expect(result != null);
+
+    const lc = getFirstLoopClause(result.?);
+
+    // Body should have 2 and_or lists
+    try std.testing.expectEqual(@as(usize, 2), lc.body.commands.len);
+}
+
+test "parseCommand: nested while loops" {
+    // while true; do while false; do echo inner; done; done
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("while true; do while false; do echo inner; done; done\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.next();
+    try std.testing.expect(result != null);
+
+    const lc = getFirstLoopClause(result.?);
+
+    // Outer body has 1 command which is another while_clause
+    try std.testing.expectEqual(@as(usize, 1), lc.body.commands.len);
+    const body_pipeline = lc.body.commands[0].items[0].pipeline;
+    try std.testing.expectEqual(@as(usize, 1), body_pipeline.commands.len);
+    try std.testing.expect(body_pipeline.commands[0].type == .while_clause);
+}
+
+test "parseCommand: while inside if" {
+    // if true; then while false; do echo x; done; fi
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("if true; then while false; do echo x; done; fi\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.next();
+    try std.testing.expect(result != null);
+
+    const ic = getFirstIfClause(result.?);
+    const body_pipeline = ic.branches[0].body.commands[0].items[0].pipeline;
+    try std.testing.expect(body_pipeline.commands[0].type == .while_clause);
+}
+
+test "parseCommand: if inside while" {
+    // while true; do if false; then echo x; fi; done
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("while true; do if false; then echo x; fi; done\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.next();
+    try std.testing.expect(result != null);
+
+    const lc = getFirstLoopClause(result.?);
+    const body_pipeline = lc.body.commands[0].items[0].pipeline;
+    try std.testing.expect(body_pipeline.commands[0].type == .if_clause);
+}
+
+test "parseCommand: while with newlines" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const input =
+        \\while true
+        \\do
+        \\echo yes
+        \\done
+        \\
+    ;
+    var reader = std.io.Reader.fixed(input);
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.next();
+    try std.testing.expect(result != null);
+    _ = getFirstLoopClause(result.?); // Just verify it parses
+}
+
+test "parseCommand: while loop with AND/OR in condition" {
+    // while true && false; do echo x; done
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("while true && false; do echo x; done\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser_inst.next();
+    try std.testing.expect(result != null);
+
+    const lc = getFirstLoopClause(result.?);
+    // Condition should have 1 and_or list with 2 items
+    try std.testing.expectEqual(@as(usize, 1), lc.condition.commands.len);
+    try std.testing.expectEqual(@as(usize, 2), lc.condition.commands[0].items.len);
+}
+
+test "parseCommand: syntax error - done without while" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("done\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = parser_inst.next();
+    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
+}
+
+test "parseCommand: syntax error - while without done" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("while true; do echo x\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = parser_inst.next();
+    try std.testing.expectError(ParseError.UnexpectedEndOfInput, result);
+}
+
+test "parseCommand: syntax error - while without do" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("while true; done\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = parser_inst.next();
+    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
+}
+
+test "parseCommand: syntax error - do without while" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("do echo x; done\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser_inst = Parser.init(arena.allocator(), &lex);
+
+    const result = parser_inst.next();
+    try std.testing.expectError(ParseError.UnsupportedSyntax, result);
+}
+
+test "parseCommand: until/while difference preserved in AST" {
+    // Verify that until and while are distinguished by the union tag
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Test while
+    var reader1 = std.io.Reader.fixed("while true; do echo x; done\n");
+    var lex1 = lexer.Lexer.init(&reader1);
+    var parser1 = Parser.init(arena.allocator(), &lex1);
+
+    const result1 = try parser1.next();
+    try std.testing.expect(result1 != null);
+    try std.testing.expect(getPipeline(result1.?).commands[0].type == .while_clause);
+
+    // Test until
+    var reader2 = std.io.Reader.fixed("until false; do echo x; done\n");
+    var lex2 = lexer.Lexer.init(&reader2);
+    var parser2 = Parser.init(arena.allocator(), &lex2);
+
+    const result2 = try parser2.next();
+    try std.testing.expect(result2 != null);
+    try std.testing.expect(getPipeline(result2.?).commands[0].type == .until_clause);
 }
