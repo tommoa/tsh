@@ -45,6 +45,10 @@ pub const ExecuteError = error{
     RedirectionFailed,
     /// The `exit` builtin was invoked. The exit code is in shell_state.exit_code.
     ExitRequested,
+    /// The `break` builtin was invoked. The level count is in shell_state.break_levels.
+    BreakRequested,
+    /// The `continue` builtin was invoked. The level count is in shell_state.continue_levels.
+    ContinueRequested,
     /// Feature not yet implemented (e.g., multi-command pipelines).
     NotImplemented,
 } || Allocator.Error || process.GetEnvMapError;
@@ -371,14 +375,36 @@ pub const Executor = struct {
 
             // Run the builtin
             const result = builtin.run(args, self.shell_state);
-            self.shell_state.last_status = .{ .exited = result.exit_code };
 
-            if (result.should_exit) {
-                self.shell_state.exit_code = result.exit_code;
-                return error.ExitRequested;
+            switch (result) {
+                .exit_code => |code| {
+                    self.shell_state.last_status = .{ .exited = code };
+                    return self.shell_state.last_status;
+                },
+                .exit => |code| {
+                    self.shell_state.last_status = .{ .exited = code };
+                    self.shell_state.exit_code = code;
+                    return error.ExitRequested;
+                },
+                .break_loop => |levels| {
+                    self.shell_state.break_levels = levels;
+                    return error.BreakRequested;
+                },
+                .continue_loop => |levels| {
+                    self.shell_state.continue_levels = levels;
+                    return error.ContinueRequested;
+                },
+                .builtin_error => |code| {
+                    // POSIX Section 2.8.1: Special built-in errors cause
+                    // non-interactive shells to exit, interactive shells continue.
+                    self.shell_state.last_status = .{ .exited = code };
+                    if (!self.shell_state.options.interactive) {
+                        self.shell_state.exit_code = code;
+                        return error.ExitRequested;
+                    }
+                    return self.shell_state.last_status;
+                },
             }
-
-            return self.shell_state.last_status;
         }
 
         // Not a builtin - fork and exec external command
@@ -562,6 +588,7 @@ pub const Executor = struct {
         else if (pipeline.commands.len == 1)
             // Single-command "pipeline" - execute in current environment.
             // This ensures builtins like cd, export, exit work correctly.
+            // Let BreakRequested/ContinueRequested propagate up to the loop handler.
             try self.executeSingleCommand(pipeline.commands[0])
         else
             // Multi-command pipeline - all stages run in subshells
@@ -637,13 +664,32 @@ pub const Executor = struct {
     /// "The until loop shall continuously execute one compound-list as long as
     /// another compound-list has a non-zero exit status."
     ///
+    /// Handles break and continue builtins:
+    /// - break n: Exits n levels of loops. Decrements level counter and re-propagates
+    ///   if > 1, otherwise breaks from this loop and returns.
+    /// - continue n: Skips to next iteration of nth enclosing loop. Decrements level
+    ///   counter and re-propagates if > 1, otherwise continues to next iteration.
+    ///
     /// The exit status is the exit status of the last body execution,
     /// or zero if the body was never executed.
     fn executeLoopClause(self: *Executor, lc: LoopClause, is_until: bool) ExecuteError!ExitStatus {
         var status: ExitStatus = .{ .exited = 0 };
 
         while (true) {
-            const cond_status = try self.executeCompoundList(lc.condition);
+            const cond_status = self.executeCompoundList(lc.condition) catch |err| switch (err) {
+                error.BreakRequested => {
+                    self.shell_state.break_levels -= 1;
+                    if (self.shell_state.break_levels > 0) return error.BreakRequested;
+                    return .{ .exited = 0 }; // break exits with status 0 (POSIX)
+                },
+                error.ContinueRequested => {
+                    self.shell_state.continue_levels -= 1;
+                    if (self.shell_state.continue_levels > 0) return error.ContinueRequested;
+                    continue; // skip to next iteration
+                },
+                else => return err,
+            };
+
             const cond_exit = cond_status.toExitCode();
 
             // while: continue if condition exits 0
@@ -652,7 +698,19 @@ pub const Executor = struct {
 
             if (!should_continue) break;
 
-            status = try self.executeCompoundList(lc.body);
+            status = self.executeCompoundList(lc.body) catch |err| switch (err) {
+                error.BreakRequested => {
+                    self.shell_state.break_levels -= 1;
+                    if (self.shell_state.break_levels > 0) return error.BreakRequested;
+                    return .{ .exited = 0 }; // break exits with status 0 (POSIX)
+                },
+                error.ContinueRequested => {
+                    self.shell_state.continue_levels -= 1;
+                    if (self.shell_state.continue_levels > 0) return error.ContinueRequested;
+                    continue;
+                },
+                else => return err,
+            };
         }
 
         return status;
@@ -712,6 +770,16 @@ pub const Executor = struct {
     fn exitWithError(self: *Executor, err: ExecuteError) noreturn {
         switch (err) {
             error.ExitRequested => posix.exit(self.shell_state.exit_code),
+            error.BreakRequested => {
+                // break in a child process should exit normally
+                // The break was handled within the child's loop
+                posix.exit(0);
+            },
+            error.ContinueRequested => {
+                // continue in a child process should exit normally
+                // The continue was handled within the child's loop
+                posix.exit(0);
+            },
             else => {
                 printError("command execution failed: {s}\n", .{@errorName(err)});
                 posix.exit(ExitStatus.GENERAL_ERROR);
@@ -815,7 +883,14 @@ pub const Executor = struct {
                 args[i] = std.mem.span(argv[i].?);
             }
             const result = builtin.run(args, self.shell_state);
-            posix.exit(result.exit_code);
+            // In a child process, handle results appropriately.
+            // For break/continue, exit with 0 (child is isolated).
+            switch (result) {
+                .exit_code => |code| posix.exit(code),
+                .exit => |code| posix.exit(code),
+                .break_loop, .continue_loop => posix.exit(0),
+                .builtin_error => |code| posix.exit(code),
+            }
         }
 
         // 5. Build env map (moved from parent - only needed for external commands)
@@ -1060,7 +1135,25 @@ fn runCommand(
 ) !ExitStatus {
     const cmd = try parseCommand(arena.allocator(), command) orelse return error.NoCommand;
     var exec = Executor.init(arena.allocator(), shell_state);
-    return exec.executeCommand(cmd);
+    return exec.executeCommand(cmd) catch |err| switch (err) {
+        error.BreakRequested => {
+            // break outside a loop - print warning and return 0 (bash behavior)
+            printError("break: not in a loop\n", .{});
+            shell_state.break_levels = 0;
+            return .{ .exited = 0 };
+        },
+        error.ContinueRequested => {
+            // continue outside a loop - print warning and return 0 (bash behavior)
+            printError("continue: not in a loop\n", .{});
+            shell_state.continue_levels = 0;
+            return .{ .exited = 0 };
+        },
+        error.ExitRequested => {
+            // For tests: return the exit code that was set
+            return .{ .exited = shell_state.exit_code };
+        },
+        else => return err,
+    };
 }
 
 /// Run a command and expect a specific exit code.
@@ -2341,4 +2434,182 @@ test "executor: exit in if body" {
     // Should return ExitRequested
     try std.testing.expectError(ExecuteError.ExitRequested, result);
     try std.testing.expectEqual(@as(u8, 42), shell_state.exit_code);
+}
+
+// --- while/until loop tests ---
+
+test "executor: while false never executes body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_while_false";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "while false; do echo body > " ++ tmp_path ++ "; done\n", 0);
+    // File should not exist (body never executed)
+    try expectFileNotFound(tmp_path);
+}
+
+test "executor: until true never executes body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_until_true";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "until true; do echo body > " ++ tmp_path ++ "; done\n", 0);
+    // File should not exist (body never executed)
+    try expectFileNotFound(tmp_path);
+}
+
+test "executor: while with break exits immediately" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_while_break";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    // break should exit the loop, writing "before" but not "after"
+    try expectStatus(&arena, &shell_state, "while true; do echo before > " ++ tmp_path ++ "; break; echo after >> " ++ tmp_path ++ "; done\n", 0);
+    try expectFileContent(tmp_path, "before\n");
+}
+
+test "executor: until with break exits immediately" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_until_break";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "until false; do echo before > " ++ tmp_path ++ "; break; echo after >> " ++ tmp_path ++ "; done\n", 0);
+    try expectFileContent(tmp_path, "before\n");
+}
+
+test "executor: break exits with status 0 regardless of previous command" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    // false sets exit status to 1, but break should make the loop return 0
+    try expectStatus(&arena, &shell_state, "while true; do false; break; done\n", 0);
+}
+
+test "executor: continue skips to next iteration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_continue";
+    const flag_path = "/tmp/tsh_test_continue_flag";
+    cleanupTempFile(tmp_path);
+    cleanupTempFile(flag_path);
+    defer cleanupTempFile(tmp_path);
+    defer cleanupTempFile(flag_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    // First iteration: write "before", create flag, continue (skip "after")
+    // Second iteration: flag exists, condition fails, exit loop
+    // Only "before" should be written, not "after"
+    try expectStatus(&arena, &shell_state, "while test ! -f " ++ flag_path ++ "; do " ++
+        "echo before >> " ++ tmp_path ++ "; " ++
+        "touch " ++ flag_path ++ "; " ++
+        "continue; " ++
+        "echo after >> " ++ tmp_path ++ "; " ++
+        "done\n", 0);
+    try expectFileContent(tmp_path, "before\n");
+}
+
+test "executor: break outside loop prints warning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    // break outside a loop should print warning but return 0
+    try expectStatus(&arena, &shell_state, "break\n", 0);
+}
+
+test "executor: continue outside loop prints warning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    // continue outside a loop should print warning but return 0
+    try expectStatus(&arena, &shell_state, "continue\n", 0);
+}
+
+test "executor: break with invalid argument returns builtin_error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    // break 0 is invalid - returns builtin_error which causes exit in non-interactive mode
+    try expectStatus(&arena, &shell_state, "break 0\n", 1);
+}
+
+test "executor: break with non-numeric argument returns builtin_error code 2" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    // break abc is invalid - returns builtin_error with code 2
+    try expectStatus(&arena, &shell_state, "break abc\n", 2);
+}
+
+test "executor: nested loops with break 2" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_nested_break2";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    // break 2 should exit both loops
+    // Only "inner" should be written, not "outer_after"
+    try expectStatus(&arena, &shell_state, "while true; do " ++
+        "while true; do " ++
+        "echo inner > " ++ tmp_path ++ "; " ++
+        "break 2; " ++
+        "done; " ++
+        "echo outer_after >> " ++ tmp_path ++ "; " ++
+        "done\n", 0);
+    try expectFileContent(tmp_path, "inner\n");
+}
+
+test "executor: loop with if statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_loop_if";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "while true; do " ++
+        "if true; then echo yes > " ++ tmp_path ++ "; fi; " ++
+        "break; " ++
+        "done\n", 0);
+    try expectFileContent(tmp_path, "yes\n");
+}
+
+test "executor: if with loop inside" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_if_loop";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "if true; then " ++
+        "while true; do echo looped > " ++ tmp_path ++ "; break; done; " ++
+        "fi\n", 0);
+    try expectFileContent(tmp_path, "looped\n");
 }

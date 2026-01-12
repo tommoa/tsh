@@ -176,6 +176,20 @@ fn executeCommands(
         if (cmd) |c| {
             state.last_status = exec.executeCommand(c) catch |err| switch (err) {
                 error.ExitRequested => return .exit_requested,
+                error.BreakRequested => {
+                    try stderr.print("tsh: break: not in a loop\n", .{});
+                    try stderr.flush();
+                    state.break_levels = 0;
+                    state.last_status = .{ .exited = 0 };
+                    continue; // continue processing commands
+                },
+                error.ContinueRequested => {
+                    try stderr.print("tsh: continue: not in a loop\n", .{});
+                    try stderr.flush();
+                    state.continue_levels = 0;
+                    state.last_status = .{ .exited = 0 };
+                    continue; // continue processing commands
+                },
                 else => {
                     try stderr.print("tsh: execution error: {s}\n", .{@errorName(err)});
                     try stderr.flush();

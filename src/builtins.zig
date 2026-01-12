@@ -26,11 +26,19 @@ const ShellState = state.ShellState;
 const printError = state.printError;
 
 /// Result of executing a builtin command.
-pub const BuiltinResult = struct {
-    /// Exit code of the builtin (0 = success).
-    exit_code: u8 = 0,
-    /// If true, the shell should exit after this command.
-    should_exit: bool = false,
+pub const BuiltinResult = union(enum) {
+    /// Normal completion with exit code.
+    exit_code: u8,
+    /// Exit the shell with the given exit code.
+    exit: u8,
+    /// Break n levels of enclosing loops.
+    break_loop: u32,
+    /// Continue n levels of enclosing loops.
+    continue_loop: u32,
+    /// Special builtin error. POSIX requires non-interactive shells to exit
+    /// on special builtin errors, while interactive shells continue.
+    /// (See POSIX Section 2.8.1 - Consequences of Shell Errors)
+    builtin_error: u8,
 };
 
 /// Enumeration of all builtin commands.
@@ -38,7 +46,9 @@ pub const BuiltinResult = struct {
 /// Use `fromName` to look up a builtin by name, and `run` to execute it.
 pub const Builtin = enum {
     @"[",
+    @"break",
     cd,
+    @"continue",
     exit,
     @"export",
     pwd,
@@ -58,7 +68,9 @@ pub const Builtin = enum {
     pub fn run(self: Builtin, args: []const []const u8, shell: *ShellState) BuiltinResult {
         return switch (self) {
             .@"[" => runBracket(args),
+            .@"break" => runBreak(args, shell),
             .cd => runCd(args, shell),
+            .@"continue" => runContinue(args, shell),
             .exit => runExit(args, shell),
             .@"export" => runExport(args, shell),
             .pwd => runPwd(args, shell),
@@ -80,16 +92,13 @@ pub const Builtin = enum {
 fn runExit(args: []const []const u8, shell: *ShellState) BuiltinResult {
     // exit with no args: use last exit status
     if (args.len <= 1) {
-        return .{
-            .exit_code = shell.last_status.toExitCode(),
-            .should_exit = true,
-        };
+        return .{ .exit = shell.last_status.toExitCode() };
     }
 
     // exit with too many args
     if (args.len > 2) {
         printError("exit: too many arguments\n", .{});
-        return .{ .exit_code = 1 };
+        return .{ .builtin_error = 1 };
     }
 
     // Parse the exit code
@@ -99,15 +108,67 @@ fn runExit(args: []const []const u8, shell: *ShellState) BuiltinResult {
     const code_str = args[1];
     const code = std.fmt.parseInt(i32, code_str, 10) catch {
         printError("exit: {s}: numeric argument required\n", .{code_str});
-        return .{ .exit_code = 2, .should_exit = true };
+        return .{ .builtin_error = 2 };
     };
 
     // Truncate to low 8 bits (handles both positive overflow and negative values)
     const exit_code: u8 = @truncate(@as(u32, @bitCast(code)));
 
-    return .{
-        .exit_code = exit_code,
-        .should_exit = true,
+    return .{ .exit = exit_code };
+}
+
+/// Parse loop level argument for break/continue builtins.
+/// Returns the level count (default 1) or a builtin_error result.
+fn parseLoopLevel(name: []const u8, args: []const []const u8) union(enum) {
+    levels: u32,
+    err: BuiltinResult,
+} {
+    if (args.len <= 1) return .{ .levels = 1 };
+
+    if (args.len > 2) {
+        printError("{s}: too many arguments\n", .{name});
+        return .{ .err = .{ .builtin_error = 1 } };
+    }
+
+    const num = std.fmt.parseInt(i32, args[1], 10) catch {
+        printError("{s}: {s}: numeric argument required\n", .{ name, args[1] });
+        return .{ .err = .{ .builtin_error = 2 } };
+    };
+
+    if (num <= 0) {
+        printError("{s}: {}: loop count out of range\n", .{ name, num });
+        return .{ .err = .{ .builtin_error = 1 } };
+    }
+
+    return .{ .levels = @intCast(num) };
+}
+
+/// break [n]
+///
+/// Exit from the nth enclosing loop. If n is omitted, break exits from
+/// the immediately enclosing loop. n must be a positive integer >= 1.
+/// If n is 0, negative, or non-numeric, an error is returned.
+///
+/// POSIX Reference: Section 2.9.4.3 - break
+fn runBreak(args: []const []const u8, _: *ShellState) BuiltinResult {
+    return switch (parseLoopLevel("break", args)) {
+        .levels => |n| .{ .break_loop = n },
+        .err => |e| e,
+    };
+}
+
+/// continue [n]
+///
+/// Continue with the next iteration of the nth enclosing loop. If n is
+/// omitted, continue skips to the next iteration of the immediately
+/// enclosing loop. n must be a positive integer >= 1. If n is 0, negative,
+/// or non-numeric, an error is returned.
+///
+/// POSIX Reference: Section 2.9.4.4 - continue
+fn runContinue(args: []const []const u8, _: *ShellState) BuiltinResult {
+    return switch (parseLoopLevel("continue", args)) {
+        .levels => |n| .{ .continue_loop = n },
+        .err => |e| e,
     };
 }
 
@@ -419,7 +480,11 @@ fn runExport(args: []const []const u8, shell: *ShellState) BuiltinResult {
         }
     }
 
-    return .{ .exit_code = if (had_error) 1 else 0 };
+    // POSIX: special builtin errors should cause non-interactive shells to exit
+    if (had_error) {
+        return .{ .builtin_error = 1 };
+    }
+    return .{ .exit_code = 0 };
 }
 
 /// unset [-v] name...
@@ -494,7 +559,11 @@ fn runUnset(args: []const []const u8, shell: *ShellState) BuiltinResult {
         }
     }
 
-    return .{ .exit_code = if (had_error) 1 else 0 };
+    // POSIX: special builtin errors should cause non-interactive shells to exit
+    if (had_error) {
+        return .{ .builtin_error = 1 };
+    }
+    return .{ .exit_code = 0 };
 }
 
 /// test expression
@@ -632,8 +701,8 @@ test "runExit: no args uses last_status" {
     shell.last_status = .{ .exited = 42 };
 
     const result = runExit(&[_][]const u8{"exit"}, &shell);
-    try std.testing.expect(result.should_exit);
-    try std.testing.expectEqual(@as(u8, 42), result.exit_code);
+    try std.testing.expect(result == .exit);
+    try std.testing.expectEqual(@as(u8, 42), result.exit);
 }
 
 test "runExit: with numeric arg" {
@@ -642,29 +711,29 @@ test "runExit: with numeric arg" {
     defer shell.deinit();
 
     const result = runExit(&[_][]const u8{ "exit", "5" }, &shell);
-    try std.testing.expect(result.should_exit);
-    try std.testing.expectEqual(@as(u8, 5), result.exit_code);
+    try std.testing.expect(result == .exit);
+    try std.testing.expectEqual(@as(u8, 5), result.exit);
 }
 
-test "runExit: with invalid arg exits with status 2" {
-    // POSIX: "exit abc" should exit the shell with status 2
+test "runExit: with invalid arg returns builtin_error with status 2" {
+    // POSIX: "exit abc" is a special builtin error
     var env = std.process.EnvMap.init(std.testing.allocator);
     var shell = try ShellState.initWithEnv(std.testing.allocator, &env);
     defer shell.deinit();
 
     const result = runExit(&[_][]const u8{ "exit", "abc" }, &shell);
-    try std.testing.expect(result.should_exit);
-    try std.testing.expectEqual(@as(u8, 2), result.exit_code);
+    try std.testing.expect(result == .builtin_error);
+    try std.testing.expectEqual(@as(u8, 2), result.builtin_error);
 }
 
-test "runExit: with too many args" {
+test "runExit: with too many args returns builtin_error" {
     var env = std.process.EnvMap.init(std.testing.allocator);
     var shell = try ShellState.initWithEnv(std.testing.allocator, &env);
     defer shell.deinit();
 
     const result = runExit(&[_][]const u8{ "exit", "1", "2" }, &shell);
-    try std.testing.expect(!result.should_exit);
-    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expect(result == .builtin_error);
+    try std.testing.expectEqual(@as(u8, 1), result.builtin_error);
 }
 
 test "runExit: large value wraps to 8 bits" {
@@ -675,16 +744,16 @@ test "runExit: large value wraps to 8 bits" {
     defer shell.deinit();
 
     const result256 = runExit(&[_][]const u8{ "exit", "256" }, &shell);
-    try std.testing.expect(result256.should_exit);
-    try std.testing.expectEqual(@as(u8, 0), result256.exit_code);
+    try std.testing.expect(result256 == .exit);
+    try std.testing.expectEqual(@as(u8, 0), result256.exit);
 
     const result257 = runExit(&[_][]const u8{ "exit", "257" }, &shell);
-    try std.testing.expect(result257.should_exit);
-    try std.testing.expectEqual(@as(u8, 1), result257.exit_code);
+    try std.testing.expect(result257 == .exit);
+    try std.testing.expectEqual(@as(u8, 1), result257.exit);
 
     const result300 = runExit(&[_][]const u8{ "exit", "300" }, &shell);
-    try std.testing.expect(result300.should_exit);
-    try std.testing.expectEqual(@as(u8, 44), result300.exit_code); // 300 % 256 = 44
+    try std.testing.expect(result300 == .exit);
+    try std.testing.expectEqual(@as(u8, 44), result300.exit); // 300 % 256 = 44
 }
 
 test "runExit: negative values wrap correctly" {
@@ -694,24 +763,24 @@ test "runExit: negative values wrap correctly" {
     defer shell.deinit();
 
     const result_neg1 = runExit(&[_][]const u8{ "exit", "-1" }, &shell);
-    try std.testing.expect(result_neg1.should_exit);
-    try std.testing.expectEqual(@as(u8, 255), result_neg1.exit_code);
+    try std.testing.expect(result_neg1 == .exit);
+    try std.testing.expectEqual(@as(u8, 255), result_neg1.exit);
 
     const result_neg2 = runExit(&[_][]const u8{ "exit", "-2" }, &shell);
-    try std.testing.expect(result_neg2.should_exit);
-    try std.testing.expectEqual(@as(u8, 254), result_neg2.exit_code);
+    try std.testing.expect(result_neg2 == .exit);
+    try std.testing.expectEqual(@as(u8, 254), result_neg2.exit);
 
     const result_neg256 = runExit(&[_][]const u8{ "exit", "-256" }, &shell);
-    try std.testing.expect(result_neg256.should_exit);
-    try std.testing.expectEqual(@as(u8, 0), result_neg256.exit_code);
+    try std.testing.expect(result_neg256 == .exit);
+    try std.testing.expectEqual(@as(u8, 0), result_neg256.exit);
 }
 
 // --- test builtin tests ---
 
 test "runTest: returns 0 for true expression" {
     const result = runTest(&[_][]const u8{ "test", "-n", "hello" });
+    try std.testing.expect(result == .exit_code);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(!result.should_exit);
 }
 
 test "runTest: returns 1 for false expression" {
@@ -753,8 +822,8 @@ test "runTest: file test -d /tmp" {
 
 test "runBracket: returns 0 for true expression" {
     const result = runBracket(&[_][]const u8{ "[", "-n", "hello", "]" });
+    try std.testing.expect(result == .exit_code);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(!result.should_exit);
 }
 
 test "runBracket: returns 1 for false expression" {
@@ -788,4 +857,92 @@ test "runBracket: ] in wrong position is not closing bracket" {
     // This is "test ] = ]" which is string equality, should be true
     const result = runBracket(&[_][]const u8{ "[", "]", "=", "]", "]" });
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+// --- break builtin tests ---
+
+test "runBreak: no argument returns break_loop with level 1" {
+    var shell: ShellState = undefined;
+    const result = runBreak(&[_][]const u8{"break"}, &shell);
+    try std.testing.expect(result == .break_loop);
+    try std.testing.expectEqual(@as(u32, 1), result.break_loop);
+}
+
+test "runBreak: with numeric argument returns that level" {
+    var shell: ShellState = undefined;
+    const result = runBreak(&[_][]const u8{ "break", "3" }, &shell);
+    try std.testing.expect(result == .break_loop);
+    try std.testing.expectEqual(@as(u32, 3), result.break_loop);
+}
+
+test "runBreak: zero argument returns builtin_error" {
+    var shell: ShellState = undefined;
+    const result = runBreak(&[_][]const u8{ "break", "0" }, &shell);
+    try std.testing.expect(result == .builtin_error);
+    try std.testing.expectEqual(@as(u8, 1), result.builtin_error);
+}
+
+test "runBreak: negative argument returns builtin_error" {
+    var shell: ShellState = undefined;
+    const result = runBreak(&[_][]const u8{ "break", "-1" }, &shell);
+    try std.testing.expect(result == .builtin_error);
+    try std.testing.expectEqual(@as(u8, 1), result.builtin_error);
+}
+
+test "runBreak: non-numeric argument returns builtin_error with code 2" {
+    var shell: ShellState = undefined;
+    const result = runBreak(&[_][]const u8{ "break", "abc" }, &shell);
+    try std.testing.expect(result == .builtin_error);
+    try std.testing.expectEqual(@as(u8, 2), result.builtin_error);
+}
+
+test "runBreak: too many arguments returns builtin_error" {
+    var shell: ShellState = undefined;
+    const result = runBreak(&[_][]const u8{ "break", "1", "2" }, &shell);
+    try std.testing.expect(result == .builtin_error);
+    try std.testing.expectEqual(@as(u8, 1), result.builtin_error);
+}
+
+// --- continue builtin tests ---
+
+test "runContinue: no argument returns continue_loop with level 1" {
+    var shell: ShellState = undefined;
+    const result = runContinue(&[_][]const u8{"continue"}, &shell);
+    try std.testing.expect(result == .continue_loop);
+    try std.testing.expectEqual(@as(u32, 1), result.continue_loop);
+}
+
+test "runContinue: with numeric argument returns that level" {
+    var shell: ShellState = undefined;
+    const result = runContinue(&[_][]const u8{ "continue", "2" }, &shell);
+    try std.testing.expect(result == .continue_loop);
+    try std.testing.expectEqual(@as(u32, 2), result.continue_loop);
+}
+
+test "runContinue: zero argument returns builtin_error" {
+    var shell: ShellState = undefined;
+    const result = runContinue(&[_][]const u8{ "continue", "0" }, &shell);
+    try std.testing.expect(result == .builtin_error);
+    try std.testing.expectEqual(@as(u8, 1), result.builtin_error);
+}
+
+test "runContinue: negative argument returns builtin_error" {
+    var shell: ShellState = undefined;
+    const result = runContinue(&[_][]const u8{ "continue", "-1" }, &shell);
+    try std.testing.expect(result == .builtin_error);
+    try std.testing.expectEqual(@as(u8, 1), result.builtin_error);
+}
+
+test "runContinue: non-numeric argument returns builtin_error with code 2" {
+    var shell: ShellState = undefined;
+    const result = runContinue(&[_][]const u8{ "continue", "abc" }, &shell);
+    try std.testing.expect(result == .builtin_error);
+    try std.testing.expectEqual(@as(u8, 2), result.builtin_error);
+}
+
+test "runContinue: too many arguments returns builtin_error" {
+    var shell: ShellState = undefined;
+    const result = runContinue(&[_][]const u8{ "continue", "1", "2" }, &shell);
+    try std.testing.expect(result == .builtin_error);
+    try std.testing.expectEqual(@as(u8, 1), result.builtin_error);
 }

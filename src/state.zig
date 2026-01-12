@@ -134,6 +134,16 @@ pub const ShellState = struct {
     /// Set by the exit builtin and read by the REPL to determine final exit code.
     exit_code: u8,
 
+    /// Number of levels for break to propagate (for `break n`).
+    /// Set by the break builtin, used by executeLoopClause to determine
+    /// when to stop propagating the BreakRequested error.
+    break_levels: u32 = 0,
+
+    /// Number of levels for continue to propagate (for `continue n`).
+    /// Set by the continue builtin, used by executeLoopClause to determine
+    /// when to stop propagating the ContinueRequested error.
+    continue_levels: u32 = 0,
+
     /// Current working directory.
     /// Initialized from getcwd() at startup, updated by cd builtin.
     /// Also exported as $PWD.
