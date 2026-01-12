@@ -131,11 +131,12 @@ const SavedFds = struct {
             }
 
             // Try to dup with CLOEXEC - succeeds if fd exists, fails if not
-            // Using fcntl F_DUPFD_CLOEXEC to atomically dup and set CLOEXEC
-            const saved: ?posix.fd_t = if (posix.fcntl(fd, posix.F.DUPFD_CLOEXEC, 0)) |fd_usize|
-                @intCast(fd_usize)
-            else |_|
-                null;
+            // Use dup() then set FD_CLOEXEC via fcntl for cross-platform compatibility
+            const saved: ?posix.fd_t = if (posix.dup(fd)) |duped_fd| blk: {
+                // Set CLOEXEC on the duplicated fd so it doesn't leak to child processes
+                _ = posix.fcntl(duped_fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)) catch {};
+                break :blk duped_fd;
+            } else |_| null;
             self.entries[self.len] = .{ .fd = fd, .saved = saved };
             self.len += 1;
         }
@@ -1189,7 +1190,7 @@ test "execute: simple echo" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const cmd = try parseCommand(arena.allocator(), "/bin/echo hello\n") orelse return error.NoCommand;
+    const cmd = try parseCommand(arena.allocator(), "echo hello\n") orelse return error.NoCommand;
     var shell_state = try ShellState.init(arena.allocator());
     var exec = Executor.init(arena.allocator(), &shell_state);
     const status = try exec.executeCommand(cmd);
@@ -1460,7 +1461,7 @@ test "executeCommand: redirection-only command does not affect subsequent comman
     const tmp_path = "/tmp/tsh_test_redir_then_echo";
     std.fs.deleteFileAbsolute(tmp_path) catch {};
 
-    const input = "> " ++ tmp_path ++ "; /bin/echo hello\n";
+    const input = "> " ++ tmp_path ++ "; echo hello\n";
     var reader = std.io.Reader.fixed(input);
     var lex = lexer.Lexer.init(&reader);
     var p = parser.Parser.init(arena.allocator(), &lex);

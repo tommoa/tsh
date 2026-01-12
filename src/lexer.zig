@@ -365,15 +365,17 @@ pub const Lexer = struct {
     }
 
     /// Consume a single byte and update position tracking.
-    inline fn consumeOne(self: *Lexer) LexerError!?u8 {
+    /// Returns a slice pointing to the consumed byte in the buffer.
+    /// The slice remains valid until the next peek operation.
+    inline fn consumeOne(self: *Lexer) LexerError!?[]const u8 {
         const buf = self.reader.peek(1) catch |err| switch (err) {
             error.EndOfStream => return null,
             else => return LexerError.UnexpectedEndOfFile,
         };
         if (buf.len == 0) return null;
-        const c = buf[0];
-        self.consume(buf[0..1]);
-        return c;
+        const slice = buf[0..1];
+        self.consume(slice);
+        return slice;
     }
 
     /// Check if a character is "plain" - can be included in a word chunk by `readWord`.
@@ -624,9 +626,9 @@ pub const Lexer = struct {
                     },
                     '`' => {
                         // TODO: Command substitution - for now, treat as literal
-                        _ = try self.consumeOne();
+                        const slice = try self.consumeOne() orelse unreachable;
                         // complete=false: still inside double quotes, more content follows
-                        break :state self.makeToken(.{ .Literal = &.{first} }, false);
+                        break :state self.makeToken(.{ .Literal = slice }, false);
                     },
                     else => {
                         // Regular literal content - read until special char
@@ -656,10 +658,10 @@ pub const Lexer = struct {
                 self.needs_continuation = false;
                 // POSIX: only \$, \`, \", \\, and \newline are special in double quotes
                 if (next == '$' or next == '`' or next == '"' or next == '\\' or next == '\n') {
-                    // Special escape - consume and return the escaped char
-                    _ = try self.consumeOne();
+                    // Special escape - consume and return the escaped char as a stable slice
+                    const escaped_slice = try self.consumeOne() orelse unreachable;
                     _ = self.swapContext(.double_quote);
-                    break :state self.makeToken(.{ .EscapedLiteral = &.{next} }, false);
+                    break :state self.makeToken(.{ .EscapedLiteral = escaped_slice }, false);
                 } else {
                     // Not a special escape - the backslash we consumed was literal.
                     // Emit a backslash literal using a static string slice.
@@ -685,10 +687,10 @@ pub const Lexer = struct {
                     continue :state self.swapContext(.none);
                 }
 
-                // Consume the escaped character and return it as an escaped literal
-                _ = try self.consumeOne();
+                // Consume the escaped character and return it as an escaped literal (stable slice)
+                const escaped_slice = try self.consumeOne() orelse unreachable;
                 _ = self.swapContext(.none);
-                break :state self.makeToken(.{ .EscapedLiteral = &.{next} }, false);
+                break :state self.makeToken(.{ .EscapedLiteral = escaped_slice }, false);
             },
             .dollar => {
                 // We saw $ - determine what kind of expansion this is.
@@ -711,9 +713,9 @@ pub const Lexer = struct {
                     // NOTE: We don't need continuations after this, because
                     // special parameters are always 1-byte names.
                     // Special parameter: $@, $*, $#, $?, $-, $$, $!, $0-$9
-                    _ = try self.consumeOne();
+                    const slice = try self.consumeOne() orelse unreachable;
                     _ = self.popContext();
-                    break :state self.makeToken(.{ .SimpleExpansion = &.{next} }, false);
+                    break :state self.makeToken(.{ .SimpleExpansion = slice }, false);
                 } else if (isParamStartChar(next)) {
                     // This is a simple expansion. Hop over to that branch.
                     continue :state self.swapContext(.simple_expansion);
@@ -789,9 +791,9 @@ pub const Lexer = struct {
                     break :state self.makeToken(.{ .Literal = result.slice }, false);
                 } else if (isSpecialParam(first)) {
                     // Special param: ${?}, ${@}, etc. (but not digits - handled above)
-                    _ = try self.consumeOne();
+                    const slice = try self.consumeOne() orelse unreachable;
                     _ = self.swapContext(.brace_expansion);
-                    break :state self.makeToken(.{ .Literal = &.{first} }, false);
+                    break :state self.makeToken(.{ .Literal = slice }, false);
                 } else if (first == ':') {
                     // Modifier without parameter name (e.g., ${:-foo}) - let brace_expansion_colon handle it
                     _ = try self.consumeOne();
@@ -803,8 +805,8 @@ pub const Lexer = struct {
                     // This is an invalid character to start a variable expansion.
                     // Send the character as a literal and let the parser deal with it.
                     _ = self.swapContext(.brace_expansion);
-                    _ = try self.consumeOne();
-                    break :state self.makeToken(.{ .Literal = &.{first} }, false);
+                    const slice = try self.consumeOne() orelse unreachable;
+                    break :state self.makeToken(.{ .Literal = slice }, false);
                 }
             },
             .brace_hash_ambiguous => {
@@ -888,9 +890,9 @@ pub const Lexer = struct {
                     _ = self.swapContext(.brace_expansion);
                     break :state self.makeToken(.{ .Literal = "#" }, false);
                 } else if (isSpecialParam(first)) {
-                    _ = try self.consumeOne();
+                    const slice = try self.consumeOne() orelse unreachable;
                     _ = self.swapContext(.brace_expansion);
-                    break :state self.makeToken(.{ .Literal = &.{first} }, false);
+                    break :state self.makeToken(.{ .Literal = slice }, false);
                 } else if (isParamStartChar(first)) {
                     const result = try self.readWhile(isParamChar) orelse {
                         return LexerError.UnterminatedBraceExpansion;
@@ -1073,8 +1075,8 @@ pub const Lexer = struct {
                 const context = self.popContext();
                 // POSIX: $, `, ", \, } and newline are special inside ${...}
                 if (next == '$' or next == '`' or next == '"' or next == '\\' or next == '}') {
-                    _ = try self.consumeOne();
-                    break :state self.makeToken(.{ .EscapedLiteral = &.{next} }, false);
+                    const escaped_slice = try self.consumeOne() orelse unreachable;
+                    break :state self.makeToken(.{ .EscapedLiteral = escaped_slice }, false);
                 } else if (next == '\n') {
                     // Line continuation
                     _ = try self.consumeOne();
