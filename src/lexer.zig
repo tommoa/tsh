@@ -120,6 +120,8 @@ pub const TokenType = union(enum) {
         /// True if colon present (:-) vs absent (-)
         check_null: bool,
     },
+    CommandSubstitutionBegin,
+    CommandSubstitutionEnd,
 };
 
 /// The lexer's Token structure.
@@ -189,6 +191,8 @@ pub const Token = struct {
                 }
                 try writer.writeByte(')');
             },
+            .CommandSubstitutionBegin => try writer.writeAll("CommandSubstitutionBegin"),
+            .CommandSubstitutionEnd => try writer.writeAll("CommandSubstitutionEnd"),
         }
         if (!self.complete) try writer.writeAll(" [incomplete]");
     }
@@ -248,6 +252,8 @@ pub const ParseContext = enum {
     brace_expansion_percent,
     /// Saw \ inside ${...}.
     brace_expansion_escape,
+    /// Inside command substitution.
+    command_substitution,
 };
 
 /// A lexer for POSIX shell syntax.
@@ -420,7 +426,10 @@ pub const Lexer = struct {
     /// The parser is responsible for determining if the preceding word is a
     /// valid fd number or should be treated as a regular argument.
     fn isWordComplete(self: *Lexer, c: ?u8) bool {
-        if (self.context_depth > 0) return false;
+        // In most nested contexts (quotes, brace expansions), words don't complete on whitespace.
+        // But command substitution is special - it's like a nested command line where
+        // spaces and other metacharacters still act as word separators.
+        if (self.context_depth > 0 and self.parse_context != .command_substitution) return false;
         const char = c orelse return true;
         return switch (char) {
             ' ', '\t', '\n', '|', ';', '&', '(', ')' => true,
@@ -709,6 +718,12 @@ pub const Lexer = struct {
                     _ = try self.consumeOne();
                     _ = self.swapContext(.brace_expansion_start);
                     break :state self.makeToken(.BraceExpansionBegin, false);
+                } else if (next == '(') {
+                    // TODO: fix this when we implement arithmetic expansion.
+                    _ = try self.consumeOne();
+                    _ = self.swapContext(.command_substitution);
+                    // complete=false because content follows (the command inside)
+                    break :state self.makeToken(.CommandSubstitutionBegin, false);
                 } else if (isSpecialParam(next)) {
                     // NOTE: We don't need continuations after this, because
                     // special parameters are always 1-byte names.
@@ -1142,12 +1157,13 @@ pub const Lexer = struct {
                     },
                 }
             },
-            .none => {
+            .none, .command_substitution => {
                 // Normal processing
 
                 // If we couldn't previously tell whether we were at the end of a word, check now and
                 // send a continuation.
                 if (self.check_end_of_word) {
+                    self.check_end_of_word = false;
                     const nextByte = try self.peekByte();
                     if (self.isWordComplete(nextByte)) {
                         // If this is the end of a word, then we also know that we are not continuing
@@ -1280,7 +1296,14 @@ pub const Lexer = struct {
                     ')' => {
                         _ = try self.consumeOne();
                         self.needs_continuation = false;
-                        break :state self.makeToken(.RightParen, true);
+                        if (self.parse_context == .command_substitution) {
+                            _ = self.popContext();
+                            const after = try self.peekByte();
+                            const at_boundary = self.isWordComplete(after);
+                            break :state self.makeToken(.CommandSubstitutionEnd, at_boundary);
+                        } else {
+                            break :state self.makeToken(.RightParen, true);
+                        }
                     },
                     ';' => {
                         _ = try self.consumeOne();
@@ -1432,6 +1455,22 @@ fn expectDoubleSemicolon(token: ?Token) !void {
     switch (t.type) {
         .DoubleSemicolon => {},
         else => return error.ExpectedDoubleSemicolon,
+    }
+}
+
+fn expectCommandSubstitutionBegin(token: ?Token) !void {
+    const t = token orelse return error.ExpectedToken;
+    switch (t.type) {
+        .CommandSubstitutionBegin => {},
+        else => return error.ExpectedCommandSubstitutionBegin,
+    }
+}
+
+fn expectCommandSubstitutionEnd(token: ?Token) !void {
+    const t = token orelse return error.ExpectedToken;
+    switch (t.type) {
+        .CommandSubstitutionEnd => {},
+        else => return error.ExpectedCommandSubstitutionEnd,
     }
 }
 
@@ -3203,6 +3242,8 @@ fn fuzzRandomBytes(_: void, input: []const u8) anyerror!void {
             .BraceExpansionBegin => {},
             .BraceExpansionEnd => {},
             .Modifier => {},
+            .CommandSubstitutionBegin => {},
+            .CommandSubstitutionEnd => {},
         }
     }
 }
@@ -3793,4 +3834,172 @@ test "nextToken: hash in double quotes is literal" {
     try expectLiteral(try lexer.nextToken(), "# not a comment");
     try expectDoubleQuoteEnd(try lexer.nextToken());
     try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: command substitution" {
+    var reader = std.io.Reader.fixed("$(test command)");
+    var lexer = Lexer.init(&reader);
+    try expectCommandSubstitutionBegin(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "test");
+    try expectLiteral(try lexer.nextToken(), "command");
+    try expectCommandSubstitutionEnd(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: command substitution preceded by text" {
+    var reader = std.io.Reader.fixed("text$(test command)");
+    var lexer = Lexer.init(&reader);
+    // "text" is incomplete because command substitution follows
+    try expectIncompleteLiteral(try lexer.nextToken(), "text");
+    try expectCommandSubstitutionBegin(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "test");
+    try expectLiteral(try lexer.nextToken(), "command");
+    try expectCommandSubstitutionEnd(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: command substitution followed by text" {
+    var reader = std.io.Reader.fixed("$(test command)text");
+    var lexer = Lexer.init(&reader);
+
+    try expectCommandSubstitutionBegin(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "test");
+    try expectLiteral(try lexer.nextToken(), "command");
+    // CommandSubstitutionEnd has complete=false because "text" follows
+    const cse = try lexer.nextToken();
+    try std.testing.expectEqual(.CommandSubstitutionEnd, cse.?.type);
+    try std.testing.expectEqual(false, cse.?.complete);
+    // "text" is incomplete (part of outer word, at end of input)
+    try expectIncompleteLiteral(try lexer.nextToken(), "text");
+}
+
+test "nextToken: command substitution in double quotes" {
+    var reader = std.io.Reader.fixed("\"$(test command)\"");
+    var lexer = Lexer.init(&reader);
+    try expectDoubleQuoteBegin(try lexer.nextToken());
+    try expectCommandSubstitutionBegin(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "test");
+    try expectLiteral(try lexer.nextToken(), "command");
+    try expectCommandSubstitutionEnd(try lexer.nextToken());
+    try expectDoubleQuoteEnd(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: command doesn't work in single quotes" {
+    var reader = std.io.Reader.fixed("'$(test command)'");
+    var lexer = Lexer.init(&reader);
+    try expectSingleQuoted(try lexer.nextToken(), "$(test command)");
+    try expectContinuation(try lexer.nextToken(), "", true);
+    try std.testing.expectEqual(null, try lexer.nextToken());
+}
+
+test "nextToken: command substitution in double quotes with 1-byte boundary" {
+    // Test "$(test command)" with 1-byte buffer.
+    // With such a small buffer, each character is a separate token.
+    // This tests that continuation handling works correctly across buffer boundaries.
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    _ = try std.posix.write(pipe[1], "\"$(test command)\"");
+    std.posix.close(pipe[1]);
+
+    const file = std.fs.File{ .handle = pipe[0] };
+    var small_buf: [1]u8 = undefined;
+    var file_reader = file.reader(&small_buf);
+    var lexer = Lexer.init(&file_reader.interface);
+
+    try expectDoubleQuoteBegin(try lexer.nextToken());
+    try expectCommandSubstitutionBegin(try lexer.nextToken());
+    try expectIncompleteLiteral(try lexer.nextToken(), "t");
+    try expectContinuation(try lexer.nextToken(), "e", false);
+    try expectContinuation(try lexer.nextToken(), "s", false);
+    try expectContinuation(try lexer.nextToken(), "t", false);
+    try expectContinuation(try lexer.nextToken(), "", true);
+    try expectIncompleteLiteral(try lexer.nextToken(), "c");
+    try expectContinuation(try lexer.nextToken(), "o", false);
+    try expectContinuation(try lexer.nextToken(), "m", false);
+    try expectContinuation(try lexer.nextToken(), "m", false);
+    try expectContinuation(try lexer.nextToken(), "a", false);
+    try expectContinuation(try lexer.nextToken(), "n", false);
+    try expectContinuation(try lexer.nextToken(), "d", false);
+    try expectContinuation(try lexer.nextToken(), "", true); // word boundary before )
+    try expectCommandSubstitutionEnd(try lexer.nextToken());
+    try expectDoubleQuoteEnd(try lexer.nextToken());
+}
+
+test "nextToken: command substitution in double quotes followed by text with 1-byte boundary" {
+    // Test "$(test command)text" with 1-byte buffer.
+    // This tests that text after command substitution is correctly joined to the word.
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    _ = try std.posix.write(pipe[1], "\"$(test command)text\"");
+    std.posix.close(pipe[1]);
+
+    const file = std.fs.File{ .handle = pipe[0] };
+    var small_buf: [1]u8 = undefined;
+    var file_reader = file.reader(&small_buf);
+    var lexer = Lexer.init(&file_reader.interface);
+
+    try expectDoubleQuoteBegin(try lexer.nextToken());
+    try expectCommandSubstitutionBegin(try lexer.nextToken());
+    try expectIncompleteLiteral(try lexer.nextToken(), "t");
+    try expectContinuation(try lexer.nextToken(), "e", false);
+    try expectContinuation(try lexer.nextToken(), "s", false);
+    try expectContinuation(try lexer.nextToken(), "t", false);
+    try expectContinuation(try lexer.nextToken(), "", true);
+    try expectIncompleteLiteral(try lexer.nextToken(), "c");
+    try expectContinuation(try lexer.nextToken(), "o", false);
+    try expectContinuation(try lexer.nextToken(), "m", false);
+    try expectContinuation(try lexer.nextToken(), "m", false);
+    try expectContinuation(try lexer.nextToken(), "a", false);
+    try expectContinuation(try lexer.nextToken(), "n", false);
+    try expectContinuation(try lexer.nextToken(), "d", false);
+    try expectContinuation(try lexer.nextToken(), "", true); // word boundary before )
+    try expectCommandSubstitutionEnd(try lexer.nextToken());
+    // "text" after command substitution
+    try expectIncompleteLiteral(try lexer.nextToken(), "t");
+    try expectContinuation(try lexer.nextToken(), "e", false);
+    try expectContinuation(try lexer.nextToken(), "x", false);
+    try expectContinuation(try lexer.nextToken(), "t", false);
+    try expectDoubleQuoteEnd(try lexer.nextToken());
+}
+
+test "nextToken: command substitution in double quotes with space before text with 1-byte boundary" {
+    // Test "$(test command) text" with 1-byte buffer.
+    // This tests that space after command substitution inside double quotes is preserved as literal.
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    _ = try std.posix.write(pipe[1], "\"$(test command) text\"");
+    std.posix.close(pipe[1]);
+
+    const file = std.fs.File{ .handle = pipe[0] };
+    var small_buf: [1]u8 = undefined;
+    var file_reader = file.reader(&small_buf);
+    var lexer = Lexer.init(&file_reader.interface);
+
+    try expectDoubleQuoteBegin(try lexer.nextToken());
+    try expectCommandSubstitutionBegin(try lexer.nextToken());
+    try expectIncompleteLiteral(try lexer.nextToken(), "t");
+    try expectContinuation(try lexer.nextToken(), "e", false);
+    try expectContinuation(try lexer.nextToken(), "s", false);
+    try expectContinuation(try lexer.nextToken(), "t", false);
+    try expectContinuation(try lexer.nextToken(), "", true);
+    try expectIncompleteLiteral(try lexer.nextToken(), "c");
+    try expectContinuation(try lexer.nextToken(), "o", false);
+    try expectContinuation(try lexer.nextToken(), "m", false);
+    try expectContinuation(try lexer.nextToken(), "m", false);
+    try expectContinuation(try lexer.nextToken(), "a", false);
+    try expectContinuation(try lexer.nextToken(), "n", false);
+    try expectContinuation(try lexer.nextToken(), "d", false);
+    try expectContinuation(try lexer.nextToken(), "", true); // word boundary before )
+    try expectCommandSubstitutionEnd(try lexer.nextToken());
+    // " text" after command substitution - space is literal inside double quotes
+    try expectIncompleteLiteral(try lexer.nextToken(), " ");
+    try expectContinuation(try lexer.nextToken(), "t", false);
+    try expectContinuation(try lexer.nextToken(), "e", false);
+    try expectContinuation(try lexer.nextToken(), "x", false);
+    try expectContinuation(try lexer.nextToken(), "t", false);
+    try expectDoubleQuoteEnd(try lexer.nextToken());
 }

@@ -1167,6 +1167,9 @@ const WordCollector = struct {
             .Pipe, .DoublePipe, .Ampersand, .DoubleAmpersand => {
                 // Shouldn't happen during word collection - handled by state machine
             },
+            .CommandSubstitutionBegin, .CommandSubstitutionEnd => {
+                return ParseError.UnsupportedSyntax;
+            },
         }
     }
 
@@ -1481,6 +1484,10 @@ pub const Parser = struct {
                                 // End of and_or list
                                 continue :and_or .done;
                             },
+                            .CommandSubstitutionBegin => {
+                                self.setError("syntax error near unexpected token `$('", tok.position, tok.line, tok.column);
+                                return ParseError.UnsupportedSyntax;
+                            },
                             else => {
                                 // Unexpected token - finish the list
                                 continue :and_or .done;
@@ -1574,6 +1581,10 @@ pub const Parser = struct {
                                 self.pushContext(.{ .pipeline = pipeline });
                                 continue :state ParserContext.initCommand(self.allocator);
                             },
+                            .CommandSubstitutionBegin => {
+                                self.setError("syntax error near unexpected token `$('", tok.position, tok.line, tok.column);
+                                return ParseError.UnsupportedSyntax;
+                            },
                             else => {
                                 pipeline.state = .collecting_commands;
                                 self.pushContext(.{ .pipeline = pipeline });
@@ -1626,6 +1637,10 @@ pub const Parser = struct {
                                     cmd.command.state = .collecting_word;
                                     continue :state cmd;
                                 }
+                            },
+                            .CommandSubstitutionBegin => {
+                                self.setError("syntax error near unexpected token `$('", tok.position, tok.line, tok.column);
+                                return ParseError.UnsupportedSyntax;
                             },
                             else => {
                                 // Any other token (quote, expansion, etc.) - word continues
@@ -1731,6 +1746,10 @@ pub const Parser = struct {
                                 pipeline.command_count_before_pipe = pipeline.commands.items.len;
                                 self.pushContext(.{ .pipeline = pipeline });
                                 continue :state ParserContext.initCommand(self.allocator);
+                            },
+                            .CommandSubstitutionBegin => {
+                                self.setError("syntax error near unexpected token `$('", tok.position, tok.line, tok.column);
+                                return ParseError.UnsupportedSyntax;
                             },
                             else => {
                                 // We got a different token. We should finish
@@ -1849,6 +1868,10 @@ pub const Parser = struct {
                                 );
                                 return ParseError.UnsupportedSyntax;
                             },
+                            .CommandSubstitutionBegin => {
+                                self.setError("syntax error near unexpected token `$('", tok.position, tok.line, tok.column);
+                                return ParseError.UnsupportedSyntax;
+                            },
                             // Unknown/unhandled tokens - yield to parent without consuming
                             else => {
                                 continue :command .done;
@@ -1895,6 +1918,10 @@ pub const Parser = struct {
                             },
                             .RightParen => {
                                 self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
+                                return ParseError.UnsupportedSyntax;
+                            },
+                            .CommandSubstitutionBegin => {
+                                self.setError("syntax error near unexpected token `$('", tok.position, tok.line, tok.column);
                                 return ParseError.UnsupportedSyntax;
                             },
                             .Newline, .Semicolon, .DoubleSemicolon, .Pipe, .DoublePipe, .Ampersand, .DoubleAmpersand => {
@@ -1978,6 +2005,10 @@ pub const Parser = struct {
                             },
                             .RightParen => {
                                 self.setError("syntax error near unexpected token `)'", tok.position, tok.line, tok.column);
+                                return ParseError.UnsupportedSyntax;
+                            },
+                            .CommandSubstitutionBegin => {
+                                self.setError("syntax error near unexpected token `$('", tok.position, tok.line, tok.column);
                                 return ParseError.UnsupportedSyntax;
                             },
                             else => {
