@@ -685,7 +685,7 @@ pub const Lexer = struct {
                 // Backslash escapes the next character (makes it literal).
                 const next = try self.peekByte() orelse {
                     // EOF after backslash outside quotes - backslash is discarded per POSIX
-                    _ = self.swapContext(.none);
+                    _ = self.popContext();
                     break :state null;
                 };
 
@@ -693,12 +693,12 @@ pub const Lexer = struct {
                     // Line continuation - backslash-newline is removed entirely
                     _ = try self.consumeOne();
                     // Intra-call transition: continue processing on the next line
-                    continue :state self.swapContext(.none);
+                    continue :state self.popContext();
                 }
 
                 // Consume the escaped character and return it as an escaped literal (stable slice)
                 const escaped_slice = try self.consumeOne() orelse unreachable;
-                _ = self.swapContext(.none);
+                _ = self.popContext();
                 break :state self.makeToken(.{ .EscapedLiteral = escaped_slice }, false);
             },
             .dollar => {
@@ -1269,7 +1269,7 @@ pub const Lexer = struct {
                     '\\' => {
                         // Escape - jump to escape handling and come back.
                         _ = try self.consumeOne();
-                        continue :state self.swapContext(.none_escape);
+                        continue :state try self.pushContext(.none_escape);
                     },
                     '<' => {
                         _ = try self.consumeOne();
@@ -1297,6 +1297,11 @@ pub const Lexer = struct {
                         _ = try self.consumeOne();
                         self.needs_continuation = false;
                         if (self.parse_context == .command_substitution) {
+                            // TODO: Track parenthesis nesting depth to handle subshells
+                            // inside command substitution, e.g., $( (echo hello) ).
+                            // Currently, the first ) closes the command substitution
+                            // even if there are unmatched ( inside. This will be
+                            // resolved when subshell parsing is implemented.
                             _ = self.popContext();
                             const after = try self.peekByte();
                             const at_boundary = self.isWordComplete(after);
@@ -4002,4 +4007,19 @@ test "nextToken: command substitution in double quotes with space before text wi
     try expectContinuation(try lexer.nextToken(), "x", false);
     try expectContinuation(try lexer.nextToken(), "t", false);
     try expectDoubleQuoteEnd(try lexer.nextToken());
+}
+
+test "nextToken: escaped paren inside command substitution" {
+    // The escaped ) should not close the command substitution.
+    // Input: $(echo \))
+    //              ^^ escaped paren (literal)
+    //                ^ closes command substitution
+    var reader = std.io.Reader.fixed("$(echo \\))");
+    var lexer = Lexer.init(&reader);
+    try expectCommandSubstitutionBegin(try lexer.nextToken());
+    try expectLiteral(try lexer.nextToken(), "echo");
+    try expectEscapedLiteral(try lexer.nextToken(), ")");
+    try expectContinuation(try lexer.nextToken(), "", true); // word boundary before )
+    try expectCommandSubstitutionEnd(try lexer.nextToken());
+    try std.testing.expectEqual(null, try lexer.nextToken());
 }
