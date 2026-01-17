@@ -121,6 +121,8 @@ pub const ExpansionError = error{
     /// parameters ($@, $*, $#, $?, etc.).
     /// The error message has already been printed to stderr.
     ParameterAssignmentInvalid,
+    /// Command substitution $(command) is not yet implemented.
+    CommandSubstitutionNotImplemented,
 } || Allocator.Error;
 
 // ============================================================================
@@ -993,6 +995,11 @@ fn expandWord(
                     content_added = true;
                 }
             },
+            .command_sub => {
+                // Command substitution (POSIX 2.6.3) - not yet implemented
+                // TODO: Execute the command in a subshell and capture stdout
+                return error.CommandSubstitutionNotImplemented;
+            },
         }
     }
 
@@ -1030,6 +1037,10 @@ fn expandInnerParts(
                 if (try builder.appendParts(paramParts)) {
                     content_added = true;
                 }
+            },
+            .command_sub => {
+                // Command substitution (POSIX 2.6.3) - not yet implemented
+                return error.CommandSubstitutionNotImplemented;
             },
         }
     }

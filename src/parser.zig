@@ -35,8 +35,10 @@ pub const WordPart = union(enum) {
     /// Parameter expansion - ${param}, ${param:-default}, etc.
     parameter: ParameterExpansion,
 
+    /// Command substitution - $(command).
+    command_sub: CommandSubstitution,
+
     // Future expansion types:
-    // command_sub: CommandSubstitution,
     // arithmetic: ArithmeticExpansion,
 
     /// Format the word part for human-readable output.
@@ -54,6 +56,7 @@ pub const WordPart = union(enum) {
                 try writer.writeAll("])");
             },
             .parameter => |param| try param.format(writer),
+            .command_sub => |cs| try cs.format(writer),
         }
     }
 
@@ -75,6 +78,7 @@ pub const WordPart = union(enum) {
                 try writer.writeByte('"');
             },
             .parameter => |param| try param.format(writer),
+            .command_sub => |cs| try cs.format(writer),
         }
     }
 
@@ -90,6 +94,7 @@ pub const WordPart = union(enum) {
                 allocator.free(parts);
             },
             .parameter => |param| param.deinit(allocator),
+            .command_sub => |cs| cs.deinit(allocator),
         }
     }
 };
@@ -174,6 +179,31 @@ pub const ParameterExpansion = struct {
                 allocator.free(word_parts);
             }
         }
+    }
+};
+
+/// Command substitution - $(command) or `command`
+///
+/// Command substitution allows the output of a command to replace the
+/// command itself. The shell executes the command in a subshell environment
+/// and replaces the command substitution with the standard output of the
+/// command, removing trailing newlines.
+///
+/// POSIX Reference: Section 2.6.3 - Command Substitution
+pub const CommandSubstitution = struct {
+    /// The parsed command list to execute in a subshell.
+    commands: CompoundList,
+
+    /// Format the command substitution for human-readable output.
+    pub fn format(self: CommandSubstitution, writer: *std.io.Writer) std.io.Writer.Error!void {
+        try writer.writeAll("$(");
+        try self.commands.format(writer);
+        try writer.writeByte(')');
+    }
+
+    /// Free all memory allocated for this command substitution.
+    pub fn deinit(self: CommandSubstitution, allocator: Allocator) void {
+        self.commands.deinit(allocator);
     }
 };
 
@@ -866,6 +896,16 @@ const ParserContext = union(enum) {
         completed_and_or: ?AndOrList,
     },
 
+    /// Parsing inside a command substitution $(...).
+    /// Collects and_or_lists until CommandSubstitutionEnd is seen.
+    /// POSIX Reference: Section 2.6.3 - Command Substitution
+    command_substitution: struct {
+        /// Accumulated and_or_lists for the command substitution.
+        commands: std.ArrayListUnmanaged(AndOrList),
+        /// Filled by child and_or_list context when it completes.
+        completed_and_or: ?AndOrList,
+    },
+
     /// Initialize a pipeline context.
     fn initPipeline() ParserContext {
         return .{ .pipeline = .{
@@ -921,6 +961,14 @@ const ParserContext = union(enum) {
         } };
     }
 
+    /// Initialize a command_substitution context.
+    fn initCommandSubstitution() ParserContext {
+        return .{ .command_substitution = .{
+            .commands = .empty,
+            .completed_and_or = null,
+        } };
+    }
+
     fn deinit(self: *ParserContext, allocator: Allocator) void {
         switch (self.*) {
             .pipeline => |*pl| {
@@ -951,6 +999,9 @@ const ParserContext = union(enum) {
             .loop_clause => |*lc| {
                 lc.condition.deinit(allocator);
                 lc.body.deinit(allocator);
+            },
+            .command_substitution => |*cs| {
+                cs.commands.deinit(allocator);
             },
         }
     }
@@ -1168,7 +1219,9 @@ const WordCollector = struct {
                 // Shouldn't happen during word collection - handled by state machine
             },
             .CommandSubstitutionBegin, .CommandSubstitutionEnd => {
-                return ParseError.UnsupportedSyntax;
+                // Command substitution tokens are handled by the main parser state
+                // machine before they reach WordCollector. If we get here, it's a bug.
+                unreachable;
             },
         }
     }
@@ -1260,6 +1313,10 @@ const WordCollector = struct {
                     // context, not looking at a double_quoted part. So continuations
                     // cannot target a double_quoted part.
                     .double_quoted => unreachable,
+                    // command_sub parts are complete once parsed - continuations cannot
+                    // extend them. A continuation after command substitution would start
+                    // a new literal part, not extend the substitution.
+                    .command_sub => unreachable,
                 }
             }
         }.f;
@@ -1484,9 +1541,10 @@ pub const Parser = struct {
                                 // End of and_or list
                                 continue :and_or .done;
                             },
-                            .CommandSubstitutionBegin => {
-                                self.setError("syntax error near unexpected token `$('", tok.position, tok.line, tok.column);
-                                return ParseError.UnsupportedSyntax;
+                            .CommandSubstitutionEnd => {
+                                // End of command substitution - finish list without consuming
+                                // The parent command_substitution context will handle this token.
+                                continue :and_or .done;
                             },
                             else => {
                                 // Unexpected token - finish the list
@@ -1516,6 +1574,12 @@ pub const Parser = struct {
                                         lc.completed_and_or = null;
                                         continue :state .{ .loop_clause = lc };
                                     },
+                                    .command_substitution => |*cs_val| {
+                                        // Empty and_or - continue command_substitution without adding anything
+                                        var cs = cs_val.*;
+                                        cs.completed_and_or = null;
+                                        continue :state .{ .command_substitution = cs };
+                                    },
                                     .pipeline, .command, .and_or_list => unreachable,
                                 }
                             }
@@ -1537,6 +1601,11 @@ pub const Parser = struct {
                                     var lc = lc_val.*;
                                     lc.completed_and_or = result;
                                     continue :state .{ .loop_clause = lc };
+                                },
+                                .command_substitution => |*cs_val| {
+                                    var cs = cs_val.*;
+                                    cs.completed_and_or = result;
+                                    continue :state .{ .command_substitution = cs };
                                 },
                                 .pipeline, .command, .and_or_list => unreachable,
                             }
@@ -1580,10 +1649,6 @@ pub const Parser = struct {
                                 pipeline.state = .collecting_commands;
                                 self.pushContext(.{ .pipeline = pipeline });
                                 continue :state ParserContext.initCommand(self.allocator);
-                            },
-                            .CommandSubstitutionBegin => {
-                                self.setError("syntax error near unexpected token `$('", tok.position, tok.line, tok.column);
-                                return ParseError.UnsupportedSyntax;
                             },
                             else => {
                                 pipeline.state = .collecting_commands;
@@ -1637,10 +1702,6 @@ pub const Parser = struct {
                                     cmd.command.state = .collecting_word;
                                     continue :state cmd;
                                 }
-                            },
-                            .CommandSubstitutionBegin => {
-                                self.setError("syntax error near unexpected token `$('", tok.position, tok.line, tok.column);
-                                return ParseError.UnsupportedSyntax;
                             },
                             else => {
                                 // Any other token (quote, expansion, etc.) - word continues
@@ -1747,10 +1808,6 @@ pub const Parser = struct {
                                 self.pushContext(.{ .pipeline = pipeline });
                                 continue :state ParserContext.initCommand(self.allocator);
                             },
-                            .CommandSubstitutionBegin => {
-                                self.setError("syntax error near unexpected token `$('", tok.position, tok.line, tok.column);
-                                return ParseError.UnsupportedSyntax;
-                            },
                             else => {
                                 // We got a different token. We should finish
                                 // pipeline.
@@ -1790,7 +1847,7 @@ pub const Parser = struct {
                                 // Continue processing and_or_list
                                 continue :state next_context;
                             },
-                            .command, .pipeline, .if_clause, .loop_clause => {
+                            .command, .pipeline, .if_clause, .loop_clause, .command_substitution => {
                                 // Pipeline should only pop to and_or_list.
                                 unreachable;
                             },
@@ -1835,6 +1892,18 @@ pub const Parser = struct {
                                     continue :command .collecting_word;
                                 }
                             },
+                            .CommandSubstitutionBegin => {
+                                // Start a word with a command substitution.
+                                _ = try self.consumeToken();
+                                command.word_collector.startWord(tok);
+                                // Push current command context, then command_substitution,
+                                // then and_or_list to parse the inner command(s).
+                                // Pipeline will pop to and_or_list, which pops to command_substitution.
+                                command.state = .collecting_word;
+                                self.pushContext(.{ .command = command });
+                                self.pushContext(ParserContext.initCommandSubstitution());
+                                continue :state ParserContext.initAndOrList();
+                            },
                             .Redirection => |redir| {
                                 command.setPendingRedir(redir, tok);
                                 _ = try self.consumeToken();
@@ -1866,10 +1935,6 @@ pub const Parser = struct {
                                     tok.line,
                                     tok.column,
                                 );
-                                return ParseError.UnsupportedSyntax;
-                            },
-                            .CommandSubstitutionBegin => {
-                                self.setError("syntax error near unexpected token `$('", tok.position, tok.line, tok.column);
                                 return ParseError.UnsupportedSyntax;
                             },
                             // Unknown/unhandled tokens - yield to parent without consuming
@@ -1921,8 +1986,14 @@ pub const Parser = struct {
                                 return ParseError.UnsupportedSyntax;
                             },
                             .CommandSubstitutionBegin => {
-                                self.setError("syntax error near unexpected token `$('", tok.position, tok.line, tok.column);
-                                return ParseError.UnsupportedSyntax;
+                                // Command substitution in the middle of a word.
+                                _ = try self.consumeToken();
+                                // Push current command context, then command_substitution,
+                                // then and_or_list to parse the inner command(s).
+                                command.state = .collecting_word;
+                                self.pushContext(.{ .command = command });
+                                self.pushContext(ParserContext.initCommandSubstitution());
+                                continue :state ParserContext.initAndOrList();
                             },
                             .Newline, .Semicolon, .DoubleSemicolon, .Pipe, .DoublePipe, .Ampersand, .DoubleAmpersand => {
                                 // Unreachable: The lexer marks words complete when followed by separators
@@ -2008,8 +2079,17 @@ pub const Parser = struct {
                                 return ParseError.UnsupportedSyntax;
                             },
                             .CommandSubstitutionBegin => {
-                                self.setError("syntax error near unexpected token `$('", tok.position, tok.line, tok.column);
-                                return ParseError.UnsupportedSyntax;
+                                // Command substitution as redirection target.
+                                _ = try self.consumeToken();
+                                command.word_collector.startWord(tok);
+                                // Push current command context, then command_substitution,
+                                // then pipeline to parse the inner command.
+                                // When we return, we'll be in collecting_word state to
+                                // continue the redirection target word.
+                                command.state = .collecting_word;
+                                self.pushContext(.{ .command = command });
+                                self.pushContext(ParserContext.initCommandSubstitution());
+                                continue :state ParserContext.initAndOrList();
                             },
                             else => {
                                 _ = try self.consumeToken();
@@ -2033,7 +2113,7 @@ pub const Parser = struct {
                     },
 
                     .word_complete => {
-                        const word = try command.word_collector.finishWord();
+                        var word = try command.word_collector.finishWord();
 
                         // If we have a pending redirection, this word is its target
                         if (command.pending_redir) |redir| {
@@ -2202,9 +2282,9 @@ pub const Parser = struct {
 
                         // Check if it's an assignment (only valid before command name)
                         if (!command.seen_command) {
-                            if (try self.tryBuildAssignment(word)) |assignment| {
+                            if (try self.buildAssignment(&word)) |assignment| {
                                 try command.assignments.append(self.allocator, assignment);
-                                word.deinit(self.allocator);
+                                // buildAssignment takes ownership and handles cleanup
                                 continue :command .start;
                             }
                         }
@@ -2288,7 +2368,7 @@ pub const Parser = struct {
                                 .pipeline => |*pl| {
                                     try pl.commands.append(self.allocator, cmd);
                                 },
-                                .command, .and_or_list, .if_clause, .loop_clause => unreachable,
+                                .command, .and_or_list, .if_clause, .loop_clause, .command_substitution => unreachable,
                             }
                         }
                         continue :state parent;
@@ -2405,7 +2485,7 @@ pub const Parser = struct {
                                             cmd_ctx.compound_command = .{ .if_clause = result };
                                             continue :state parent;
                                         },
-                                        .and_or_list, .if_clause, .loop_clause, .pipeline => unreachable,
+                                        .and_or_list, .if_clause, .loop_clause, .pipeline, .command_substitution => unreachable,
                                     }
                                 },
                                 .@"if" => {
@@ -2448,7 +2528,7 @@ pub const Parser = struct {
                                         cmd_ctx.compound_command = .{ .if_clause = result };
                                         continue :state parent;
                                     },
-                                    .and_or_list, .if_clause, .loop_clause, .pipeline => unreachable,
+                                    .and_or_list, .if_clause, .loop_clause, .pipeline, .command_substitution => unreachable,
                                 }
                             } else if (reserved == .@"if") {
                                 // Nested if in else - let and_or_list handle it
@@ -2544,7 +2624,7 @@ pub const Parser = struct {
                                             }
                                             continue :state parent;
                                         },
-                                        .and_or_list, .if_clause, .loop_clause, .pipeline => unreachable,
+                                        .and_or_list, .if_clause, .loop_clause, .pipeline, .command_substitution => unreachable,
                                     }
                                 },
                                 .@"while", .until, .@"if" => {
@@ -2569,6 +2649,68 @@ pub const Parser = struct {
                 // Not a reserved word - push and_or_list to parse more commands
                 self.pushContext(.{ .loop_clause = lc });
                 continue :state ParserContext.initAndOrList();
+            },
+            .command_substitution => |cs_ctx| {
+                var cs = cs_ctx;
+
+                // Handle completed and_or from child context.
+                if (cs.completed_and_or) |result| {
+                    cs.completed_and_or = null;
+                    try cs.commands.append(self.allocator, result);
+                }
+
+                // Check for CommandSubstitutionEnd or more commands
+                const tok = self.peekToken() catch |err| {
+                    self.setError(lexerErrorMessage(err), self.lex.position, self.lex.line, self.lex.column);
+                    return err;
+                } orelse {
+                    // EOF inside command substitution - error
+                    self.setError("syntax error: unexpected end of input (expected ')')", self.lex.position, self.lex.line, self.lex.column);
+                    return ParseError.UnexpectedEndOfInput;
+                };
+
+                switch (tok.type) {
+                    .CommandSubstitutionEnd => {
+                        // Consume the closing )
+                        _ = try self.consumeToken();
+
+                        // Build the CommandSubstitution
+                        const cmd_sub = CommandSubstitution{
+                            .commands = CompoundList{
+                                .commands = try cs.commands.toOwnedSlice(self.allocator),
+                            },
+                        };
+
+                        // Pop to parent command context and add the command_sub to current word
+                        var parent = self.popContext() orelse unreachable;
+                        switch (parent) {
+                            .command => |*cmd_ctx| {
+                                // Use addPartToCurrentContext to handle both top-level and
+                                // quoted contexts (e.g., command substitution inside double quotes)
+                                try cmd_ctx.word_collector.addPartToCurrentContext(.{ .command_sub = cmd_sub });
+                                // Check if the token was complete (word boundary)
+                                if (tok.complete) {
+                                    cmd_ctx.state = .word_complete;
+                                } else {
+                                    cmd_ctx.state = .collecting_word;
+                                }
+                                continue :state parent;
+                            },
+                            .and_or_list, .if_clause, .loop_clause, .pipeline, .command_substitution => unreachable,
+                        }
+                    },
+                    .Semicolon, .Newline => {
+                        // More commands in the substitution - consume separator and continue
+                        _ = try self.consumeToken();
+                        self.pushContext(.{ .command_substitution = cs });
+                        continue :state ParserContext.initAndOrList();
+                    },
+                    else => {
+                        // More content - continue parsing
+                        self.pushContext(.{ .command_substitution = cs });
+                        continue :state ParserContext.initAndOrList();
+                    },
+                }
             },
         }
     }
@@ -2617,13 +2759,18 @@ pub const Parser = struct {
         return ParserContext.initAndOrList();
     }
 
-    /// Try to build an assignment from a word.
-    /// Returns the assignment if valid, or null if it's not an assignment.
+    /// Build an assignment from a word, taking ownership of its parts.
+    ///
+    /// If successful, returns the Assignment and consumes the word (frees what
+    /// needs to be freed, moves what can be moved). The word's parts will be
+    /// set to an empty slice to indicate ownership was transferred.
+    ///
+    /// If not an assignment, returns null and leaves the word unchanged.
     ///
     /// An assignment must have:
     /// 1. An unquoted `=` not at position 0
     /// 2. A valid identifier before the `=`: [A-Za-z_][A-Za-z0-9_]*
-    fn tryBuildAssignment(self: *Parser, word: Word) ParseError!?Assignment {
+    fn buildAssignment(self: *Parser, word: *Word) ParseError!?Assignment {
         // For now, we only support simple assignments where the first part
         // is a literal containing `=`
         if (word.parts.len == 0) return null;
@@ -2644,17 +2791,25 @@ pub const Parser = struct {
 
                 // Build the value Word
                 var value_parts: std.ArrayListUnmanaged(WordPart) = .empty;
+                errdefer value_parts.deinit(self.allocator);
 
                 // Add the part after `=` from the first literal (if non-empty)
                 if (value_start.len > 0) {
                     const copied = try self.allocator.dupe(u8, value_start);
+                    errdefer self.allocator.free(copied);
                     try value_parts.append(self.allocator, .{ .literal = copied });
                 }
 
-                // Add remaining parts from the original word
+                // Move remaining parts from the original word (take ownership).
+                // We move rather than copy to avoid deep-copying complex structures
+                // like CommandSubstitution.
                 for (word.parts[1..]) |part| {
-                    try value_parts.append(self.allocator, try self.copyWordPart(part));
+                    try value_parts.append(self.allocator, part);
                 }
+
+                // Allocate name before toOwnedSlice so errdefer can clean up value_parts
+                const name_copied = try self.allocator.dupe(u8, name);
+                errdefer self.allocator.free(name_copied);
 
                 const value = Word{
                     .parts = try value_parts.toOwnedSlice(self.allocator),
@@ -2663,7 +2818,12 @@ pub const Parser = struct {
                     .column = word.column + eq_pos + 1,
                 };
 
-                const name_copied = try self.allocator.dupe(u8, name);
+                // Free the first literal (we've extracted what we need from it)
+                self.allocator.free(lit);
+                // Free the original parts slice (we've moved the contents)
+                self.allocator.free(word.parts);
+                // Mark the word as consumed
+                word.parts = &.{};
 
                 return Assignment{
                     .name = name_copied,
@@ -2673,46 +2833,10 @@ pub const Parser = struct {
                     .column = word.column,
                 };
             },
-            // If the first part is quoted, double_quoted, or parameter, it's not an assignment
+            // If the first part is quoted, double_quoted, parameter, or command_sub, it's not an assignment
             // (the `=` would need to be in an unquoted literal)
-            .quoted, .double_quoted, .parameter => return null,
+            .quoted, .double_quoted, .parameter, .command_sub => return null,
         }
-    }
-
-    /// Deep copy a WordPart, including nested parts for double_quoted and parameter.
-    fn copyWordPart(self: *Parser, part: WordPart) ParseError!WordPart {
-        return switch (part) {
-            .literal => |lit| WordPart{ .literal = try self.allocator.dupe(u8, lit) },
-            .quoted => |q| WordPart{ .quoted = try self.allocator.dupe(u8, q) },
-            .double_quoted => |parts| blk: {
-                var copied_parts = try self.allocator.alloc(WordPart, parts.len);
-                for (parts, 0..) |p, i| {
-                    copied_parts[i] = try self.copyWordPart(p);
-                }
-                break :blk WordPart{ .double_quoted = copied_parts };
-            },
-            .parameter => |param| blk: {
-                const copied_name = try self.allocator.dupe(u8, param.name);
-                const copied_modifier: ?ParameterExpansion.Modifier = if (param.modifier) |mod| m: {
-                    const copied_word: ?[]const WordPart = if (mod.word) |word_parts| w: {
-                        var copied_parts = try self.allocator.alloc(WordPart, word_parts.len);
-                        for (word_parts, 0..) |p, i| {
-                            copied_parts[i] = try self.copyWordPart(p);
-                        }
-                        break :w copied_parts;
-                    } else null;
-                    break :m ParameterExpansion.Modifier{
-                        .op = mod.op,
-                        .check_null = mod.check_null,
-                        .word = copied_word,
-                    };
-                } else null;
-                break :blk WordPart{ .parameter = ParameterExpansion{
-                    .name = copied_name,
-                    .modifier = copied_modifier,
-                } };
-            },
-        };
     }
 
     /// Check if a string is a valid shell identifier.
@@ -2792,8 +2916,8 @@ pub const Parser = struct {
             // Only unquoted literals can form fd numbers
             const lit = switch (part) {
                 .literal => |l| l,
-                // Quoted, double_quoted, or parameter parts can't be fd numbers
-                .quoted, .double_quoted, .parameter => return null,
+                // Quoted, double_quoted, parameter, or command_sub parts can't be fd numbers
+                .quoted, .double_quoted, .parameter, .command_sub => return null,
             };
             if (lit.len == 0) continue;
 
@@ -2829,13 +2953,13 @@ pub const Parser = struct {
                         break :blk switch (parts[0]) {
                             .literal => |lit| lit,
                             .quoted => |q| q,
-                            .double_quoted, .parameter => null,
+                            .double_quoted, .parameter, .command_sub => null,
                         };
                     }
                     break :blk null;
                 },
-                // Parameter expansions can't be evaluated at parse time
-                .parameter => null,
+                // Parameter expansions and command substitutions can't be evaluated at parse time
+                .parameter, .command_sub => null,
             };
             if (text) |t| {
                 if (std.mem.eql(u8, t, "-")) {
@@ -2885,6 +3009,11 @@ fn expectWordPart(actual: WordPart, expected: WordPart) !void {
                 try std.testing.expectEqual(exp_param.modifier.?.op, actual.parameter.modifier.?.op);
                 try std.testing.expectEqual(exp_param.modifier.?.check_null, actual.parameter.modifier.?.check_null);
             }
+        },
+        .command_sub => |exp_cs| {
+            if (actual != .command_sub) return error.ExpectedCommandSub;
+            // Check that command counts match
+            try std.testing.expectEqual(exp_cs.commands.commands.len, actual.command_sub.commands.commands.len);
         },
     }
 }
@@ -3763,6 +3892,10 @@ fn appendWordPartText(allocator: Allocator, result: *std.ArrayListUnmanaged(u8),
             // This allows buffer boundary tests to compare commands with expansions.
             try result.appendSlice(allocator, "$");
             try result.appendSlice(allocator, param.name);
+        },
+        .command_sub => {
+            // Append a placeholder for command substitution for comparison purposes.
+            try result.appendSlice(allocator, "$()");
         },
     }
 }
@@ -5714,4 +5847,254 @@ test "parseCommand: until/while difference preserved in AST" {
     const result2 = try parser2.next();
     try std.testing.expect(result2 != null);
     try std.testing.expect(getPipeline(result2.?).commands[0].type == .until_clause);
+}
+
+// --- Command Substitution Parsing Tests ---
+
+test "parseCommand: simple command substitution" {
+    // echo $(pwd)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo $(pwd)\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser.next();
+    try std.testing.expect(result != null);
+
+    const pipeline = getPipeline(result.?);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.commands.len);
+
+    const cmd = pipeline.commands[0];
+    try std.testing.expect(cmd.type == .simple);
+
+    const simple = cmd.type.simple;
+    try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
+
+    // First arg is "echo"
+    try std.testing.expectEqual(@as(usize, 1), simple.argv[0].parts.len);
+    try std.testing.expect(simple.argv[0].parts[0] == .literal);
+
+    // Second arg is $(pwd) - a command substitution
+    try std.testing.expectEqual(@as(usize, 1), simple.argv[1].parts.len);
+    try std.testing.expect(simple.argv[1].parts[0] == .command_sub);
+
+    // The command substitution contains one command: pwd
+    const cs = simple.argv[1].parts[0].command_sub;
+    try std.testing.expectEqual(@as(usize, 1), cs.commands.commands.len);
+}
+
+test "parseCommand: command substitution in double quotes" {
+    // echo "hello $(whoami)"
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo \"hello $(whoami)\"\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser.next();
+    try std.testing.expect(result != null);
+
+    const pipeline = getPipeline(result.?);
+    const cmd = pipeline.commands[0];
+    const simple = cmd.type.simple;
+
+    try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
+
+    // Second arg is "hello $(whoami)" - double-quoted with command substitution
+    const word = simple.argv[1];
+    try std.testing.expectEqual(@as(usize, 1), word.parts.len);
+    try std.testing.expect(word.parts[0] == .double_quoted);
+
+    const dq_parts = word.parts[0].double_quoted;
+    try std.testing.expectEqual(@as(usize, 2), dq_parts.len);
+    try std.testing.expect(dq_parts[0] == .literal); // "hello "
+    try std.testing.expect(dq_parts[1] == .command_sub); // $(whoami)
+}
+
+test "parseCommand: command substitution with pipe" {
+    // echo $(ls | head -1)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo $(ls | head -1)\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser.next();
+    try std.testing.expect(result != null);
+
+    const pipeline = getPipeline(result.?);
+    const cmd = pipeline.commands[0];
+    const simple = cmd.type.simple;
+
+    try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
+
+    // Second arg is $(ls | head -1) - command substitution with a pipeline
+    const word = simple.argv[1];
+    try std.testing.expectEqual(@as(usize, 1), word.parts.len);
+    try std.testing.expect(word.parts[0] == .command_sub);
+
+    // The command substitution contains one and_or list with one pipeline
+    const cs = word.parts[0].command_sub;
+    try std.testing.expectEqual(@as(usize, 1), cs.commands.commands.len);
+
+    // That pipeline should have 2 commands (ls | head)
+    const inner_pipeline = cs.commands.commands[0].items[0].pipeline;
+    try std.testing.expectEqual(@as(usize, 2), inner_pipeline.commands.len);
+}
+
+test "parseCommand: command substitution at start of word" {
+    // $(pwd)/foo
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo $(pwd)/foo\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser.next();
+    try std.testing.expect(result != null);
+
+    const pipeline = getPipeline(result.?);
+    const cmd = pipeline.commands[0];
+    const simple = cmd.type.simple;
+
+    // Second arg is $(pwd)/foo - command substitution followed by literal
+    const word = simple.argv[1];
+    try std.testing.expectEqual(@as(usize, 2), word.parts.len);
+    try std.testing.expect(word.parts[0] == .command_sub);
+    try std.testing.expect(word.parts[1] == .literal);
+    try std.testing.expectEqualStrings("/foo", word.parts[1].literal);
+}
+
+test "parseCommand: multiple command substitutions" {
+    // echo $(pwd) $(date)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo $(pwd) $(date)\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser.next();
+    try std.testing.expect(result != null);
+
+    const pipeline = getPipeline(result.?);
+    const cmd = pipeline.commands[0];
+    const simple = cmd.type.simple;
+
+    // Should have 3 args: echo, $(pwd), $(date)
+    try std.testing.expectEqual(@as(usize, 3), simple.argv.len);
+    try std.testing.expect(simple.argv[1].parts[0] == .command_sub);
+    try std.testing.expect(simple.argv[2].parts[0] == .command_sub);
+}
+
+test "parseCommand: unterminated command substitution" {
+    // echo $(pwd  -- missing closing paren
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo $(pwd");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = parser.next();
+    try std.testing.expectError(ParseError.UnexpectedEndOfInput, result);
+}
+
+test "parseCommand: nested command substitution" {
+    // echo $(echo $(pwd))
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo $(echo $(pwd))\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser.next();
+    try std.testing.expect(result != null);
+
+    const pipeline = getPipeline(result.?);
+    const cmd = pipeline.commands[0];
+    const simple = cmd.type.simple;
+
+    try std.testing.expectEqual(@as(usize, 2), simple.argv.len);
+
+    // Second arg is $(echo $(pwd)) - outer command substitution
+    const word = simple.argv[1];
+    try std.testing.expectEqual(@as(usize, 1), word.parts.len);
+    try std.testing.expect(word.parts[0] == .command_sub);
+
+    // The outer command substitution contains "echo $(pwd)"
+    const outer_cs = word.parts[0].command_sub;
+    try std.testing.expectEqual(@as(usize, 1), outer_cs.commands.commands.len);
+
+    // Get the inner command (echo $(pwd))
+    const inner_pipeline = outer_cs.commands.commands[0].items[0].pipeline;
+    try std.testing.expectEqual(@as(usize, 1), inner_pipeline.commands.len);
+    const inner_simple = inner_pipeline.commands[0].type.simple;
+    try std.testing.expectEqual(@as(usize, 2), inner_simple.argv.len);
+
+    // The second arg of inner command is $(pwd) - nested command substitution
+    try std.testing.expect(inner_simple.argv[1].parts[0] == .command_sub);
+}
+
+test "parseCommand: assignment with command substitution" {
+    // FOO=$(pwd)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("FOO=$(pwd)\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser.next();
+    try std.testing.expect(result != null);
+
+    const pipeline = getPipeline(result.?);
+    const cmd = pipeline.commands[0];
+    const simple = cmd.type.simple;
+
+    // Should have one assignment and no argv
+    try std.testing.expectEqual(@as(usize, 1), simple.assignments.len);
+    try std.testing.expectEqual(@as(usize, 0), simple.argv.len);
+
+    // Check the assignment
+    const assignment = simple.assignments[0];
+    try std.testing.expectEqualStrings("FOO", assignment.name);
+
+    // The value should be a command substitution
+    try std.testing.expectEqual(@as(usize, 1), assignment.value.parts.len);
+    try std.testing.expect(assignment.value.parts[0] == .command_sub);
+
+    // The command substitution contains "pwd"
+    const cs = assignment.value.parts[0].command_sub;
+    try std.testing.expectEqual(@as(usize, 1), cs.commands.commands.len);
+}
+
+test "parseCommand: command substitution at end of word" {
+    // echo prefix$(pwd)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader = std.io.Reader.fixed("echo prefix$(pwd)\n");
+    var lex = lexer.Lexer.init(&reader);
+    var parser = Parser.init(arena.allocator(), &lex);
+
+    const result = try parser.next();
+    try std.testing.expect(result != null);
+
+    const pipeline = getPipeline(result.?);
+    const cmd = pipeline.commands[0];
+    const simple = cmd.type.simple;
+
+    // Second arg is "prefix$(pwd)" - literal followed by command substitution
+    const word = simple.argv[1];
+    try std.testing.expectEqual(@as(usize, 2), word.parts.len);
+    try std.testing.expect(word.parts[0] == .literal);
+    try std.testing.expectEqualStrings("prefix", word.parts[0].literal);
+    try std.testing.expect(word.parts[1] == .command_sub);
 }
