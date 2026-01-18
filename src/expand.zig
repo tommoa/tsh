@@ -11,7 +11,7 @@
 //!
 //! 1. **Tilde Expansion** (2.6.1) - `~` and `~/path` expand to $HOME
 //! 2. **Parameter Expansion** (2.6.2) - `$VAR`, `${VAR}`, `${VAR:-default}`, etc.
-//! 3. **Command Substitution** (2.6.3) - `$(cmd)` and `` `cmd` `` (not yet implemented)
+//! 3. **Command Substitution** (2.6.3) - `$(cmd)` (implemented), `` `cmd` `` (not yet implemented)
 //! 4. **Arithmetic Expansion** (2.6.4) - `$((expr))` (not yet implemented)
 //! 5. **Field Splitting** (2.6.5) - Split on IFS (not yet implemented)
 //! 6. **Pathname Expansion** (2.6.6) - Glob patterns `*`, `?`, `[...]` (not yet implemented)
@@ -87,6 +87,7 @@ const Allocator = std.mem.Allocator;
 const parser = @import("parser.zig");
 const pattern = @import("pattern.zig");
 const state = @import("state.zig");
+const subshell = @import("subshell.zig");
 
 const Word = parser.Word;
 const WordPart = parser.WordPart;
@@ -121,9 +122,7 @@ pub const ExpansionError = error{
     /// parameters ($@, $*, $#, $?, etc.).
     /// The error message has already been printed to stderr.
     ParameterAssignmentInvalid,
-    /// Command substitution $(command) is not yet implemented.
-    CommandSubstitutionNotImplemented,
-} || Allocator.Error;
+} || Allocator.Error || subshell.SubshellError;
 
 // ============================================================================
 // Public API
@@ -995,10 +994,15 @@ fn expandWord(
                     content_added = true;
                 }
             },
-            .command_sub => {
-                // Command substitution (POSIX 2.6.3) - not yet implemented
-                // TODO: Execute the command in a subshell and capture stdout
-                return error.CommandSubstitutionNotImplemented;
+            .command_sub => |cs| {
+                // Command substitution (POSIX 2.6.3)
+                const output = try subshell.captureOutput(builder.allocator, cs.commands, shell);
+                // In unquoted context, output is subject to field splitting (future)
+                // For now, we just append it as a single part
+                if (output.len > 0) {
+                    try builder.append(output);
+                    content_added = true;
+                }
             },
         }
     }
@@ -1038,9 +1042,14 @@ fn expandInnerParts(
                     content_added = true;
                 }
             },
-            .command_sub => {
-                // Command substitution (POSIX 2.6.3) - not yet implemented
-                return error.CommandSubstitutionNotImplemented;
+            .command_sub => |cs| {
+                // Command substitution (POSIX 2.6.3)
+                const output = try subshell.captureOutput(builder.allocator, cs.commands, shell);
+                // In quoted context, result is a single field (no field splitting)
+                if (output.len > 0) {
+                    try builder.append(output);
+                    content_added = true;
+                }
             },
         }
     }
@@ -4003,4 +4012,140 @@ test "modifier: ${@+alt} with no params returns alt (dash/zsh behavior)" {
     // Without colon, only checks if "set" - $@ is always set, returns alternative
     const result = try expandWordJoined(arena.allocator(), word, &shell);
     try std.testing.expectEqualStrings("alt", result);
+}
+
+// --- Command Substitution Tests (POSIX 2.6.3) ---
+
+const lexer = @import("lexer.zig");
+
+fn expandCommandString(allocator: Allocator, input: []const u8, shell: *ShellState) ![]const u8 {
+    var reader = std.io.Reader.fixed(input);
+    var lex = lexer.Lexer.init(&reader);
+    var p = parser.Parser.init(allocator, &lex);
+    const cmd = (try p.parseCommand()) orelse return error.NoCommand;
+    defer cmd.and_or.deinit(allocator);
+
+    if (cmd.and_or.items.len == 0) return error.NoCommand;
+    const pipeline = cmd.and_or.items[0].pipeline;
+    if (pipeline.commands.len == 0) return error.NoCommand;
+    const simple = pipeline.commands[0].type.simple;
+    if (simple.argv.len == 0) return error.NoCommand;
+
+    const word = simple.argv[0];
+    return expandWordJoined(allocator, word, shell);
+}
+
+test "command substitution: simple echo" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+
+    const result = try expandCommandString(arena.allocator(), "$(echo hello)", &shell);
+    try std.testing.expectEqualStrings("hello", result);
+}
+
+test "command substitution: trailing newlines removed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+
+    // printf without trailing newline, then echo adds newlines
+    const result = try expandCommandString(arena.allocator(), "$(printf 'a\\n\\n')", &shell);
+    try std.testing.expectEqualStrings("a", result);
+}
+
+test "command substitution: interior newlines preserved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+
+    const result = try expandCommandString(arena.allocator(), "$(printf 'a\\nb')", &shell);
+    try std.testing.expectEqualStrings("a\nb", result);
+}
+
+test "command substitution: empty output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+
+    const result = try expandCommandString(arena.allocator(), "x$(true)y", &shell);
+    try std.testing.expectEqualStrings("xy", result);
+}
+
+test "command substitution: failed command captures output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+
+    // Command fails but output should still be captured
+    const result = try expandCommandString(arena.allocator(), "$(echo foo && false)", &shell);
+    try std.testing.expectEqualStrings("foo", result);
+
+    // Check that exit status reflects the failure
+    try std.testing.expectEqual(@as(u8, 1), shell.last_status.exited);
+}
+
+test "command substitution: nested substitution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+
+    const result = try expandCommandString(arena.allocator(), "$(echo $(echo nested))", &shell);
+    try std.testing.expectEqualStrings("nested", result);
+}
+
+test "command substitution: with prefix and suffix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+
+    const result = try expandCommandString(arena.allocator(), "prefix$(echo middle)suffix", &shell);
+    try std.testing.expectEqualStrings("prefixmiddlesuffix", result);
+}
+
+test "command substitution: multiple substitutions in one word" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+
+    const result = try expandCommandString(arena.allocator(), "$(echo a)$(echo b)", &shell);
+    try std.testing.expectEqualStrings("ab", result);
+}
+
+test "command substitution: in double quotes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+
+    const result = try expandCommandString(arena.allocator(), "\"prefix $(echo middle) suffix\"", &shell);
+    try std.testing.expectEqualStrings("prefix middle suffix", result);
+}
+
+test "command substitution: with pipeline" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+
+    const result = try expandCommandString(arena.allocator(), "$(echo hello | cat)", &shell);
+    try std.testing.expectEqualStrings("hello", result);
 }

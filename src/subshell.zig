@@ -1,0 +1,183 @@
+//! Subshell Execution Primitives
+//!
+//! This module provides low-level primitives for executing commands in
+//! subshells, including capturing output for command substitution and
+//! shared utilities for process management.
+//!
+//! POSIX Reference: Section 2.6.3 - Command Substitution
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const posix = std.posix;
+const fs = std.fs;
+
+const parser = @import("parser.zig");
+const state = @import("state.zig");
+
+const CompoundList = parser.CompoundList;
+const ShellState = state.ShellState;
+const ExitStatus = state.ExitStatus;
+const printError = state.printError;
+
+/// Configuration for child process execution.
+/// Used for pipe wiring and execution mode flags.
+pub const ExecConfig = struct {
+    /// fd to wire to stdin (null = inherit).
+    stdin_fd: ?posix.fd_t = null,
+    /// fd to wire to stdout (null = inherit).
+    stdout_fd: ?posix.fd_t = null,
+    /// Additional fds to close before exec.
+    /// TODO: Used for here-docs and process substitution where children need
+    /// to close fds they shouldn't inherit (e.g., write ends of here-doc pipes).
+    close_fds: []const posix.fd_t = &.{},
+
+    /// Apply pipe fd wiring. Call at start of child process.
+    pub fn applyPipes(self: ExecConfig) void {
+        if (self.stdin_fd) |fd| {
+            posix.dup2(fd, posix.STDIN_FILENO) catch posix.exit(ExitStatus.GENERAL_ERROR);
+            posix.close(fd);
+        }
+        if (self.stdout_fd) |fd| {
+            posix.dup2(fd, posix.STDOUT_FILENO) catch posix.exit(ExitStatus.GENERAL_ERROR);
+            posix.close(fd);
+        }
+        for (self.close_fds) |fd| {
+            posix.close(fd);
+        }
+    }
+};
+
+/// Convert wait status to ExitStatus.
+pub fn statusFromWaitResult(status: u32) ExitStatus {
+    if (posix.W.IFEXITED(status)) {
+        return .{ .exited = posix.W.EXITSTATUS(status) };
+    } else if (posix.W.IFSIGNALED(status)) {
+        return .{ .signaled = posix.W.TERMSIG(status) };
+    } else {
+        // Stopped or other - treat as exit 1
+        return .{ .exited = 1 };
+    }
+}
+
+/// Errors that can occur during subshell execution.
+pub const SubshellError = error{
+    /// fork() system call failed.
+    ForkFailed,
+    /// pipe() system call failed.
+    PipeFailed,
+    /// Failed to read from pipe.
+    ReadFailed,
+} || Allocator.Error;
+
+/// Execute commands in a subshell and capture stdout.
+///
+/// This function:
+/// 1. Creates a pipe for capturing output
+/// 2. Forks a child process
+/// 3. Executes the commands in the child with stdout redirected to the pipe
+/// 4. Reads all output from the pipe in the parent
+/// 5. Strips trailing newlines per POSIX 2.6.3
+/// 6. Updates shell_state.last_status with the command's exit status
+///
+/// POSIX Reference: Section 2.6.3 - Command Substitution
+/// "The shell shall expand the command substitution by executing command
+/// in a subshell environment and replacing the command substitution with
+/// the standard output of the command, with any trailing <newline>
+/// characters deleted."
+///
+/// Returns the captured output (allocated using the provided allocator).
+pub fn captureOutput(
+    allocator: Allocator,
+    commands: CompoundList,
+    shell_state: *ShellState,
+) SubshellError![]const u8 {
+    // We need to import executor for executing the commands
+    // This is declared locally to avoid circular dependencies at the module level
+    const executor = @import("executor.zig");
+
+    // Create pipe for capturing stdout
+    const pipe_fds = posix.pipe() catch {
+        printError("pipe failed for command substitution\n", .{});
+        return error.PipeFailed;
+    };
+    const read_fd = pipe_fds[0];
+    const write_fd = pipe_fds[1];
+
+    // Fork child process
+    const pid = posix.fork() catch {
+        posix.close(read_fd);
+        posix.close(write_fd);
+        printError("fork failed for command substitution\n", .{});
+        return error.ForkFailed;
+    };
+
+    if (pid == 0) {
+        // Child process: execute commands with stdout redirected to pipe
+
+        // Close read end - we only write
+        posix.close(read_fd);
+
+        // Redirect stdout to write end of pipe
+        posix.dup2(write_fd, posix.STDOUT_FILENO) catch posix.exit(ExitStatus.GENERAL_ERROR);
+        posix.close(write_fd);
+
+        // Execute the commands
+        // Create a new executor for the child process
+        var exec = executor.Executor.init(allocator, shell_state);
+        const status = exec.executeCompoundList(commands) catch |err| {
+            // Handle execution errors
+            switch (err) {
+                error.ExitRequested => posix.exit(shell_state.exit_code),
+                error.BreakRequested, error.ContinueRequested => {
+                    // break/continue in command substitution - treat as error
+                    printError("break/continue not valid in command substitution\n", .{});
+                    posix.exit(ExitStatus.GENERAL_ERROR);
+                },
+                else => posix.exit(ExitStatus.GENERAL_ERROR),
+            }
+        };
+
+        // Exit with the command's exit status
+        posix.exit(status.toExitCode());
+    }
+
+    // Parent process: read output from pipe
+
+    // Close write end - we only read
+    posix.close(write_fd);
+
+    // Read all data from pipe using std.fs.File
+    const file = fs.File{ .handle = read_fd };
+
+    const output = file.readToEndAlloc(allocator, std.math.maxInt(usize)) catch |err| {
+        posix.close(read_fd);
+        _ = posix.waitpid(pid, 0);
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.ReadFailed,
+        };
+    };
+    errdefer allocator.free(output);
+
+    posix.close(read_fd);
+
+    // Wait for child and update last_status
+    const wait_result = posix.waitpid(pid, 0);
+    shell_state.last_status = statusFromWaitResult(wait_result.status);
+
+    // Strip trailing newlines per POSIX 2.6.3
+    var trimmed = output;
+    while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '\n') {
+        trimmed = trimmed[0 .. trimmed.len - 1];
+    }
+
+    // Return trimmed output
+    // We need to dupe if we trimmed, otherwise just return the slice
+    if (trimmed.len < output.len) {
+        const result_str = try allocator.dupe(u8, trimmed);
+        allocator.free(output);
+        return result_str;
+    } else {
+        return output;
+    }
+}

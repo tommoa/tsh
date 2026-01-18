@@ -16,6 +16,7 @@ const lexer = @import("lexer.zig");
 const state = @import("state.zig");
 const builtins = @import("builtins.zig");
 const expand = @import("expand.zig");
+const subshell = @import("subshell.zig");
 const SimpleCommand = parser.SimpleCommand;
 const ParsedCommand = parser.ParsedCommand;
 const Command = parser.Command;
@@ -172,32 +173,8 @@ const SavedFds = struct {
 };
 
 /// Configuration for child process execution.
-/// Used for pipe wiring and execution mode flags.
-const ExecConfig = struct {
-    /// fd to wire to stdin (null = inherit).
-    stdin_fd: ?posix.fd_t = null,
-    /// fd to wire to stdout (null = inherit).
-    stdout_fd: ?posix.fd_t = null,
-    /// Additional fds to close before exec.
-    /// TODO: Used for here-docs and process substitution where children need
-    /// to close fds they shouldn't inherit (e.g., write ends of here-doc pipes).
-    close_fds: []const posix.fd_t = &.{},
-
-    /// Apply pipe fd wiring. Call at start of child process.
-    fn applyPipes(self: ExecConfig) void {
-        if (self.stdin_fd) |fd| {
-            posix.dup2(fd, posix.STDIN_FILENO) catch posix.exit(ExitStatus.GENERAL_ERROR);
-            posix.close(fd);
-        }
-        if (self.stdout_fd) |fd| {
-            posix.dup2(fd, posix.STDOUT_FILENO) catch posix.exit(ExitStatus.GENERAL_ERROR);
-            posix.close(fd);
-        }
-        for (self.close_fds) |fd| {
-            posix.close(fd);
-        }
-    }
-};
+/// Re-exported from subshell module for convenience.
+const ExecConfig = subshell.ExecConfig;
 
 /// Result of searching for an executable command.
 ///
@@ -613,7 +590,7 @@ pub const Executor = struct {
     /// Reference: POSIX.1-2017 Section 2.9.3 Lists
     /// The exit status of a compound-list is the exit status of the last
     /// AND/OR list that was executed.
-    fn executeCompoundList(self: *Executor, list: CompoundList) ExecuteError!ExitStatus {
+    pub fn executeCompoundList(self: *Executor, list: CompoundList) ExecuteError!ExitStatus {
         var status: ExitStatus = .{ .exited = 0 };
         for (list.commands) |and_or| {
             status = try self.executeAndOrList(and_or);
@@ -1108,16 +1085,8 @@ fn applyRedirections(allocator: Allocator, redirections: []const ParsedRedirecti
 }
 
 /// Convert wait status to ExitStatus.
-fn statusFromWaitResult(status: u32) ExitStatus {
-    if (posix.W.IFEXITED(status)) {
-        return .{ .exited = posix.W.EXITSTATUS(status) };
-    } else if (posix.W.IFSIGNALED(status)) {
-        return .{ .signaled = posix.W.TERMSIG(status) };
-    } else {
-        // Stopped or other - treat as exit 1
-        return .{ .exited = 1 };
-    }
-}
+/// Re-exported from subshell module for convenience.
+const statusFromWaitResult = subshell.statusFromWaitResult;
 
 // --- Tests ---
 

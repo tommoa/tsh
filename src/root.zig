@@ -9,6 +9,7 @@ pub const state = @import("state.zig");
 pub const builtins = @import("builtins.zig");
 pub const options = @import("options.zig");
 pub const repl = @import("repl.zig");
+pub const subshell = @import("subshell.zig");
 
 // Re-export commonly used types at the top level for convenience
 pub const Lexer = lexer.Lexer;
