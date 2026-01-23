@@ -4,6 +4,7 @@
 
 pub const lexer = @import("lexer.zig");
 pub const parser = @import("parser.zig");
+pub const child = @import("child.zig");
 pub const executor = @import("executor.zig");
 pub const state = @import("state.zig");
 pub const builtins = @import("builtins.zig");

@@ -86,6 +86,7 @@ const Allocator = std.mem.Allocator;
 
 const parser = @import("parser.zig");
 const pattern = @import("pattern.zig");
+const child = @import("child.zig");
 const state = @import("state.zig");
 const subshell = @import("subshell.zig");
 
@@ -122,7 +123,7 @@ pub const ExpansionError = error{
     /// parameters ($@, $*, $#, $?, etc.).
     /// The error message has already been printed to stderr.
     ParameterAssignmentInvalid,
-} || Allocator.Error || subshell.SubshellError;
+} || Allocator.Error || child.SubshellError;
 
 // ============================================================================
 // Public API

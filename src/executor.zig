@@ -13,10 +13,10 @@ const process = std.process;
 
 const parser = @import("parser.zig");
 const lexer = @import("lexer.zig");
+const child = @import("child.zig");
 const state = @import("state.zig");
 const builtins = @import("builtins.zig");
 const expand = @import("expand.zig");
-const subshell = @import("subshell.zig");
 const SimpleCommand = parser.SimpleCommand;
 const ParsedCommand = parser.ParsedCommand;
 const Command = parser.Command;
@@ -173,8 +173,8 @@ const SavedFds = struct {
 };
 
 /// Configuration for child process execution.
-/// Re-exported from subshell module for convenience.
-const ExecConfig = subshell.ExecConfig;
+/// Re-exported from child module for convenience.
+const ExecConfig = child.ExecConfig;
 
 /// Result of searching for an executable command.
 ///
@@ -1085,8 +1085,8 @@ fn applyRedirections(allocator: Allocator, redirections: []const ParsedRedirecti
 }
 
 /// Convert wait status to ExitStatus.
-/// Re-exported from subshell module for convenience.
-const statusFromWaitResult = subshell.statusFromWaitResult;
+/// Re-exported from child module for convenience.
+const statusFromWaitResult = child.statusFromWaitResult;
 
 // --- Tests ---
 
