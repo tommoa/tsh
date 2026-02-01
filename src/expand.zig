@@ -949,14 +949,9 @@ fn evaluateParameterExpansion(
 /// multiple fields based on IFS characters. `.quoted` and `.positional` parts
 /// pass through unchanged.
 ///
-/// The `ifs` parameter specifies the Internal Field Separator. If null, uses
-/// the default IFS (space, tab, newline). Custom IFS values are not yet
-/// fully supported (future enhancement).
-///
-/// Default IFS rules:
-/// - Trim leading/trailing whitespace (space/tab/newline)
-/// - Any sequence of whitespace delimits fields
-/// - Empty fields after trimming are discarded
+/// The `ifs` parameter specifies the Internal Field Separator. If null or
+/// unset, uses the default IFS (space, tab, newline). If empty string, no
+/// field splitting is performed. Custom IFS values follow POSIX rules.
 ///
 /// POSIX Reference: Section 2.6.5 - Field Splitting
 pub fn splitFields(
@@ -965,8 +960,8 @@ pub fn splitFields(
     ifs: ?[]const u8,
 ) Allocator.Error![]ExpandedPart {
     // Use provided IFS or default (space, tab, newline)
-    // TODO: Handle custom IFS values (non-default)
     const effective_ifs = ifs orelse " \t\n";
+    const is_empty_ifs = effective_ifs.len == 0;
 
     // Collect results in a dynamic array
     var result: std.ArrayListUnmanaged(ExpandedPart) = .empty;
@@ -979,53 +974,13 @@ pub fn splitFields(
                 try result.append(allocator, part);
             },
             .normal => {
-                // Split .normal parts on default IFS
-                const content = part.content;
-                if (content.len == 0) {
-                    // Empty content - skip (no field created)
-                    continue;
-                }
-
-                // Find the first non-whitespace character
-                var start: usize = 0;
-                while (start < content.len and std.mem.indexOfScalar(u8, effective_ifs, content[start]) != null) {
-                    start += 1;
-                }
-
-                // If entire string is whitespace, skip (no fields)
-                if (start >= content.len) {
-                    continue;
-                }
-
-                // Find the last non-whitespace character
-                var end: usize = content.len;
-                while (end > start and std.mem.indexOfScalar(u8, effective_ifs, content[end - 1]) != null) {
-                    end -= 1;
-                }
-
-                // Now split the trimmed content on whitespace runs
-                var i: usize = start;
-                while (i < end) {
-                    // Find start of next field (skip whitespace)
-                    while (i < end and std.mem.indexOfScalar(u8, effective_ifs, content[i]) != null) {
-                        i += 1;
-                    }
-
-                    if (i >= end) break;
-
-                    // Find end of this field
-                    const field_start = i;
-                    while (i < end and std.mem.indexOfScalar(u8, effective_ifs, content[i]) == null) {
-                        i += 1;
-                    }
-                    const field_end = i;
-
-                    // Create a new .normal part for this field
-                    const field_content = content[field_start..field_end];
-                    try result.append(allocator, .{
-                        .content = field_content,
-                        .kind = .normal,
-                    });
+                if (is_empty_ifs) {
+                    // Empty IFS: no field splitting at all
+                    try result.append(allocator, part);
+                } else {
+                    // Use splitFieldsCustom for all non-empty IFS
+                    // This handles default, whitespace-only, and custom IFS correctly
+                    try splitFieldsCustom(allocator, part, effective_ifs, &result);
                 }
             },
         }
@@ -1033,6 +988,116 @@ pub fn splitFields(
 
     // Convert ArrayList to owned slice
     return result.toOwnedSlice(allocator);
+}
+
+/// Split fields using custom IFS rules (POSIX 2.6.5).
+///
+/// For custom IFS:
+/// - "IFS white space" (space/tab/newline in IFS) is trimmed from ends
+/// - Non-whitespace IFS chars act as delimiters
+/// - Adjacent delimiters can create empty fields
+fn splitFieldsCustom(
+    allocator: Allocator,
+    part: ExpandedPart,
+    ifs: []const u8,
+    result: *std.ArrayListUnmanaged(ExpandedPart),
+) Allocator.Error!void {
+    const content = part.content;
+    if (content.len == 0) {
+        return;
+    }
+
+    // Identify IFS white space chars (space/tab/newline that are in IFS)
+    const whitespace_chars = " \t\n";
+
+    // Helper: check if a byte is IFS whitespace
+    const isIfsWhitespace = struct {
+        fn call(c: u8, ifs_arg: []const u8) bool {
+            return std.mem.indexOfScalar(u8, whitespace_chars, c) != null and
+                std.mem.indexOfScalar(u8, ifs_arg, c) != null;
+        }
+    }.call;
+
+    // Helper: check if a byte is non-whitespace IFS
+    const isIfsNonWhitespace = struct {
+        fn call(c: u8, ifs_arg: []const u8) bool {
+            return std.mem.indexOfScalar(u8, whitespace_chars, c) == null and
+                std.mem.indexOfScalar(u8, ifs_arg, c) != null;
+        }
+    }.call;
+
+    // Skip leading IFS whitespace
+    var start: usize = 0;
+    while (start < content.len and isIfsWhitespace(content[start], ifs)) {
+        start += 1;
+    }
+
+    // Skip trailing IFS whitespace
+    var end: usize = content.len;
+    while (end > start and isIfsWhitespace(content[end - 1], ifs)) {
+        end -= 1;
+    }
+
+    // If entire string is IFS whitespace, skip
+    if (start >= end) {
+        return;
+    }
+
+    // Now process the content
+    var i: usize = start;
+    var field_start: usize = start;
+    var in_field = true;
+
+    while (i < end) {
+        const c = content[i];
+
+        if (isIfsNonWhitespace(c, ifs)) {
+            // Non-whitespace IFS char: always delimits a field
+            if (in_field) {
+                // End current field
+                try result.append(allocator, .{
+                    .content = content[field_start..i],
+                    .kind = .normal,
+                });
+            } else {
+                // Consecutive delimiter - create empty field
+                try result.append(allocator, .{
+                    .content = "",
+                    .kind = .normal,
+                });
+            }
+            // Skip the delimiter and any following IFS whitespace
+            i += 1;
+            while (i < end and isIfsWhitespace(content[i], ifs)) {
+                i += 1;
+            }
+            field_start = i;
+            in_field = true;
+        } else if (isIfsWhitespace(c, ifs)) {
+            // IFS whitespace after non-IFS chars: delimits field
+            if (in_field) {
+                try result.append(allocator, .{
+                    .content = content[field_start..i],
+                    .kind = .normal,
+                });
+                in_field = false;
+            }
+            i += 1;
+            field_start = i;
+        } else {
+            // Non-IFS char: part of current field
+            in_field = true;
+            i += 1;
+        }
+    }
+
+    // Handle final field (note: trailing delimiters don't create empty fields)
+    if (field_start < end) {
+        try result.append(allocator, .{
+            .content = content[field_start..end],
+            .kind = .normal,
+        });
+    }
 }
 
 // ============================================================================
@@ -4415,4 +4480,168 @@ test "splitFields: multiple parts with mixed kinds" {
     try std.testing.expectEqual(ExpandedPart.Kind.quoted, result[2].kind);
     try std.testing.expectEqual(ExpandedPart.Kind.normal, result[3].kind);
     try std.testing.expectEqual(ExpandedPart.Kind.normal, result[4].kind);
+}
+
+test "splitFields: empty IFS means no splitting" {
+    const allocator = std.testing.allocator;
+
+    const parts = &[_]ExpandedPart{
+        .{ .content = "hello world", .kind = .normal },
+    };
+
+    // Empty string IFS - no splitting should occur
+    const result = try splitFields(allocator, parts, "");
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("hello world", result[0].content);
+}
+
+test "splitFields: custom IFS with comma delimiter" {
+    const allocator = std.testing.allocator;
+
+    const parts = &[_]ExpandedPart{
+        .{ .content = "a,b,c", .kind = .normal },
+    };
+
+    const result = try splitFields(allocator, parts, ",");
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqualStrings("a", result[0].content);
+    try std.testing.expectEqualStrings("b", result[1].content);
+    try std.testing.expectEqualStrings("c", result[2].content);
+}
+
+test "splitFields: custom IFS with colon delimiter" {
+    const allocator = std.testing.allocator;
+
+    const parts = &[_]ExpandedPart{
+        .{ .content = "a:b:c", .kind = .normal },
+    };
+
+    const result = try splitFields(allocator, parts, ":");
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqualStrings("a", result[0].content);
+    try std.testing.expectEqualStrings("b", result[1].content);
+    try std.testing.expectEqualStrings("c", result[2].content);
+}
+
+test "splitFields: custom IFS with multiple delimiters" {
+    const allocator = std.testing.allocator;
+
+    const parts = &[_]ExpandedPart{
+        .{ .content = "a,b:c", .kind = .normal },
+    };
+
+    const result = try splitFields(allocator, parts, ",");
+    defer allocator.free(result);
+
+    // Only comma is delimiter, colon is part of field
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("a", result[0].content);
+    try std.testing.expectEqualStrings("b:c", result[1].content);
+}
+
+test "splitFields: custom IFS creates empty fields for consecutive delimiters" {
+    const allocator = std.testing.allocator;
+
+    const parts = &[_]ExpandedPart{
+        .{ .content = "a,,b", .kind = .normal },
+    };
+
+    const result = try splitFields(allocator, parts, ",");
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqualStrings("a", result[0].content);
+    try std.testing.expectEqualStrings("", result[1].content);
+    try std.testing.expectEqualStrings("b", result[2].content);
+}
+
+test "splitFields: custom IFS handles leading and trailing delimiters" {
+    const allocator = std.testing.allocator;
+
+    const parts = &[_]ExpandedPart{
+        .{ .content = ",a,b,", .kind = .normal },
+    };
+
+    const result = try splitFields(allocator, parts, ",");
+    defer allocator.free(result);
+
+    // Leading delimiter creates empty field, trailing does not
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqualStrings("", result[0].content);
+    try std.testing.expectEqualStrings("a", result[1].content);
+    try std.testing.expectEqualStrings("b", result[2].content);
+}
+
+test "splitFields: custom IFS with mixed delimiters and whitespace" {
+    const allocator = std.testing.allocator;
+
+    const parts = &[_]ExpandedPart{
+        .{ .content = "a, b,c", .kind = .normal },
+    };
+
+    // IFS with comma and space
+    const result = try splitFields(allocator, parts, ", ");
+    defer allocator.free(result);
+
+    // Space is IFS whitespace, so it's trimmed/handled specially
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqualStrings("a", result[0].content);
+    try std.testing.expectEqualStrings("b", result[1].content);
+    try std.testing.expectEqualStrings("c", result[2].content);
+}
+
+test "splitFields: custom IFS with all-delimiter content" {
+    const allocator = std.testing.allocator;
+
+    const parts = &[_]ExpandedPart{
+        .{ .content = ",,,", .kind = .normal },
+    };
+
+    const result = try splitFields(allocator, parts, ",");
+    defer allocator.free(result);
+
+    // Should produce 3 empty fields (trailing delimiter doesn't create field)
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqualStrings("", result[0].content);
+    try std.testing.expectEqualStrings("", result[1].content);
+    try std.testing.expectEqualStrings("", result[2].content);
+}
+
+test "splitFields: whitespace-only IFS behaves like default" {
+    const allocator = std.testing.allocator;
+
+    const parts = &[_]ExpandedPart{
+        .{ .content = "  a  b  ", .kind = .normal },
+    };
+
+    // IFS with only space should behave like default (no empty fields)
+    const result = try splitFields(allocator, parts, " ");
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("a", result[0].content);
+    try std.testing.expectEqualStrings("b", result[1].content);
+}
+
+test "splitFields: mixed IFS with comma and space" {
+    const allocator = std.testing.allocator;
+
+    // IFS=", " should treat both as delimiters
+    const parts = &[_]ExpandedPart{
+        .{ .content = "a, b,c", .kind = .normal },
+    };
+
+    const result = try splitFields(allocator, parts, ", ");
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqualStrings("a", result[0].content);
+    try std.testing.expectEqualStrings("b", result[1].content);
+    try std.testing.expectEqualStrings("c", result[2].content);
 }
