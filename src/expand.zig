@@ -11,9 +11,9 @@
 //!
 //! 1. **Tilde Expansion** (2.6.1) - `~` and `~/path` expand to $HOME
 //! 2. **Parameter Expansion** (2.6.2) - `$VAR`, `${VAR}`, `${VAR:-default}`, etc.
-//! 3. **Command Substitution** (2.6.3) - `$(cmd)` (implemented), `` `cmd` `` (not yet implemented)
+//! 3. **Command Substitution** (2.6.3) - `$(cmd)`, `` `cmd` `` (not yet implemented)
 //! 4. **Arithmetic Expansion** (2.6.4) - `$((expr))` (not yet implemented)
-//! 5. **Field Splitting** (2.6.5) - Split on IFS (partially implemented - default IFS only)
+//! 5. **Field Splitting** (2.6.5) - Split on IFS
 //! 6. **Pathname Expansion** (2.6.6) - Glob patterns `*`, `?`, `[...]` (not yet implemented)
 //! 7. **Quote Removal** (2.6.7) - Remove quotes that aren't part of expansions
 //!
@@ -66,7 +66,7 @@
 //!
 //! | Kind         | Word Boundary | Field Splitting | Source                      |
 //! |--------------|---------------|-----------------|-----------------------------|
-//! | `.normal`    | No            | Yes (future)    | Unquoted `$VAR`             |
+//! | `.normal`    | No            | Yes             | Unquoted `$VAR`             |
 //! | `.positional`| Conditional*  | No              | `$@` expansion              |
 //! | `.quoted`    | No            | No              | `"$VAR"`, literals in `"…"` |
 //!
@@ -171,7 +171,7 @@ pub fn expandWordJoined(allocator: Allocator, word: Word, shell: *ShellState) Ex
 /// Each part has a `kind` that determines word boundary behavior and future
 /// field splitting:
 ///
-/// - `.normal`: Unquoted content, subject to field splitting (when implemented)
+/// - `.normal`: Unquoted content, subject to field splitting.
 /// - `.positional`: From `$@` expansion, creates word boundaries between
 ///   consecutive positional parts. Not subject to field splitting.
 /// - `.quoted`: From quoted context, not subject to field splitting.
@@ -191,7 +191,7 @@ const ExpandedPart = struct {
     kind: Kind,
 
     const Kind = enum {
-        /// Regular unquoted content. Subject to field splitting (when implemented).
+        /// Regular unquoted content. Subject to field splitting.
         normal,
 
         /// From $@ expansion. Creates word boundary before this part if previous
@@ -247,15 +247,38 @@ pub const WordBuilder = struct {
         self.last_was_positional = false;
     }
 
-    /// Append expanded parts, handling word boundaries from $@ expansion.
+    /// Append expanded parts, handling word boundaries from $@ expansion
+    /// and field splitting for .normal parts.
     /// Returns true if any content was added.
-    pub fn appendParts(self: *WordBuilder, parts: []const ExpandedPart) Allocator.Error!bool {
+    pub fn appendParts(self: *WordBuilder, parts: []const ExpandedPart, ifs: ?[]const u8) Allocator.Error!bool {
         for (parts) |p| {
-            if (p.kind == .positional and self.last_was_positional) {
-                try self.startWord();
+            switch (p.kind) {
+                .quoted => {
+                    try self.append(p.content);
+                    self.last_was_positional = false;
+                },
+                .positional => {
+                    if (self.last_was_positional) {
+                        try self.startWord();
+                    }
+                    try self.append(p.content);
+                    self.last_was_positional = true;
+                },
+                .normal => {
+                    // Apply field splitting using provided IFS or default IFS if unset
+                    const effective_ifs = ifs orelse " \t\n";
+                    const split_parts = try splitFields(self.allocator, &[_]ExpandedPart{p}, effective_ifs);
+                    defer self.allocator.free(split_parts);
+                    // Each split field becomes a separate word
+                    for (split_parts, 0..) |field, i| {
+                        if (i > 0) {
+                            try self.startWord();
+                        }
+                        try self.append(field.content);
+                    }
+                    self.last_was_positional = false;
+                },
             }
-            try self.append(p.content);
-            self.last_was_positional = (p.kind == .positional);
         }
         return parts.len > 0;
     }
@@ -1151,19 +1174,25 @@ fn expandWord(
             },
             .parameter => |param| {
                 // Parameter expansion (POSIX 2.6.2) - unquoted context
-                // TODO: Apply field splitting to the result
+                // Field splitting is applied by appendParts when IFS is provided
                 const param_parts = try evaluateParameterExpansion(builder.allocator, shell, param, false);
-                if (try builder.appendParts(param_parts)) {
+                if (try builder.appendParts(param_parts, shell.ifs)) {
                     content_added = true;
                 }
             },
             .command_sub => |cs| {
-                // Command substitution (POSIX 2.6.3)
+                // Command substitution (POSIX 2.6.3) - unquoted context
+                // Field splitting is applied by appendParts when IFS is provided
                 const output = try subshell.captureOutput(builder.allocator, cs.commands, shell);
-                // TODO: In unquoted context, output is subject to field splitting
                 if (output.len > 0) {
-                    try builder.append(output);
-                    content_added = true;
+                    // Create a normal part - appendParts handles field splitting
+                    const temp_part = ExpandedPart{
+                        .content = output,
+                        .kind = .normal,
+                    };
+                    if (try builder.appendParts(&[_]ExpandedPart{temp_part}, shell.ifs)) {
+                        content_added = true;
+                    }
                 }
             },
         }
@@ -1200,14 +1229,13 @@ fn expandInnerParts(
             .parameter => |param| {
                 // Parameter expansion in quoted context
                 const param_parts = try evaluateParameterExpansion(builder.allocator, shell, param, true);
-                if (try builder.appendParts(param_parts)) {
+                if (try builder.appendParts(param_parts, null)) {
                     content_added = true;
                 }
             },
             .command_sub => |cs| {
-                // Command substitution (POSIX 2.6.3)
+                // Command substitution (POSIX 2.6.3) - quoted context, no field splitting
                 const output = try subshell.captureOutput(builder.allocator, cs.commands, shell);
-                // In quoted context, result is a single field (no field splitting)
                 if (output.len > 0) {
                     try builder.append(output);
                     content_added = true;
@@ -1890,7 +1918,7 @@ test "WordBuilder: appendParts handles positional kind" {
         .{ .content = "a", .kind = .positional },
         .{ .content = "b", .kind = .positional },
     };
-    _ = try builder.appendParts(&parts);
+    _ = try builder.appendParts(&parts, null);
     try std.testing.expectEqual(@as(usize, 2), builder.wordCount());
 }
 
@@ -4228,7 +4256,8 @@ test "command substitution: interior newlines preserved" {
     var shell = try ShellState.initWithEnv(arena.allocator(), &env);
 
     const result = try expandCommandString(arena.allocator(), "$(printf 'a\\nb')", &shell);
-    try std.testing.expectEqualStrings("a\nb", result);
+    // With field splitting, newline becomes delimiter, so result is "a b" (two words joined by space)
+    try std.testing.expectEqualStrings("a b", result);
 }
 
 test "command substitution: empty output" {
