@@ -592,11 +592,28 @@ fn getSpecialParameter(
                         return try allocator.alloc(ExpandedPart, 0);
                     }
                 }
-                // TODO: use first char of IFS instead of space
-                const joined = try std.mem.join(allocator, " ", params);
-                const result = try allocator.alloc(ExpandedPart, 1);
-                result[0] = .{ .content = joined, .kind = kind };
-                return result;
+                if (quoted) {
+                    // POSIX 2.5.2: "$*" joins with first character of IFS into single field
+                    const ifs_first = if (shell.ifs) |ifs| (if (ifs.len > 0) ifs[0..1] else "") else " ";
+                    const joined = try std.mem.join(allocator, ifs_first, params);
+                    const result = try allocator.alloc(ExpandedPart, 1);
+                    result[0] = .{ .content = joined, .kind = .quoted };
+                    return result;
+                } else {
+                    // Unquoted $*: join with IFS[0], then split and create positional parts
+                    const ifs_first = if (shell.ifs) |ifs| (if (ifs.len > 0) ifs[0..1] else "") else " ";
+                    const joined = try std.mem.join(allocator, ifs_first, params);
+                    // Split the joined result on IFS to create separate fields
+                    const temp_part = ExpandedPart{ .content = joined, .kind = .normal };
+                    const split_parts = try splitFields(allocator, &[_]ExpandedPart{temp_part}, shell.ifs);
+                    defer allocator.free(split_parts);
+                    // Convert to positional parts to create word boundaries
+                    const result = try allocator.alloc(ExpandedPart, split_parts.len);
+                    for (split_parts, 0..) |part, i| {
+                        result[i] = .{ .content = part.content, .kind = .positional };
+                    }
+                    return result;
+                }
             },
             '$' => {
                 // $$ - PID of shell (cached at startup)
@@ -3773,6 +3790,123 @@ test "modifier: ${#*} returns positional parameter count" {
 
     const result = try expandWordJoined(arena.allocator(), word, &shell);
     try std.testing.expectEqualStrings("5", result);
+}
+
+test "quoted $* joins with IFS[0]" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b", "c" });
+    try shell.setEnv("IFS", ",");
+
+    // "$*" joins with first char of IFS (comma), no field splitting in quoted context
+    const result = try expandCommandString(arena.allocator(), "\"$*\"", &shell);
+    try std.testing.expectEqualStrings("a,b,c", result);
+}
+
+test "unquoted $* produces separate words like $@" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b", "c" });
+    try shell.setEnv("IFS", ",");
+
+    // Unquoted $* produces separate words (same as $@)
+    const result = try expandCommandString(arena.allocator(), "$*", &shell);
+    try std.testing.expectEqualStrings("a b c", result);
+}
+
+test "unquoted $* with prefix and suffix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b", "c" });
+    try shell.setEnv("IFS", ",");
+
+    // prefix$*suffix with IFS="," produces: [prefixa] [b] [csuffix]
+    // Unquoted $* creates word boundaries like $@
+    const result = try expandCommandString(arena.allocator(), "prefix$*suffix", &shell);
+    try std.testing.expectEqualStrings("prefixa b csuffix", result);
+}
+
+test "quoted $* with prefix and suffix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b", "c" });
+    try shell.setEnv("IFS", ",");
+
+    // prefix"$*"suffix with IFS="," produces single word: [prefixa,b,csuffix]
+    const result = try expandCommandString(arena.allocator(), "prefix\"$*\"suffix", &shell);
+    try std.testing.expectEqualStrings("prefixa,b,csuffix", result);
+}
+
+test "quoted $* when argument contains IFS char" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a,c", "b", "c" });
+    try shell.setEnv("IFS", ",");
+
+    // "$*" joins with comma, arg containing comma is preserved as data
+    const result = try expandCommandString(arena.allocator(), "\"$*\"", &shell);
+    try std.testing.expectEqualStrings("a,c,b,c", result);
+}
+
+test "unquoted $* when argument contains IFS char" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a,c", "b", "c" });
+    try shell.setEnv("IFS", ",");
+
+    // $* produces separate words, comma in arg acts as delimiter
+    // Result: a, c, b, c (4 separate words)
+    const result = try expandCommandString(arena.allocator(), "$*", &shell);
+    try std.testing.expectEqualStrings("a c b c", result);
+}
+
+test "$* with multiple IFS characters uses first for joining" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b", "c" });
+    try shell.setEnv("IFS", ",:");
+
+    // "$*" uses first char (,) for joining
+    const result_quoted = try expandCommandString(arena.allocator(), "\"$*\"", &shell);
+    try std.testing.expectEqualStrings("a,b,c", result_quoted);
+
+    // $* splits on all IFS chars (, and :)
+    const result_unquoted = try expandCommandString(arena.allocator(), "$*", &shell);
+    try std.testing.expectEqualStrings("a b c", result_unquoted);
+}
+
+test "quoted $* with default IFS joins with space" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var env = process.EnvMap.init(arena.allocator());
+    var shell = try ShellState.initWithEnv(arena.allocator(), &env);
+    try shell.setPositionalParams(&[_][]const u8{ "a", "b", "c" });
+    // IFS not set, uses default (space)
+
+    const result = try expandCommandString(arena.allocator(), "\"$*\"", &shell);
+    try std.testing.expectEqualStrings("a b c", result);
 }
 
 test "modifier: ${1:-default} with no positional params returns default" {
