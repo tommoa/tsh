@@ -164,6 +164,12 @@ pub const ShellState = struct {
     /// TODO: Expand variables in PS1 before displaying.
     ps1: []const u8,
 
+    /// IFS (Internal Field Separator) for word splitting.
+    /// Cached from the IFS environment variable. Null means use default IFS
+    /// (space, tab, newline) per POSIX 2.6.5.
+    /// Updated when IFS is set or unset via setEnv() or setVariable().
+    ifs: ?[]const u8,
+
     /// Shell options (interactive mode, etc.).
     options: ShellOptions,
 
@@ -219,6 +225,7 @@ pub const ShellState = struct {
             .oldcwd = null,
             .home = env.get("HOME"),
             .ps1 = env.get("PS1") orelse DEFAULT_PS1,
+            .ifs = env.get("IFS"),
             .options = .{},
             .pid = std.c.getpid(),
         };
@@ -278,6 +285,8 @@ pub const ShellState = struct {
             self.home = self.env.get("HOME");
         } else if (std.mem.eql(u8, key, "PS1")) {
             self.ps1 = self.env.get("PS1") orelse DEFAULT_PS1;
+        } else if (std.mem.eql(u8, key, "IFS")) {
+            self.ifs = self.env.get("IFS");
         }
     }
 
@@ -317,6 +326,8 @@ pub const ShellState = struct {
                 self.home = self.env.get("HOME");
             } else if (std.mem.eql(u8, name, "PS1")) {
                 self.ps1 = self.env.get("PS1") orelse DEFAULT_PS1;
+            } else if (std.mem.eql(u8, name, "IFS")) {
+                self.ifs = self.env.get("IFS");
             }
         } else {
             // For shell variables, we need to dupe the value ourselves
@@ -333,6 +344,10 @@ pub const ShellState = struct {
                 const duped_name = try self.allocator.dupe(u8, name);
                 errdefer self.allocator.free(duped_name);
                 try self.variables.put(duped_name, duped_value);
+            }
+            // Update cached IFS when set as shell variable (non-exported)
+            if (std.mem.eql(u8, name, "IFS")) {
+                self.ifs = duped_value;
             }
         }
     }
@@ -597,4 +612,66 @@ test "ShellState: setVariable updates existing variable" {
     try state.setVariable("FOO", "second");
 
     try std.testing.expectEqualStrings("second", state.getVariable("FOO").?);
+}
+
+test "ShellState: IFS is cached from env at startup" {
+    var env = process.EnvMap.init(std.testing.allocator);
+    try env.put("IFS", ",:");
+
+    var state = try ShellState.initWithEnv(std.testing.allocator, &env);
+    defer state.deinit();
+
+    try std.testing.expectEqualStrings(",:", state.ifs.?);
+}
+
+test "ShellState: IFS is null when IFS not set" {
+    var env = process.EnvMap.init(std.testing.allocator);
+    var state = try ShellState.initWithEnv(std.testing.allocator, &env);
+    defer state.deinit();
+
+    try std.testing.expect(state.ifs == null);
+}
+
+test "ShellState: setEnv updates cached IFS" {
+    var env = process.EnvMap.init(std.testing.allocator);
+    var state = try ShellState.initWithEnv(std.testing.allocator, &env);
+    defer state.deinit();
+
+    try std.testing.expect(state.ifs == null);
+    try state.setEnv("IFS", ",");
+    try std.testing.expectEqualStrings(",", state.ifs.?);
+}
+
+test "ShellState: setEnv with null clears cached IFS" {
+    var env = process.EnvMap.init(std.testing.allocator);
+    try env.put("IFS", ",");
+
+    var state = try ShellState.initWithEnv(std.testing.allocator, &env);
+    defer state.deinit();
+
+    try std.testing.expect(state.ifs != null);
+    try state.setEnv("IFS", null);
+    try std.testing.expect(state.ifs == null);
+}
+
+test "ShellState: setVariable updates cached IFS when exported" {
+    var env = process.EnvMap.init(std.testing.allocator);
+    // Mark IFS as exported
+    try env.put("IFS", "old");
+
+    var state = try ShellState.initWithEnv(std.testing.allocator, &env);
+    defer state.deinit();
+
+    try state.setVariable("IFS", "new");
+    try std.testing.expectEqualStrings("new", state.ifs.?);
+}
+
+test "ShellState: setVariable updates cached IFS as shell variable" {
+    var env = process.EnvMap.init(std.testing.allocator);
+    var state = try ShellState.initWithEnv(std.testing.allocator, &env);
+    defer state.deinit();
+
+    try std.testing.expect(state.ifs == null);
+    try state.setVariable("IFS", ",");
+    try std.testing.expectEqualStrings(",", state.ifs.?);
 }

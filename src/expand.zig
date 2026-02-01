@@ -949,19 +949,24 @@ fn evaluateParameterExpansion(
 /// multiple fields based on IFS characters. `.quoted` and `.positional` parts
 /// pass through unchanged.
 ///
-/// Currently only handles default IFS (space, tab, newline).
-/// Rules:
-/// - Trim leading/trailing whitespace
-/// - Any sequence of space/tab/newline delimits fields
+/// The `ifs` parameter specifies the Internal Field Separator. If null, uses
+/// the default IFS (space, tab, newline). Custom IFS values are not yet
+/// fully supported (future enhancement).
+///
+/// Default IFS rules:
+/// - Trim leading/trailing whitespace (space/tab/newline)
+/// - Any sequence of whitespace delimits fields
 /// - Empty fields after trimming are discarded
 ///
 /// POSIX Reference: Section 2.6.5 - Field Splitting
 pub fn splitFields(
     allocator: Allocator,
     parts: []const ExpandedPart,
+    ifs: ?[]const u8,
 ) Allocator.Error![]ExpandedPart {
-    // Default IFS: space, tab, newline
-    const DEFAULT_IFS = " \t\n";
+    // Use provided IFS or default (space, tab, newline)
+    // TODO: Handle custom IFS values (non-default)
+    const effective_ifs = ifs orelse " \t\n";
 
     // Collect results in a dynamic array
     var result: std.ArrayListUnmanaged(ExpandedPart) = .empty;
@@ -983,7 +988,7 @@ pub fn splitFields(
 
                 // Find the first non-whitespace character
                 var start: usize = 0;
-                while (start < content.len and std.mem.indexOfScalar(u8, DEFAULT_IFS, content[start]) != null) {
+                while (start < content.len and std.mem.indexOfScalar(u8, effective_ifs, content[start]) != null) {
                     start += 1;
                 }
 
@@ -994,7 +999,7 @@ pub fn splitFields(
 
                 // Find the last non-whitespace character
                 var end: usize = content.len;
-                while (end > start and std.mem.indexOfScalar(u8, DEFAULT_IFS, content[end - 1]) != null) {
+                while (end > start and std.mem.indexOfScalar(u8, effective_ifs, content[end - 1]) != null) {
                     end -= 1;
                 }
 
@@ -1002,7 +1007,7 @@ pub fn splitFields(
                 var i: usize = start;
                 while (i < end) {
                     // Find start of next field (skip whitespace)
-                    while (i < end and std.mem.indexOfScalar(u8, DEFAULT_IFS, content[i]) != null) {
+                    while (i < end and std.mem.indexOfScalar(u8, effective_ifs, content[i]) != null) {
                         i += 1;
                     }
 
@@ -1010,7 +1015,7 @@ pub fn splitFields(
 
                     // Find end of this field
                     const field_start = i;
-                    while (i < end and std.mem.indexOfScalar(u8, DEFAULT_IFS, content[i]) == null) {
+                    while (i < end and std.mem.indexOfScalar(u8, effective_ifs, content[i]) == null) {
                         i += 1;
                     }
                     const field_end = i;
@@ -4253,7 +4258,7 @@ test "splitFields: basic splitting on space" {
         .{ .content = "hello world", .kind = .normal },
     };
 
-    const result = try splitFields(allocator, parts);
+    const result = try splitFields(allocator, parts, null);
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 2), result.len);
@@ -4270,7 +4275,7 @@ test "splitFields: multiple spaces collapse" {
         .{ .content = "a   b     c", .kind = .normal },
     };
 
-    const result = try splitFields(allocator, parts);
+    const result = try splitFields(allocator, parts, null);
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 3), result.len);
@@ -4286,7 +4291,7 @@ test "splitFields: trims leading and trailing whitespace" {
         .{ .content = "  hello world  ", .kind = .normal },
     };
 
-    const result = try splitFields(allocator, parts);
+    const result = try splitFields(allocator, parts, null);
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 2), result.len);
@@ -4303,7 +4308,7 @@ test "splitFields: handles tabs" {
         .{ .content = tab_content, .kind = .normal },
     };
 
-    const result = try splitFields(allocator, parts);
+    const result = try splitFields(allocator, parts, null);
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 2), result.len);
@@ -4320,7 +4325,7 @@ test "splitFields: handles newlines" {
         .{ .content = nl_content, .kind = .normal },
     };
 
-    const result = try splitFields(allocator, parts);
+    const result = try splitFields(allocator, parts, null);
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 2), result.len);
@@ -4335,7 +4340,7 @@ test "splitFields: empty content returns empty" {
         .{ .content = "", .kind = .normal },
     };
 
-    const result = try splitFields(allocator, parts);
+    const result = try splitFields(allocator, parts, null);
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 0), result.len);
@@ -4350,7 +4355,7 @@ test "splitFields: whitespace only returns empty" {
         .{ .content = ws_content, .kind = .normal },
     };
 
-    const result = try splitFields(allocator, parts);
+    const result = try splitFields(allocator, parts, null);
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 0), result.len);
@@ -4363,7 +4368,7 @@ test "splitFields: quoted parts pass through unchanged" {
         .{ .content = "hello world", .kind = .quoted },
     };
 
-    const result = try splitFields(allocator, parts);
+    const result = try splitFields(allocator, parts, null);
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 1), result.len);
@@ -4378,7 +4383,7 @@ test "splitFields: positional parts pass through unchanged" {
         .{ .content = "hello world", .kind = .positional },
     };
 
-    const result = try splitFields(allocator, parts);
+    const result = try splitFields(allocator, parts, null);
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 1), result.len);
@@ -4395,7 +4400,7 @@ test "splitFields: multiple parts with mixed kinds" {
         .{ .content = "also split", .kind = .normal },
     };
 
-    const result = try splitFields(allocator, parts);
+    const result = try splitFields(allocator, parts, null);
     defer allocator.free(result);
 
     // Expected: "split", "this", "keep together" (quoted, unsplit), "also", "split"
