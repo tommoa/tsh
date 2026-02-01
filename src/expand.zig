@@ -13,7 +13,7 @@
 //! 2. **Parameter Expansion** (2.6.2) - `$VAR`, `${VAR}`, `${VAR:-default}`, etc.
 //! 3. **Command Substitution** (2.6.3) - `$(cmd)` (implemented), `` `cmd` `` (not yet implemented)
 //! 4. **Arithmetic Expansion** (2.6.4) - `$((expr))` (not yet implemented)
-//! 5. **Field Splitting** (2.6.5) - Split on IFS (not yet implemented)
+//! 5. **Field Splitting** (2.6.5) - Split on IFS (partially implemented - default IFS only)
 //! 6. **Pathname Expansion** (2.6.6) - Glob patterns `*`, `?`, `[...]` (not yet implemented)
 //! 7. **Quote Removal** (2.6.7) - Remove quotes that aren't part of expansions
 //!
@@ -940,6 +940,97 @@ fn evaluateParameterExpansion(
 }
 
 // ============================================================================
+// Field Splitting (POSIX 2.6.5)
+// ============================================================================
+
+/// Apply field splitting to expanded parts per POSIX 2.6.5.
+///
+/// This function processes expanded parts and splits `.normal` parts into
+/// multiple fields based on IFS characters. `.quoted` and `.positional` parts
+/// pass through unchanged.
+///
+/// Currently only handles default IFS (space, tab, newline).
+/// Rules:
+/// - Trim leading/trailing whitespace
+/// - Any sequence of space/tab/newline delimits fields
+/// - Empty fields after trimming are discarded
+///
+/// POSIX Reference: Section 2.6.5 - Field Splitting
+pub fn splitFields(
+    allocator: Allocator,
+    parts: []const ExpandedPart,
+) Allocator.Error![]ExpandedPart {
+    // Default IFS: space, tab, newline
+    const DEFAULT_IFS = " \t\n";
+
+    // Collect results in a dynamic array
+    var result: std.ArrayListUnmanaged(ExpandedPart) = .empty;
+    defer result.deinit(allocator);
+
+    for (parts) |part| {
+        switch (part.kind) {
+            .quoted, .positional => {
+                // Quoted and positional parts are not subject to field splitting
+                try result.append(allocator, part);
+            },
+            .normal => {
+                // Split .normal parts on default IFS
+                const content = part.content;
+                if (content.len == 0) {
+                    // Empty content - skip (no field created)
+                    continue;
+                }
+
+                // Find the first non-whitespace character
+                var start: usize = 0;
+                while (start < content.len and std.mem.indexOfScalar(u8, DEFAULT_IFS, content[start]) != null) {
+                    start += 1;
+                }
+
+                // If entire string is whitespace, skip (no fields)
+                if (start >= content.len) {
+                    continue;
+                }
+
+                // Find the last non-whitespace character
+                var end: usize = content.len;
+                while (end > start and std.mem.indexOfScalar(u8, DEFAULT_IFS, content[end - 1]) != null) {
+                    end -= 1;
+                }
+
+                // Now split the trimmed content on whitespace runs
+                var i: usize = start;
+                while (i < end) {
+                    // Find start of next field (skip whitespace)
+                    while (i < end and std.mem.indexOfScalar(u8, DEFAULT_IFS, content[i]) != null) {
+                        i += 1;
+                    }
+
+                    if (i >= end) break;
+
+                    // Find end of this field
+                    const field_start = i;
+                    while (i < end and std.mem.indexOfScalar(u8, DEFAULT_IFS, content[i]) == null) {
+                        i += 1;
+                    }
+                    const field_end = i;
+
+                    // Create a new .normal part for this field
+                    const field_content = content[field_start..field_end];
+                    try result.append(allocator, .{
+                        .content = field_content,
+                        .kind = .normal,
+                    });
+                }
+            },
+        }
+    }
+
+    // Convert ArrayList to owned slice
+    return result.toOwnedSlice(allocator);
+}
+
+// ============================================================================
 // Core Expansion Logic
 // ============================================================================
 
@@ -990,16 +1081,16 @@ fn expandWord(
             },
             .parameter => |param| {
                 // Parameter expansion (POSIX 2.6.2) - unquoted context
-                const paramParts = try evaluateParameterExpansion(builder.allocator, shell, param, false);
-                if (try builder.appendParts(paramParts)) {
+                // TODO: Apply field splitting to the result
+                const param_parts = try evaluateParameterExpansion(builder.allocator, shell, param, false);
+                if (try builder.appendParts(param_parts)) {
                     content_added = true;
                 }
             },
             .command_sub => |cs| {
                 // Command substitution (POSIX 2.6.3)
                 const output = try subshell.captureOutput(builder.allocator, cs.commands, shell);
-                // In unquoted context, output is subject to field splitting (future)
-                // For now, we just append it as a single part
+                // TODO: In unquoted context, output is subject to field splitting
                 if (output.len > 0) {
                     try builder.append(output);
                     content_added = true;
@@ -1038,8 +1129,8 @@ fn expandInnerParts(
             .double_quoted => unreachable, // Parser doesn't nest double_quoted
             .parameter => |param| {
                 // Parameter expansion in quoted context
-                const paramParts = try evaluateParameterExpansion(builder.allocator, shell, param, true);
-                if (try builder.appendParts(paramParts)) {
+                const param_parts = try evaluateParameterExpansion(builder.allocator, shell, param, true);
+                if (try builder.appendParts(param_parts)) {
                     content_added = true;
                 }
             },
@@ -4149,4 +4240,174 @@ test "command substitution: with pipeline" {
 
     const result = try expandCommandString(arena.allocator(), "$(echo hello | cat)", &shell);
     try std.testing.expectEqualStrings("hello", result);
+}
+
+// ============================================================================
+// Field Splitting Tests
+// ============================================================================
+
+test "splitFields: basic splitting on space" {
+    const allocator = std.testing.allocator;
+
+    const parts = &[_]ExpandedPart{
+        .{ .content = "hello world", .kind = .normal },
+    };
+
+    const result = try splitFields(allocator, parts);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("hello", result[0].content);
+    try std.testing.expectEqualStrings("world", result[1].content);
+    try std.testing.expectEqual(ExpandedPart.Kind.normal, result[0].kind);
+    try std.testing.expectEqual(ExpandedPart.Kind.normal, result[1].kind);
+}
+
+test "splitFields: multiple spaces collapse" {
+    const allocator = std.testing.allocator;
+
+    const parts = &[_]ExpandedPart{
+        .{ .content = "a   b     c", .kind = .normal },
+    };
+
+    const result = try splitFields(allocator, parts);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqualStrings("a", result[0].content);
+    try std.testing.expectEqualStrings("b", result[1].content);
+    try std.testing.expectEqualStrings("c", result[2].content);
+}
+
+test "splitFields: trims leading and trailing whitespace" {
+    const allocator = std.testing.allocator;
+
+    const parts = &[_]ExpandedPart{
+        .{ .content = "  hello world  ", .kind = .normal },
+    };
+
+    const result = try splitFields(allocator, parts);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("hello", result[0].content);
+    try std.testing.expectEqualStrings("world", result[1].content);
+}
+
+test "splitFields: handles tabs" {
+    const allocator = std.testing.allocator;
+
+    // Use explicit tab byte
+    const tab_content = "hello" ++ &[_]u8{0x09} ++ "world";
+    const parts = &[_]ExpandedPart{
+        .{ .content = tab_content, .kind = .normal },
+    };
+
+    const result = try splitFields(allocator, parts);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("hello", result[0].content);
+    try std.testing.expectEqualStrings("world", result[1].content);
+}
+
+test "splitFields: handles newlines" {
+    const allocator = std.testing.allocator;
+
+    // Use explicit newline byte
+    const nl_content = "hello" ++ &[_]u8{0x0A} ++ "world";
+    const parts = &[_]ExpandedPart{
+        .{ .content = nl_content, .kind = .normal },
+    };
+
+    const result = try splitFields(allocator, parts);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("hello", result[0].content);
+    try std.testing.expectEqualStrings("world", result[1].content);
+}
+
+test "splitFields: empty content returns empty" {
+    const allocator = std.testing.allocator;
+
+    const parts = &[_]ExpandedPart{
+        .{ .content = "", .kind = .normal },
+    };
+
+    const result = try splitFields(allocator, parts);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "splitFields: whitespace only returns empty" {
+    const allocator = std.testing.allocator;
+
+    // Content: "   <tab><newline>  "
+    const ws_content = "   " ++ &[_]u8{ 0x09, 0x0A, 0x20, 0x20 };
+    const parts = &[_]ExpandedPart{
+        .{ .content = ws_content, .kind = .normal },
+    };
+
+    const result = try splitFields(allocator, parts);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "splitFields: quoted parts pass through unchanged" {
+    const allocator = std.testing.allocator;
+
+    const parts = &[_]ExpandedPart{
+        .{ .content = "hello world", .kind = .quoted },
+    };
+
+    const result = try splitFields(allocator, parts);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("hello world", result[0].content);
+    try std.testing.expectEqual(ExpandedPart.Kind.quoted, result[0].kind);
+}
+
+test "splitFields: positional parts pass through unchanged" {
+    const allocator = std.testing.allocator;
+
+    const parts = &[_]ExpandedPart{
+        .{ .content = "hello world", .kind = .positional },
+    };
+
+    const result = try splitFields(allocator, parts);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("hello world", result[0].content);
+    try std.testing.expectEqual(ExpandedPart.Kind.positional, result[0].kind);
+}
+
+test "splitFields: multiple parts with mixed kinds" {
+    const allocator = std.testing.allocator;
+
+    const parts = &[_]ExpandedPart{
+        .{ .content = "split this", .kind = .normal },
+        .{ .content = "keep together", .kind = .quoted },
+        .{ .content = "also split", .kind = .normal },
+    };
+
+    const result = try splitFields(allocator, parts);
+    defer allocator.free(result);
+
+    // Expected: "split", "this", "keep together" (quoted, unsplit), "also", "split"
+    try std.testing.expectEqual(@as(usize, 5), result.len);
+    try std.testing.expectEqualStrings("split", result[0].content);
+    try std.testing.expectEqualStrings("this", result[1].content);
+    try std.testing.expectEqualStrings("keep together", result[2].content);
+    try std.testing.expectEqualStrings("also", result[3].content);
+    try std.testing.expectEqualStrings("split", result[4].content);
+    try std.testing.expectEqual(ExpandedPart.Kind.normal, result[0].kind);
+    try std.testing.expectEqual(ExpandedPart.Kind.normal, result[1].kind);
+    try std.testing.expectEqual(ExpandedPart.Kind.quoted, result[2].kind);
+    try std.testing.expectEqual(ExpandedPart.Kind.normal, result[3].kind);
+    try std.testing.expectEqual(ExpandedPart.Kind.normal, result[4].kind);
 }
