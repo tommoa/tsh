@@ -22,6 +22,7 @@ const ParsedCommand = parser.ParsedCommand;
 const Command = parser.Command;
 const IfClause = parser.IfClause;
 const LoopClause = parser.LoopClause;
+const ForClause = parser.ForClause;
 const CompoundList = parser.CompoundList;
 const AndOrList = parser.AndOrList;
 
@@ -694,6 +695,72 @@ pub const Executor = struct {
         return status;
     }
 
+    /// Execute a for clause (POSIX 2.9.4.4)
+    ///
+    /// Syntax: for name [in [word...]]; do compound-list; done
+    ///
+    /// The words are expanded and field-split to produce iteration values.
+    /// If no words are provided, the loop iterates over positional parameters ($@).
+    ///
+    /// The exit status is the exit status of the last command in the body,
+    /// or 0 if the body was never executed.
+    fn executeForClause(self: *Executor, fc: ForClause) ExecuteError!ExitStatus {
+        var status: ExitStatus = .{ .exited = 0 };
+
+        if (fc.words.len == 0) {
+            // No words provided - iterate over positional parameters ($@)
+            for (self.shell_state.positional_params.items) |value| {
+                try self.shell_state.setVariable(fc.name, value);
+                status = self.executeCompoundList(fc.body) catch |err| switch (err) {
+                    error.BreakRequested => {
+                        self.shell_state.break_levels -= 1;
+                        if (self.shell_state.break_levels > 0) return error.BreakRequested;
+                        return .{ .exited = 0 }; // break exits with status 0 (POSIX)
+                    },
+                    error.ContinueRequested => {
+                        self.shell_state.continue_levels -= 1;
+                        if (self.shell_state.continue_levels > 0) return error.ContinueRequested;
+                        continue; // skip to next iteration
+                    },
+                    else => return err,
+                };
+            }
+        } else {
+            // Expand all words at once with field splitting.
+            // Per POSIX, expansion failure aborts the entire for loop.
+            const argv = expand.expandArgv(self.allocator, fc.words, self.shell_state) catch |err| {
+                switch (err) {
+                    // Error message already printed by expansion
+                    error.ParameterUnsetOrNull, error.ParameterAssignmentInvalid => {},
+                    else => self.setError("failed to expand arguments", @errorName(err)),
+                }
+                self.shell_state.last_status = .{ .exited = 1 };
+                return self.shell_state.last_status;
+            };
+
+            // Iterate directly over argv until null terminator
+            var i: usize = 0;
+            while (argv[i]) |arg| : (i += 1) {
+                try self.shell_state.setVariable(fc.name, std.mem.span(arg));
+                status = self.executeCompoundList(fc.body) catch |err| switch (err) {
+                    error.BreakRequested => {
+                        self.shell_state.break_levels -= 1;
+                        if (self.shell_state.break_levels > 0) return error.BreakRequested;
+                        return .{ .exited = 0 }; // break exits with status 0 (POSIX)
+                    },
+                    error.ContinueRequested => {
+                        self.shell_state.continue_levels -= 1;
+                        if (self.shell_state.continue_levels > 0) return error.ContinueRequested;
+                        continue; // skip to next iteration
+                    },
+                    else => return err,
+                };
+            }
+        }
+
+        return status;
+    }
+
     /// Execute a single command (simple or compound) in the current environment.
     ///
     /// This is the unified dispatch point for all command types. Simple commands
@@ -737,6 +804,7 @@ pub const Executor = struct {
             .if_clause => |ic| self.executeIfClause(ic),
             .while_clause => |lc| self.executeLoopClause(lc, false),
             .until_clause => |lc| self.executeLoopClause(lc, true),
+            .for_clause => |fc| self.executeForClause(fc),
         };
     }
 
@@ -806,6 +874,7 @@ pub const Executor = struct {
             .if_clause => |ic| self.executeIfClause(ic) catch |err| self.exitWithError(err),
             .while_clause => |lc| self.executeLoopClause(lc, false) catch |err| self.exitWithError(err),
             .until_clause => |lc| self.executeLoopClause(lc, true) catch |err| self.exitWithError(err),
+            .for_clause => |fc| self.executeForClause(fc) catch |err| self.exitWithError(err),
         };
         posix.exit(status.toExitCode());
     }
@@ -2582,4 +2651,128 @@ test "executor: if with loop inside" {
         "while true; do echo looped > " ++ tmp_path ++ "; break; done; " ++
         "fi\n", 0);
     try expectFileContent(tmp_path, "looped\n");
+}
+
+// --- For loop executor tests ---
+
+test "executor: simple for loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_for_simple";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "for i in a b c; do echo $i >> " ++ tmp_path ++ "; done\n", 0);
+    try expectFileContent(tmp_path, "a\nb\nc\n");
+}
+
+test "executor: for loop with variable expansion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_for_var";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "for i in 1 2 3; do echo Item: $i >> " ++ tmp_path ++ "; done\n", 0);
+    try expectFileContent(tmp_path, "Item: 1\nItem: 2\nItem: 3\n");
+}
+
+test "executor: for loop with break" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_for_break";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "for i in 1 2 3 4 5; do if [ $i -eq 3 ]; then break; fi; echo $i >> " ++ tmp_path ++ "; done\n", 0);
+    try expectFileContent(tmp_path, "1\n2\n");
+}
+
+test "executor: for loop with continue" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_for_continue";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "for i in 1 2 3; do if [ $i -eq 2 ]; then continue; fi; echo $i >> " ++ tmp_path ++ "; done\n", 0);
+    try expectFileContent(tmp_path, "1\n3\n");
+}
+
+test "executor: for loop with positional parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_for_positional";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    // Set positional parameters manually
+    try shell_state.positional_params.append(arena.allocator(), "x");
+    try shell_state.positional_params.append(arena.allocator(), "y");
+    try shell_state.positional_params.append(arena.allocator(), "z");
+
+    try expectStatus(&arena, &shell_state, "for i; do echo $i >> " ++ tmp_path ++ "; done\n", 0);
+    try expectFileContent(tmp_path, "x\ny\nz\n");
+}
+
+test "executor: nested for loops" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_for_nested";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "for i in 1 2; do for j in a b; do echo $i$j >> " ++ tmp_path ++ "; done; done\n", 0);
+    try expectFileContent(tmp_path, "1a\n1b\n2a\n2b\n");
+}
+
+test "executor: for loop with if statement in body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_for_if";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    try expectStatus(&arena, &shell_state, "for i in 1 2 3; do if [ $i -eq 2 ]; then echo two >> " ++ tmp_path ++ "; fi; done\n", 0);
+    try expectFileContent(tmp_path, "two\n");
+}
+
+test "executor: for loop exit status is last command status" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var shell_state = try ShellState.init(arena.allocator());
+    // Loop that succeeds
+    try expectStatus(&arena, &shell_state, "for i in 1; do true; done\n", 0);
+
+    // Loop that fails on last iteration
+    try expectStatus(&arena, &shell_state, "for i in 1; do false; done\n", 1);
+}
+
+test "executor: for loop with redirections" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tmp_path = "/tmp/tsh_test_for_redir";
+    cleanupTempFile(tmp_path);
+    defer cleanupTempFile(tmp_path);
+
+    var shell_state = try ShellState.init(arena.allocator());
+    // Redirect the entire for loop output
+    try expectStatus(&arena, &shell_state, "for i in a b c; do echo $i; done > " ++ tmp_path ++ "\n", 0);
+    try expectFileContent(tmp_path, "a\nb\nc\n");
 }
