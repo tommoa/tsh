@@ -37,16 +37,20 @@ zig build run -- --dump-ast < script.sh
 
 ### Running a Single Test
 
-Zig's build system runs all tests together. To run tests from a specific file,
-you can compile and run tests directly:
+Zig's build system runs all tests together. To run tests from a specific file:
 
 ```bash
-# Run tests for a specific module (compiles and runs in one step)
+# Run tests for a specific module
 zig test src/lexer.zig --dep tsh -Mroot=src/root.zig
+zig test src/parser.zig --dep tsh -Mroot=src/root.zig
+zig test src/executor.zig --dep tsh -Mroot=src/root.zig
+
+# Run tests for builtins sub-modules
+zig test src/builtin_test.zig --dep tsh -Mroot=src/root.zig
 ```
 
 Note: Zig does not support filtering tests by name. To isolate a test, temporarily
-comment out other tests or use a conditional compilation approach.
+comment out other tests.
 
 ## Project Structure
 
@@ -60,9 +64,11 @@ src/
 ├── expand.zig      # Word expansion (tilde, parameter, globbing)
 ├── state.zig       # Shell state (env, variables, exit status, cwd)
 ├── builtins.zig    # Builtin commands (cd, exit, export, pwd, test)
-├── options.zig     # POSIX-compliant option parsing framework
 ├── builtin_test.zig # test/[ expression evaluator
-├── pattern.zig     # Pattern matching for glob and parameter expansion
+├── options.zig     # POSIX-compliant option parsing framework
+├── pattern.zig     # Pattern matching for glob/parameter expansion
+├── child.zig       # Process execution primitives
+├── subshell.zig    # Subshell execution and command substitution
 └── repl.zig        # Read-eval-print loop
 ```
 
@@ -70,13 +76,14 @@ src/
 
 ### Imports
 
-Order imports: standard library, project modules, then type aliases.
+Order imports: standard library, project modules (alphabetically), then type aliases.
 
 ```zig
 const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
+const builtins = @import("builtins.zig");
 const parser = @import("parser.zig");
 const state = @import("state.zig");
 const ShellState = state.ShellState;
@@ -93,10 +100,13 @@ const printError = state.printError;
 | Variables     | snake_case          | `exit_code`, `last_status`            |
 | Enum variants | Context-dependent   | `.Literal`, `.exited`, `.str_equal`   |
 
-Use `@"keyword"` syntax for reserved words as identifiers:
+Use `pub` prefix for public APIs. Use `@{"keyword"}` for reserved words:
+
 ```zig
 pub const Builtin = enum {
+    @"[",
     @"break",
+    cd,
     @"continue",
     @"export",
     // ...
@@ -106,21 +116,22 @@ pub const Builtin = enum {
 ### Types and Patterns
 
 Use tagged unions for discriminated types:
+
 ```zig
 pub const ExitStatus = union(enum) {
     exited: u8,
     signaled: u32,
 };
 
-pub const BuiltinResult = union(enum) {
-    exit_code: u8,
-    exit: u8,
-    break_loop: u32,
-    builtin_error: u8,
+pub const WordPart = union(enum) {
+    literal: []const u8,
+    parameter: ParameterExpansion,
+    command_sub: CommandSubstitution,
 };
 ```
 
 Define module-specific error sets:
+
 ```zig
 pub const LexerError = error{
     UnexpectedEndOfFile,
@@ -137,9 +148,7 @@ pub const ExecuteError = error{
 
 ### Error Handling
 
-- Use `printError` from `state.zig` for user-facing errors (prefixes with "tsh: ")
-- Return structured error info when context is needed
-- Prefer explicit error handling over `try` for user-facing code
+Use `printError` from `state.zig` for user-facing errors:
 
 ```zig
 // User-facing error
@@ -150,16 +159,29 @@ return .{ .exit_code = 1 };
 const value = try self.allocator.dupe(u8, input);
 ```
 
+Return structured error info with tagged unions:
+
+```zig
+pub const BuiltinResult = union(enum) {
+    exit_code: u8,         // Continue execution
+    exit: u8,              // Exit the shell
+    break_loop: u32,       // Break from loop
+    continue_loop: u32,    // Continue loop
+    builtin_error: u8,     // Error in builtin
+};
+```
+
 ### Memory Management
 
-- Use `ArenaAllocator` for parse-time allocations (freed in batch)
+- Use `ArenaAllocator` for parse-time allocations
 - Pass `Allocator` explicitly to functions that allocate
-- Use `defer` for cleanup and document ownership in comments
-- `EnvMap.put()` duplicates values internally; shell variables need manual duping
+- Use `defer` for cleanup
+- `EnvMap.put()` duplicates values; shell variables need manual duping
 
 ### Documentation
 
 Reference POSIX sections in doc comments:
+
 ```zig
 /// Exit the shell with status n.
 ///
@@ -167,30 +189,31 @@ Reference POSIX sections in doc comments:
 fn runExit(args: []const []const u8, shell: *ShellState) BuiltinResult {
 ```
 
-Use `//!` for module-level docs at file top, `///` for public API.
+Use `//!` for module-level docs, `///` for public API.
 
 ### Testing
 
-Tests go at the bottom of each file with descriptive names:
+Tests go at the bottom of each file:
+
 ```zig
 test "ShellState: setEnv updates cached home" {
     var env = process.EnvMap.init(std.testing.allocator);
-    var state = try ShellState.initWithEnv(std.testing.allocator, &env);
-    defer state.deinit();
+    var shell_state = try ShellState.initWithEnv(std.testing.allocator, &env);
+    defer shell_state.deinit();
 
-    try std.testing.expect(state.home == null);
-    try state.setEnv("HOME", "/new/home");
-    try std.testing.expectEqualStrings("/new/home", state.home.?);
+    try std.testing.expect(shell_state.home == null);
+    try shell_state.setEnv("HOME", "/new/home");
+    try std.testing.expectEqualStrings("/new/home", shell_state.home.?);
 }
 ```
 
-Use helper functions prefixed with `run*Test` or `expect*` for complex setups.
+Use helper functions prefixed with `run*Test` or `expect*`.
 
 ### Commit Messages
 
 Format: `type(scope): description`
 
-- **feat**: New feature (`feat(executor): add if statement execution support`)
+- **feat**: New feature (`feat(executor): add if statement execution`)
 - **fix**: Bug fix (`fix: resolve test failures on Linux`)
 - **refactor**: Code restructuring (`refactor(parser): reorganize token dispatch`)
 - **test**: Test additions/changes
@@ -198,15 +221,14 @@ Format: `type(scope): description`
 
 ## Architecture Notes
 
-- **Lexer**: Streaming reader with small buffer, produces tokens incrementally
-  - It is important when changing the lexer that potential buffer boundary
-    issues are considered.
-- **Parser**: Consumes tokens, builds AST using labeled switch state machine
-  - The parser should be invariant on the buffer size for the lexer.
-- **Executor**: Handles fork/exec, pipes, redirections; builtins run in-process
-- **State**: Persists env vars, shell vars, cwd, exit status between commands
-- **Expand**: Processes words through tilde, parameter, and glob expansion phases
+- **Lexer**: Streaming reader with small buffer, produces tokens incrementally.
+  Critical: Consider buffer boundary issues when modifying.
+- **Parser**: Consumes tokens, builds AST using labeled switch state machine.
+  Should be invariant on lexer buffer size.
+- **Executor**: Handles fork/exec, pipes, redirections. Builtins run in-process.
+- **State**: Persists env vars, shell vars, cwd, exit status between commands.
+- **Expand**: Word expansion through tilde, parameter, and glob phases.
 
-Builtins that modify shell state (cd, export, exit) must run in the shell
-process, not forked children. The `BuiltinResult` union signals control flow
-(exit, break, continue) back to the executor.
+Builtins that modify shell state (cd, export, exit) run in the shell process,
+not forked children. `BuiltinResult` signals control flow (exit, break, continue)
+back to the executor.
